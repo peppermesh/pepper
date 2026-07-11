@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Bug report
+description: Report a reproducible PepperMesh defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not disclose security vulnerabilities here. Use private vulnerability reporting instead."
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide minimal steps, configuration, and relevant commands.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, Rust version, and Firecracker version where relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: shell

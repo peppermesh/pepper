@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[node]
+name = "node-1"
+listen_addr = "127.0.0.1:9001"
+failure_domain = "rack-a"
+
+[node.placement_labels]
+region = "dev"
+zone = "dev-a"
+rack = "rack-a"
+disk_class = "ssd"
+
+[data]
+path = "./dev/node1-data"
+
+[identity]
+key_path = "./dev/node1-data/node.key"
+generate_if_missing = true
+
+[api]
+bind_addr = "127.0.0.1:9080"
+
+[[storage.locations]]
+path = "./dev/node1-storage"
+max_capacity_bytes = 1000000000
+
+[network]
+bootstrap_peers = []
+
+[replication]
+default_factor = 3
+repair_interval_seconds = 30
+
+[compute]
+enabled = true
+runtime = "firecracker"
+max_concurrent_jobs = 1
+work_dir = "./dev/node1-data/compute"
+firecracker_binary = "/usr/local/bin/firecracker"
+firecracker_jailer_binary = "/usr/local/bin/jailer"
+firecracker_enable_jailer = false
+firecracker_jailer_uid = 65534
+firecracker_jailer_gid = 65534
+firecracker_jailer_chroot_base = "./dev/jailer"
+firecracker_strict_sandbox = true
+firecracker_allow_untrusted_rootfs = false
+# firecracker_allowed_rootfs_cids = ["cid://..."]
+firecracker_memory_mib = 128
+firecracker_vcpu_count = 1
+
+[auth]
+# cluster_secret_path = "./dev/cluster.secret"
+# api_bearer_token = "dev-token"
+
+[limits]
+max_block_bytes = 67108864
+max_object_bytes = 1073741824
+max_compute_timeout_seconds = 600
+http_requests_per_minute = 6000
+rpc_requests_per_minute = 6000
+
+[logging]
+format = "pretty"

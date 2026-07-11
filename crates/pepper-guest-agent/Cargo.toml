@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-guest-agent"
+version = "0.1.0"
+publish = false
+rust-version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Firecracker guest control agent for PepperMesh"
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true

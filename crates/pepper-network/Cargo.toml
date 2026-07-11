@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-network"
+version = "0.1.0"
+publish = false
+rust-version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Authenticated QUIC networking for PepperMesh"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+pepper-crypto = { version = "0.1.0", path = "../pepper-crypto" }
+pepper-metadata = { version = "0.1.0", path = "../pepper-metadata" }
+pepper-types = { version = "0.1.0", path = "../pepper-types" }
+prost.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+redb.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[build-dependencies]
+prost-build.workspace = true

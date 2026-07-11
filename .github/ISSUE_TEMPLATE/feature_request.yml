@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Feature request
+description: Propose an improvement to PepperMesh
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem or use case should PepperMesh address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior without requiring a specific implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility considerations
+      description: Note protocol, storage-format, API, configuration, or upgrade implications.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

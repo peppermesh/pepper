@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package pepper.v1;
+
+message RequestEnvelope {
+  string request_id = 1;
+  uint32 protocol_version = 2;
+  string node_id = 3;
+  string method = 4;
+  bytes payload = 5;
+  int64 auth_timestamp_unix_seconds = 6;
+  string auth_signature_hex = 7;
+  string public_key_hex = 8;
+  string identity_signature_hex = 9;
+}
+
+message ResponseEnvelope {
+  string request_id = 1;
+  bool ok = 2;
+  string error_code = 3;
+  string error_message = 4;
+  bytes payload = 5;
+  string node_id = 6;
+  string public_key_hex = 7;
+  string signature_hex = 8;
+}
+
+message NodeDescriptor {
+  string node_id = 1;
+  string name = 2;
+  repeated string addresses = 3;
+  string public_key_hex = 4;
+  string signature_hex = 5;
+  string failure_domain = 6;
+  map<string, string> placement_labels = 7;
+  uint64 storage_capacity_bytes = 8;
+  uint64 storage_available_bytes = 9;
+  string tls_certificate_digest_hex = 10;
+}
+
+message HandshakeRequest {
+  NodeDescriptor descriptor = 1;
+}
+
+message HandshakeResponse {
+  NodeDescriptor descriptor = 1;
+}
+
+message NodeInfoRequest {}
+
+message NodeInfoResponse {
+  NodeDescriptor descriptor = 1;
+}
+
+message ListPeersRequest {}
+
+message PeerInfo {
+  string node_id = 1;
+  string name = 2;
+  repeated string addresses = 3;
+  int64 last_seen_unix_seconds = 4;
+  bool connected = 5;
+  string failure_domain = 6;
+  map<string, string> placement_labels = 7;
+  uint64 storage_capacity_bytes = 8;
+  uint64 storage_available_bytes = 9;
+}
+
+message ListPeersResponse {
+  repeated PeerInfo peers = 1;
+}
+
+message BlockHasRequest {
+  string cid = 1;
+}
+
+message BlockHasResponse {
+  bool has = 1;
+}
+
+message BlockGetRequest {
+  string cid = 1;
+}
+
+message BlockGetResponse {
+  string cid = 1;
+  string codec = 2;
+  bytes payload = 3;
+}
+
+message RelayBlockGetRequest {
+  string target_node_id = 1;
+  string cid = 2;
+}
+
+message RelayBlockGetResponse {
+  string cid = 1;
+  bytes payload = 2;
+}
+
+message BlockPutReplicaRequest {
+  bytes payload = 1;
+  string codec = 2;
+}
+
+message BlockPutReplicaResponse {
+  string cid = 1;
+  string codec = 2;
+  uint64 size = 3;
+  bool already_existed = 4;
+  string provider_record_json = 5;
+}
+
+message BlockProvidersRequest {
+  string cid = 1;
+}
+
+message BlockProvidersResponse {
+  repeated string provider_record_json = 1;
+}
+
+message BlockAnnounceProviderRequest {
+  string provider_record_json = 1;
+}
+
+message BlockAnnounceProviderResponse {
+  bool accepted = 1;
+}
+
+message ComputeOfferRequest {
+  string spec_json = 1;
+}
+
+message ComputeOfferResponse {
+  bool accepted = 1;
+  string node_id = 2;
+  uint64 estimated_queue_delay_seconds = 3;
+  uint64 local_input_bytes = 4;
+  uint64 total_input_bytes = 5;
+  uint32 available_parallelism = 6;
+  string rejection_reason = 7;
+}
+
+message ComputeSubmitRequest {
+  string job_id = 1;
+  string spec_json = 2;
+}
+
+message ComputeSubmitResponse {
+  string job_status_json = 1;
+}
+
+message ComputeStatusRequest {
+  string job_id = 1;
+}
+
+message ComputeStatusResponse {
+  string job_status_json = 1;
+}
+
+message ComputeLogsRequest {
+  string job_id = 1;
+}
+
+message ComputeLogsResponse {
+  string logs_json = 1;
+}
+
+message ComputeCancelRequest {
+  string job_id = 1;
+}
+
+message ComputeCancelResponse {
+  string job_status_json = 1;
+}

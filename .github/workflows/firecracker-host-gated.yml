@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: firecracker-host-gated
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_image:
+        description: "Path to a Firecracker-compatible ext4 rootfs image on the runner"
+        required: true
+        default: "/var/lib/pepper/rootfs.ext4"
+      kernel_image:
+        description: "Path to a Firecracker-compatible guest kernel on the runner"
+        required: true
+        default: "/var/lib/pepper/vmlinux"
+
+permissions:
+  contents: read
+
+jobs:
+  firecracker-host-gated:
+    runs-on: [self-hosted, linux, kvm, firecracker]
+    env:
+      PEPPER_FIRECRACKER_ROOTFS_IMAGE: ${{ inputs.rootfs_image }}
+      PEPPER_FIRECRACKER_KERNEL_IMAGE: ${{ inputs.kernel_image }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Run host-gated Firecracker rootfs/cancel test
+        run: cargo test -p pepper-agent --test multinode firecracker_rootfs_cid_and_cancel_host_gated -- --ignored --exact --nocapture

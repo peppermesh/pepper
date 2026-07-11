@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-placement"
+version = "0.1.0"
+publish = false
+rust-version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Deterministic data placement for PepperMesh"
+
+[dependencies]
+blake3.workspace = true
+pepper-types = { version = "0.1.0", path = "../pepper-types" }

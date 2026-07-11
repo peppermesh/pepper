@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: DCO
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  signoff:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: python
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          commits = subprocess.check_output(
+              ["git", "rev-list", "--reverse", f"{base}..{head}"],
+              text=True,
+          ).splitlines()
+          if not commits:
+              print("No contribution commits found.")
+              sys.exit(0)
+
+          failures = []
+          trailer = re.compile(
+              r"^Signed-off-by:\s+(.+?)\s+<([^<>\s]+@[^<>\s]+)>\s*$",
+              re.MULTILINE | re.IGNORECASE,
+          )
+          for commit in commits:
+              author_name = subprocess.check_output(
+                  ["git", "show", "-s", "--format=%an", commit], text=True
+              ).strip()
+              author_email = subprocess.check_output(
+                  ["git", "show", "-s", "--format=%ae", commit], text=True
+              ).strip()
+              message = subprocess.check_output(
+                  ["git", "show", "-s", "--format=%B", commit], text=True
+              )
+              signoffs = trailer.findall(message)
+              author_signed = any(
+                  name.strip().casefold() == author_name.casefold()
+                  and email.casefold() == author_email.casefold()
+                  for name, email in signoffs
+              )
+              if not author_signed:
+                  failures.append((commit, author_name, author_email))
+
+          if failures:
+              print("Every contributing commit must be signed off by its author.")
+              print("Create commits with `git commit -s` or amend/rebase with --signoff.\n")
+              for commit, name, email in failures:
+                  print(f"::error title=Missing DCO sign-off::{commit[:12]} needs: "
+                        f"Signed-off-by: {name} <{email}>")
+              sys.exit(1)
+
+          print(f"Verified DCO sign-offs on {len(commits)} commit(s).")
