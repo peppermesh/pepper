@@ -25,7 +25,7 @@ use pepper_crypto::{NodeIdentity, verify_signature};
 use pepper_metadata::MetadataStore;
 use pepper_network::{
     NetworkBlockService, NetworkComputeService, NetworkConfig, NetworkError, NetworkHandle,
-    PeerStatus, proto,
+    NetworkPinService, PeerStatus, proto,
 };
 use pepper_placement::{PlacementNode, select_replicas};
 use pepper_storage::{BlockStore, StorageError};
@@ -170,6 +170,7 @@ struct RateLimitBucket {
 struct ObjectPutQuery {
     erasure_data_shards: Option<u16>,
     erasure_parity_shards: Option<u16>,
+    pin: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -512,6 +513,12 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
             state: state.clone(),
         }))
         .await;
+    state
+        .network
+        .set_pin_service(Arc::new(AgentPinService {
+            state: state.clone(),
+        }))
+        .await;
 
     recover_compute_jobs(&state).map_err(|error| anyhow::anyhow!(error.message))?;
     spawn_repair_loop(state.clone());
@@ -606,6 +613,7 @@ async fn put_block(
     let _guard = state.operation_lock.read().await;
     let body = read_body_limited(body, state.max_block_bytes, "block").await?;
     let receipt = put_replicated_block(&state, CODEC_RAW, body).await?;
+    ensure_implicit_pin(&state, &receipt.cid).await?;
     Ok(Json(receipt))
 }
 
@@ -673,6 +681,9 @@ async fn put_object(
     } else {
         put_object_stream_receipt(&state, body).await?
     };
+    if query.pin.unwrap_or(true) {
+        ensure_implicit_pin(&state, &receipt.cid).await?;
+    }
     Ok(Json(receipt))
 }
 
@@ -753,6 +764,7 @@ async fn put_dir(
     if !children_durable {
         receipt.status = "degraded".to_string();
     }
+    ensure_implicit_pin(&state, &receipt.cid).await?;
     Ok(Json(receipt))
 }
 
@@ -1433,6 +1445,15 @@ async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
         }
     }
 
+    for pin in all_pin_records(state)?
+        .into_iter()
+        .filter(|pin| pin.owner == state.status.node_id)
+    {
+        if let Err(error) = broadcast_pin(state, &pin).await {
+            warn!(pin_id = %pin.pin_id, error = %error.message, "failed to resynchronize pin record");
+        }
+    }
+
     let candidates = placement_candidates(state, state.network.peers().await);
     let mut pinned_replication = HashMap::<Cid, usize>::new();
     for pin in active_pins(state)? {
@@ -1445,21 +1466,7 @@ async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
     }
 
     for stat in state.block_store.list_blocks()? {
-        let locally_responsible = select_replicas(&stat.cid, &candidates, state.replication_factor)
-            .iter()
-            .any(|node| node.is_local);
-        let desired_replication =
-            pinned_replication
-                .get(&stat.cid)
-                .copied()
-                .unwrap_or(if locally_responsible {
-                    state.replication_factor
-                } else if stat.codec == CODEC_ERASURE_MANIFEST {
-                    // A retained EC control manifest coordinates shard repair and rebalance.
-                    1
-                } else {
-                    0
-                });
+        let desired_replication = pinned_replication.get(&stat.cid).copied().unwrap_or(0);
         if desired_replication == 0 {
             continue;
         }
@@ -1825,6 +1832,59 @@ async fn reconstruct_erasure_shards(
     Ok(shards)
 }
 
+async fn ensure_implicit_pin(state: &AppState, root_cid: &Cid) -> Result<(), ApiError> {
+    if active_pins_for_root(state, root_cid)?
+        .iter()
+        .any(|pin| pin.owner == state.status.node_id && pin.expires_at_unix_seconds.is_none())
+    {
+        return Ok(());
+    }
+    let now = unix_seconds();
+    let mut pin = PinRecord {
+        pin_id: next_pin_id(),
+        root_cid: root_cid.clone(),
+        owner: state.status.node_id.clone(),
+        replication_factor: state.replication_factor as u16,
+        created_at_unix_seconds: now,
+        expires_at_unix_seconds: None,
+        status: "active".to_string(),
+        signature_hex: String::new(),
+    };
+    sign_pin(state, &mut pin)?;
+    persist_pin(state, &pin)?;
+    broadcast_pin(state, &pin).await?;
+    Ok(())
+}
+
+async fn broadcast_pin(state: &AppState, pin: &PinRecord) -> Result<(), ApiError> {
+    let json = serde_json::to_string(pin).map_err(ApiError::serde)?;
+    let mut failed = Vec::new();
+    for peer in state.network.peers().await {
+        let mut applied = false;
+        for address in peer.addresses {
+            let Ok(address) = address.parse() else {
+                continue;
+            };
+            if state.network.apply_pin(address, json.clone()).await.is_ok() {
+                applied = true;
+                break;
+            }
+        }
+        if !applied {
+            failed.push(peer.node_id);
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::internal(format!(
+            "failed to synchronize pin {} to peers: {}",
+            pin.pin_id,
+            failed.join(", ")
+        )))
+    }
+}
+
 async fn create_pin(
     State(state): State<AppState>,
     Json(request): Json<PinCreateRequest>,
@@ -1862,13 +1922,9 @@ async fn create_pin(
     }
     let now = unix_seconds();
     let mut pin = PinRecord {
-        pin_id: format!(
-            "pin-{now}-{}-{}",
-            std::process::id(),
-            PIN_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ),
+        pin_id: next_pin_id(),
         root_cid: request.root_cid.clone(),
-        owner: "local".to_string(),
+        owner: state.status.node_id.clone(),
         replication_factor,
         created_at_unix_seconds: now,
         expires_at_unix_seconds: request.ttl_seconds.map(|ttl| now.saturating_add(ttl)),
@@ -1877,6 +1933,7 @@ async fn create_pin(
     };
     sign_pin(&state, &mut pin)?;
     persist_pin(&state, &pin)?;
+    broadcast_pin(&state, &pin).await?;
     Ok(Json(PinStatusResponse {
         root_cid: request.root_cid,
         pins: active_pins_for_root(&state, &pin.root_cid)?,
@@ -1907,11 +1964,20 @@ async fn delete_pin(
     Path(cid): Path<String>,
 ) -> Result<Json<PinStatusResponse>, ApiError> {
     let root_cid = BlockStore::parse_cid(&cid)?;
-    deactivate_pins_for_root(&state, &root_cid)?;
+    let deleted = deactivate_pins_for_root(&state, &root_cid)?;
+    for pin in &deleted {
+        broadcast_pin(&state, pin).await?;
+    }
+    let pins = active_pins_for_root(&state, &root_cid)?;
+    let reachable_count = if pins.is_empty() {
+        0
+    } else {
+        traverse_reachable(&state, root_cid.clone()).await?.len()
+    };
     Ok(Json(PinStatusResponse {
         root_cid,
-        pins: Vec::new(),
-        reachable_count: 0,
+        pins,
+        reachable_count,
     }))
 }
 
@@ -1929,29 +1995,12 @@ async fn run_gc(
     for pin in active_pins(&state)? {
         protected.extend(traverse_reachable(&state, pin.root_cid).await?);
     }
-    protect_local_replica_responsibility(&state, &mut protected).await?;
     let report = if query.dry_run {
         state.block_store.garbage_collect_dry_run(&protected)?
     } else {
         state.block_store.garbage_collect(&protected)?
     };
     Ok(Json(report))
-}
-
-async fn protect_local_replica_responsibility(
-    state: &AppState,
-    protected: &mut HashSet<Cid>,
-) -> Result<(), ApiError> {
-    let candidates = placement_candidates(state, state.network.peers().await);
-    for stat in state.block_store.list_blocks()? {
-        if select_replicas(&stat.cid, &candidates, state.replication_factor)
-            .iter()
-            .any(|node| node.is_local)
-        {
-            protected.insert(stat.cid);
-        }
-    }
-    Ok(())
 }
 
 async fn admin_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -2178,15 +2227,21 @@ fn sign_pin(state: &AppState, pin: &mut PinRecord) -> Result<(), ApiError> {
 }
 
 fn verify_pin(state: &AppState, pin: &PinRecord) -> Result<(), ApiError> {
-    let signature: [u8; 64] = hex::decode(&pin.signature_hex)
-        .map_err(|_| ApiError::bad_request("pin signature is invalid"))?
-        .try_into()
-        .map_err(|_| ApiError::bad_request("pin signature must be 64 bytes"))?;
-    if !verify_signature(
-        &state.identity.public_key_bytes(),
-        &pin_signature_payload(pin)?,
-        &signature,
-    ) {
+    let payload = pin_signature_payload(pin)?;
+    let valid = if pin.owner == "local" {
+        let signature = hex::decode(&pin.signature_hex)
+            .ok()
+            .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+        signature.is_some_and(|signature| {
+            verify_signature(&state.identity.public_key_bytes(), &payload, &signature)
+        })
+    } else {
+        state
+            .network
+            .verify_node_signature(&pin.owner, &payload, &pin.signature_hex)
+            .is_ok()
+    };
+    if !valid {
         return Err(ApiError::bad_request("pin signature verification failed"));
     }
     Ok(())
@@ -2201,6 +2256,29 @@ fn persist_pin(state: &AppState, pin: &PinRecord) -> Result<(), ApiError> {
         .map_err(ApiError::redb_transaction)?;
     {
         let mut pins = write_txn.open_table(PINS).map_err(ApiError::redb_table)?;
+        if let Some(existing) = pins
+            .get(pin.pin_id.as_str())
+            .map_err(ApiError::redb_storage)?
+        {
+            let existing: PinRecord =
+                serde_json::from_slice(existing.value()).map_err(ApiError::serde)?;
+            verify_pin(state, &existing)?;
+            if existing.owner != pin.owner
+                || existing.root_cid != pin.root_cid
+                || existing.replication_factor != pin.replication_factor
+                || existing.created_at_unix_seconds != pin.created_at_unix_seconds
+                || existing.expires_at_unix_seconds != pin.expires_at_unix_seconds
+            {
+                return Err(ApiError::bad_request(
+                    "pin update attempted to change immutable fields",
+                ));
+            }
+            if existing.status == "deleted" && pin.status != "deleted" {
+                return Err(ApiError::bad_request(
+                    "deleted pin records cannot be reactivated",
+                ));
+            }
+        }
         let bytes = serde_json::to_vec(pin).map_err(ApiError::serde)?;
         pins.insert(pin.pin_id.as_str(), bytes.as_slice())
             .map_err(ApiError::redb_storage)?;
@@ -2227,7 +2305,7 @@ fn active_pins_for_root(state: &AppState, root: &Cid) -> Result<Vec<PinRecord>, 
         .collect())
 }
 
-fn active_pins(state: &AppState) -> Result<Vec<PinRecord>, ApiError> {
+fn all_pin_records(state: &AppState) -> Result<Vec<PinRecord>, ApiError> {
     let read_txn = state
         .metadata
         .database()
@@ -2238,25 +2316,41 @@ fn active_pins(state: &AppState) -> Result<Vec<PinRecord>, ApiError> {
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(error) => return Err(ApiError::redb_table(error)),
     };
-    let now = unix_seconds();
     let mut pins = Vec::new();
     for item in table.iter().map_err(ApiError::redb_storage)? {
         let (_, value) = item.map_err(ApiError::redb_storage)?;
         let pin: PinRecord = serde_json::from_slice(value.value()).map_err(ApiError::serde)?;
         verify_pin(state, &pin)?;
-        if pin.status == "active"
-            && pin
-                .expires_at_unix_seconds
-                .is_none_or(|expiry| expiry > now)
-        {
-            pins.push(pin);
-        }
+        pins.push(pin);
     }
     Ok(pins)
 }
 
-fn deactivate_pins_for_root(state: &AppState, root: &Cid) -> Result<(), ApiError> {
-    let mut pins = active_pins_for_root(state, root)?;
+fn active_pins(state: &AppState) -> Result<Vec<PinRecord>, ApiError> {
+    let now = unix_seconds();
+    Ok(all_pin_records(state)?
+        .into_iter()
+        .filter(|pin| {
+            pin.status == "active"
+                && pin
+                    .expires_at_unix_seconds
+                    .is_none_or(|expiry| expiry > now)
+        })
+        .collect())
+}
+
+fn deactivate_pins_for_root(state: &AppState, root: &Cid) -> Result<Vec<PinRecord>, ApiError> {
+    let active = active_pins_for_root(state, root)?;
+    let mut pins = active
+        .iter()
+        .filter(|pin| pin.owner == state.status.node_id || pin.owner == "local")
+        .cloned()
+        .collect::<Vec<_>>();
+    if pins.is_empty() && !active.is_empty() {
+        return Err(ApiError::bad_request(
+            "pin must be deleted through the node that created it",
+        ));
+    }
     let write_txn = state
         .metadata
         .database()
@@ -2274,7 +2368,7 @@ fn deactivate_pins_for_root(state: &AppState, root: &Cid) -> Result<(), ApiError
         }
     }
     write_txn.commit().map_err(ApiError::redb_commit)?;
-    Ok(())
+    Ok(pins)
 }
 
 fn unix_seconds() -> i64 {
@@ -5085,21 +5179,25 @@ async fn collect_compute_output(
         }
         collection
     };
-    if output_path.is_dir() {
+    let root_cid = if output_path.is_dir() {
         let manifest = build_dir_manifest_from_path(state, &output_path).await?;
         let bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
-        Ok(Some(
+        Some(
             put_replicated_block(state, CODEC_DIR_MANIFEST, bytes)
                 .await?
                 .cid,
-        ))
+        )
     } else if output_path.is_file() {
         let bytes =
             std::fs::read(&output_path).map_err(|error| ApiError::internal(error.to_string()))?;
-        Ok(Some(put_object_bytes_internal(state, bytes).await?))
+        Some(put_object_bytes_internal(state, bytes).await?)
     } else {
-        Ok(None)
+        None
+    };
+    if let Some(cid) = &root_cid {
+        ensure_implicit_pin(state, cid).await?;
     }
+    Ok(root_cid)
 }
 
 fn copy_output_path(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
@@ -5362,6 +5460,20 @@ fn load_job(state: &AppState, job_id: &str) -> Result<Option<ComputeJobStatus>, 
         .transpose()
 }
 
+fn next_pin_id() -> String {
+    let mut nonce = [0u8; 16];
+    if getrandom::fill(&mut nonce).is_ok() {
+        format!("pin-{}", hex::encode(nonce))
+    } else {
+        format!(
+            "pin-{}-{}-{}",
+            unix_seconds(),
+            std::process::id(),
+            PIN_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+}
+
 fn next_job_id() -> String {
     let mut nonce = [0u8; 16];
     if getrandom::fill(&mut nonce).is_ok() {
@@ -5617,6 +5729,25 @@ impl NetworkBlockService for AgentBlockService {
         let _guard = self.operation_lock.read().await;
         tokio::task::block_in_place(|| self.block_store.put_replica(codec, &payload))
             .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+}
+
+struct AgentPinService {
+    state: AppState,
+}
+
+#[async_trait]
+impl NetworkPinService for AgentPinService {
+    async fn apply(
+        &self,
+        authenticated_node: &str,
+        pin_record_json: String,
+    ) -> Result<(), NetworkError> {
+        let pin: PinRecord = serde_json::from_str(&pin_record_json)?;
+        if pin.owner != authenticated_node {
+            return Err(NetworkError::Unauthenticated);
+        }
+        persist_pin(&self.state, &pin).map_err(|error| NetworkError::BlockService(error.message))
     }
 }
 

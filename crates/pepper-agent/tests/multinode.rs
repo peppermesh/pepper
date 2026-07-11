@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use pepper_types::{Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, NodeStatus};
+use pepper_types::{
+    Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, GcReport, NodeStatus,
+    PinStatusResponse,
+};
 use reqwest::StatusCode;
 use std::{
     collections::HashSet,
@@ -735,6 +738,174 @@ async fn repair_replicates_to_new_node_after_replica_loss() -> TestResult<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     Err("repair did not copy block to replacement node".into())
+}
+
+#[tokio::test]
+async fn implicit_object_root_pin_protects_chunks_until_unpinned() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p = free_port()?;
+    let api = free_port()?;
+    let config = write_config_with_options(TestConfigOptions {
+        root: temp.path(),
+        name: "object-pin-node",
+        p2p_port: p2p,
+        api_port: api,
+        bootstrap: &[],
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 1,
+    })?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    run_init(agent, &config)?;
+    let _node = spawn_agent(agent, &config)?;
+    wait_health(api).await?;
+
+    let client = reqwest::Client::new();
+    let payload = vec![42u8; 4 * 1024 * 1024 + 1];
+    let put: DurabilityReceipt = client
+        .post(format!("http://127.0.0.1:{api}/v1/objects"))
+        .body(payload)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let encoded = encode_path_segment(&put.cid.to_string());
+    let status: PinStatusResponse = client
+        .get(format!("http://127.0.0.1:{api}/v1/pins/{encoded}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(status.pins.len(), 1);
+    assert_eq!(status.reachable_count, 3);
+
+    let protected: GcReport = client
+        .post(format!("http://127.0.0.1:{api}/v1/admin/gc"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(protected.deleted_blocks, 0);
+    client
+        .delete(format!("http://127.0.0.1:{api}/v1/pins/{encoded}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let collected: GcReport = client
+        .post(format!("http://127.0.0.1:{api}/v1/admin/gc"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(collected.deleted_blocks, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn implicit_pins_protect_and_unpin_collects_three_node_replicas() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_config_with_options(TestConfigOptions {
+        root: temp.path(),
+        name: "pin-node1",
+        p2p_port: p2p1,
+        api_port: api1,
+        bootstrap: &[],
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 3,
+    })?;
+    let bootstrap = [format!("127.0.0.1:{p2p1}")];
+    let config2 = write_config_with_options(TestConfigOptions {
+        root: temp.path(),
+        name: "pin-node2",
+        p2p_port: p2p2,
+        api_port: api2,
+        bootstrap: &bootstrap,
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 3,
+    })?;
+    let config3 = write_config_with_options(TestConfigOptions {
+        root: temp.path(),
+        name: "pin-node3",
+        p2p_port: p2p3,
+        api_port: api3,
+        bootstrap: &bootstrap,
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 3,
+    })?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let _node1 = spawn_agent(agent, &config1)?;
+    let _node2 = spawn_agent(agent, &config2)?;
+    let _node3 = spawn_agent(agent, &config3)?;
+    for api in [api1, api2, api3] {
+        wait_health(api).await?;
+    }
+    wait_for_peer_count(api1, 2).await?;
+
+    let client = reqwest::Client::new();
+    let put: DurabilityReceipt = client
+        .post(format!("http://127.0.0.1:{api1}/v1/blocks"))
+        .body("implicitly pinned")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(put.replicas_accepted, 3, "receipt: {put:?}");
+    let encoded = encode_path_segment(&put.cid.to_string());
+
+    for api in [api1, api2, api3] {
+        let status: PinStatusResponse = client
+            .get(format!("http://127.0.0.1:{api}/v1/pins/{encoded}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(status.pins.len(), 1);
+        let gc: GcReport = client
+            .post(format!("http://127.0.0.1:{api}/v1/admin/gc"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(gc.deleted_blocks, 0);
+    }
+
+    client
+        .delete(format!("http://127.0.0.1:{api1}/v1/pins/{encoded}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut deleted = 0usize;
+    for api in [api1, api2, api3] {
+        let gc: GcReport = client
+            .post(format!("http://127.0.0.1:{api}/v1/admin/gc"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        deleted += gc.deleted_blocks;
+    }
+    assert_eq!(deleted, 3);
+    Ok(())
 }
 
 #[tokio::test]

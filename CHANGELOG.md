@@ -13,7 +13,7 @@ Initial developer-preview release of Pepper's distributed content-addressed stor
 - Apache License 2.0 distribution terms, DCO 1.1 contribution policy, automated sign-off enforcement, and dependency license checks.
 - Immutable raw blocks and chunked object/directory DAGs.
 - Replicated and Reed-Solomon erasure-coded storage.
-- Signed provider records, pinning, garbage collection, corruption recovery, and repair.
+- Signed provider records, implicit root pinning for user-facing puts, authenticated pin synchronization, pin-driven garbage collection, corruption recovery, and repair.
 - Authenticated QUIC node networking and local HTTP/CLI interfaces.
 - Firecracker-only compute with CID inputs, captured outputs/logs, cancellation, limits, and signed receipts.
 - Metrics, administrative status, metadata backup, and development multi-node configuration.

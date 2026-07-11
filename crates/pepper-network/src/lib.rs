@@ -30,7 +30,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/pepper.v1.rs"));
 }
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_FRAME_BYTES: usize = 68 * 1024 * 1024;
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const PROVIDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("providers");
@@ -148,6 +148,15 @@ pub trait NetworkBlockService: Send + Sync + 'static {
 }
 
 #[async_trait]
+pub trait NetworkPinService: Send + Sync + 'static {
+    async fn apply(
+        &self,
+        authenticated_node: &str,
+        pin_record_json: String,
+    ) -> Result<(), NetworkError>;
+}
+
+#[async_trait]
 pub trait NetworkComputeService: Send + Sync + 'static {
     async fn offer(&self, spec_json: String) -> Result<proto::ComputeOfferResponse, NetworkError>;
     async fn submit(
@@ -168,6 +177,7 @@ pub struct NetworkHandle {
     metadata: Arc<MetadataStore>,
     peers: Arc<RwLock<HashMap<String, PeerStatus>>>,
     compute_service: Arc<RwLock<Option<Arc<dyn NetworkComputeService>>>>,
+    pin_service: Arc<RwLock<Option<Arc<dyn NetworkPinService>>>>,
     cluster_secret: Option<Arc<[u8]>>,
     requests_per_minute: Option<u64>,
     rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
@@ -202,6 +212,7 @@ impl NetworkHandle {
             metadata,
             peers,
             compute_service: Arc::new(RwLock::new(None)),
+            pin_service: Arc::new(RwLock::new(None)),
             cluster_secret: config.cluster_secret.map(Arc::from),
             requests_per_minute: config.requests_per_minute,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -233,6 +244,10 @@ impl NetworkHandle {
 
     pub async fn set_compute_service(&self, service: Arc<dyn NetworkComputeService>) {
         *self.compute_service.write().await = Some(service);
+    }
+
+    pub async fn set_pin_service(&self, service: Arc<dyn NetworkPinService>) {
+        *self.pin_service.write().await = Some(service);
     }
 
     pub fn local_descriptor(&self) -> proto::NodeDescriptor {
@@ -686,6 +701,26 @@ impl NetworkHandle {
         let response: proto::BlockAnnounceProviderResponse =
             self.rpc(peer, "/block/announce_provider", request).await?;
         Ok(response.accepted)
+    }
+
+    pub async fn apply_pin(
+        &self,
+        peer: SocketAddr,
+        pin_record_json: String,
+    ) -> Result<(), NetworkError> {
+        let response: proto::PinApplyResponse = self
+            .rpc(
+                peer,
+                "/pin/apply",
+                proto::PinApplyRequest { pin_record_json },
+            )
+            .await?;
+        if !response.accepted {
+            return Err(NetworkError::BlockService(
+                "peer rejected pin record".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn compute_offer(
@@ -1172,6 +1207,22 @@ impl NetworkHandle {
                 let record: ProviderRecord = serde_json::from_str(&announce.provider_record_json)?;
                 self.persist_provider_record(&record)?;
                 encode_payload(proto::BlockAnnounceProviderResponse { accepted: true })
+            }
+            "/pin/apply" => {
+                let pin_service =
+                    self.pin_service
+                        .read()
+                        .await
+                        .clone()
+                        .ok_or_else(|| NetworkError::Rpc {
+                            code: "pin_unavailable".to_string(),
+                            message: "pin service is not available".to_string(),
+                        })?;
+                let apply = proto::PinApplyRequest::decode(request.payload.as_slice())?;
+                pin_service
+                    .apply(&request.node_id, apply.pin_record_json)
+                    .await?;
+                encode_payload(proto::PinApplyResponse { accepted: true })
             }
             "/compute/offer" => {
                 let compute =

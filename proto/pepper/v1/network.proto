@@ -129,6 +129,14 @@ message BlockAnnounceProviderResponse {
   bool accepted = 1;
 }
 
+message PinApplyRequest {
+  string pin_record_json = 1;
+}
+
+message PinApplyResponse {
+  bool accepted = 1;
+}
+
 message ComputeOfferRequest {
   string spec_json = 1;
 }

@@ -645,7 +645,7 @@ fn print_pin_status(response: &PinStatusResponse, json: bool) -> Result<()> {
 }
 
 async fn object_put(api: &str, json: bool, path: PathBuf, erasure: Option<String>) -> Result<()> {
-    let response = put_object_file(api, &path, erasure.as_deref()).await?;
+    let response = put_object_file(api, &path, erasure.as_deref(), true).await?;
     print_receipt(&response, json)?;
     Ok(())
 }
@@ -771,6 +771,7 @@ async fn put_object_file(
     api: &str,
     path: &Path,
     erasure: Option<&str>,
+    pin: bool,
 ) -> Result<DurabilityReceipt> {
     let mut url = resource_url(api, &["v1", "objects"])?;
     if let Some(erasure) = erasure {
@@ -778,6 +779,9 @@ async fn put_object_file(
         url.query_pairs_mut()
             .append_pair("erasure_data_shards", &data.to_string())
             .append_pair("erasure_parity_shards", &parity.to_string());
+    }
+    if !pin {
+        url.query_pairs_mut().append_pair("pin", "false");
     }
     let file = tokio::fs::File::open(path)
         .await
@@ -830,7 +834,7 @@ async fn collect_dir_entries(
                 });
                 stack.push(child);
             } else if metadata.is_file() {
-                let receipt = put_object_file(api, &child, None).await?;
+                let receipt = put_object_file(api, &child, None, false).await?;
                 entries.push(DirEntry {
                     path: relative,
                     kind: "file".to_string(),
