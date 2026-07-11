@@ -27,6 +27,6 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
       - name: Run host-gated Firecracker rootfs/cancel test
-        run: cargo test -p pepper-agent --test multinode firecracker_rootfs_cid_and_cancel_host_gated -- --ignored --exact --nocapture
+        run: cargo test --locked -p pepper-agent --test multinode firecracker_rootfs_cid_and_cancel_host_gated -- --ignored --exact --nocapture
