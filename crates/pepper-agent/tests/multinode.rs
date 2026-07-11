@@ -3,10 +3,12 @@
 use pepper_types::{Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, NodeStatus};
 use reqwest::StatusCode;
 use std::{
+    collections::HashSet,
     fs,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -798,7 +800,18 @@ async fn two_node_replicated_write_and_remote_read() -> TestResult<()> {
 }
 
 fn free_port() -> TestResult<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    static ALLOCATED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let allocated = ALLOCATED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let mut allocated = allocated
+            .lock()
+            .map_err(|_| "test port allocator lock poisoned")?;
+        if allocated.insert(port) {
+            return Ok(port);
+        }
+    }
 }
 
 fn write_config(
@@ -997,7 +1010,7 @@ async fn wait_health(api_port: u16) -> TestResult<()> {
 async fn wait_health_with_token(api_port: u16, token: Option<&str>) -> TestResult<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{api_port}/healthz");
-    for _ in 0..100 {
+    for _ in 0..200 {
         let mut request = client.get(&url);
         if let Some(token) = token {
             request = request.bearer_auth(token);
@@ -1007,9 +1020,9 @@ async fn wait_health_with_token(api_port: u16, token: Option<&str>) -> TestResul
         {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("agent on port {api_port} did not become healthy").into())
+    Err(format!("agent on port {api_port} did not become healthy after 20 seconds").into())
 }
 
 async fn wait_for_peer(api_port: u16) -> TestResult<()> {
