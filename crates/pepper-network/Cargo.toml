@@ -37,3 +37,4 @@ tempfile = "3.23"
 
 [build-dependencies]
 prost-build.workspace = true
+protoc-bin-vendored.workspace = true

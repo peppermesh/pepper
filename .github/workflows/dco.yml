@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out pull request history
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
@@ -52,6 +52,16 @@ jobs:
               author_email = subprocess.check_output(
                   ["git", "show", "-s", "--format=%ae", commit], text=True
               ).strip()
+              # Dependabot is an installed GitHub App, not a legal person able to
+              # certify the DCO. Exempt only its exact, GitHub-controlled identity;
+              # all human and other automation commits remain subject to DCO.
+              if (
+                  author_name == "dependabot[bot]"
+                  and author_email
+                  == "49699333+dependabot[bot]@users.noreply.github.com"
+              ):
+                  print(f"Trusted Dependabot commit: {commit[:12]}")
+                  continue
               message = subprocess.check_output(
                   ["git", "show", "-s", "--format=%B", commit], text=True
               )
