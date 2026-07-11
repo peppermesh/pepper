@@ -4,7 +4,7 @@
 
 All notable changes to Pepper are documented here.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-11
 
 Initial developer-preview release of Pepper's distributed content-addressed storage and data-local Firecracker compute platform.
 
