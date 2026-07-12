@@ -50,6 +50,8 @@ pub struct PepperConfig {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
+    pub namespace: NamespaceConfig,
+    #[serde(default)]
     pub replication: ReplicationConfig,
     #[serde(default)]
     pub erasure: ErasureConfig,
@@ -117,6 +119,46 @@ pub struct StorageLocationConfig {
 pub struct NetworkConfig {
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+}
+
+/// Transactional namespace and per-node consensus resource configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub consensus_enabled: bool,
+    #[serde(default = "default_max_namespace_groups")]
+    pub max_namespace_groups: usize,
+    #[serde(default = "default_max_consensus_log_bytes")]
+    pub max_consensus_log_bytes: u64,
+    #[serde(default = "default_max_namespace_write_rate")]
+    pub max_namespace_write_rate: u64,
+    #[serde(default = "default_max_consensus_command_bytes")]
+    pub max_consensus_command_bytes: u64,
+    #[serde(default = "default_consensus_heartbeat_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_consensus_election_min_ms")]
+    pub election_timeout_min_ms: u64,
+    #[serde(default = "default_consensus_election_max_ms")]
+    pub election_timeout_max_ms: u64,
+    #[serde(default = "default_consensus_snapshot_after_logs")]
+    pub snapshot_after_logs: u64,
+    #[serde(default = "default_consensus_logs_after_snapshot")]
+    pub max_logs_after_snapshot: u64,
+    #[serde(default = "default_consensus_checkpoint_log_bytes")]
+    pub checkpoint_log_bytes: u64,
+    #[serde(default = "default_consensus_restore_target_ms")]
+    pub checkpoint_restore_target_ms: u64,
+    #[serde(default = "default_namespace_max_staging_leases")]
+    pub max_staging_leases: usize,
+    #[serde(default = "default_namespace_max_staging_bytes")]
+    pub max_staging_bytes: u64,
+    #[serde(default = "default_namespace_staging_ttl_seconds")]
+    pub staging_ttl_seconds: u64,
+    #[serde(default = "default_namespace_read_lease_ttl_seconds")]
+    pub read_lease_ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,6 +290,30 @@ impl Default for ApiConfig {
     }
 }
 
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            consensus_enabled: false,
+            max_namespace_groups: default_max_namespace_groups(),
+            max_consensus_log_bytes: default_max_consensus_log_bytes(),
+            max_namespace_write_rate: default_max_namespace_write_rate(),
+            max_consensus_command_bytes: default_max_consensus_command_bytes(),
+            heartbeat_interval_ms: default_consensus_heartbeat_ms(),
+            election_timeout_min_ms: default_consensus_election_min_ms(),
+            election_timeout_max_ms: default_consensus_election_max_ms(),
+            snapshot_after_logs: default_consensus_snapshot_after_logs(),
+            max_logs_after_snapshot: default_consensus_logs_after_snapshot(),
+            checkpoint_log_bytes: default_consensus_checkpoint_log_bytes(),
+            checkpoint_restore_target_ms: default_consensus_restore_target_ms(),
+            max_staging_leases: default_namespace_max_staging_leases(),
+            max_staging_bytes: default_namespace_max_staging_bytes(),
+            staging_ttl_seconds: default_namespace_staging_ttl_seconds(),
+            read_lease_ttl_seconds: default_namespace_read_lease_ttl_seconds(),
+        }
+    }
+}
+
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
@@ -325,6 +391,66 @@ fn default_true() -> bool {
 
 fn default_replication_factor() -> u16 {
     3
+}
+
+fn default_max_namespace_groups() -> usize {
+    128
+}
+
+fn default_max_consensus_log_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_max_namespace_write_rate() -> u64 {
+    1_000
+}
+
+fn default_max_consensus_command_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_consensus_heartbeat_ms() -> u64 {
+    100
+}
+
+fn default_consensus_election_min_ms() -> u64 {
+    300
+}
+
+fn default_consensus_election_max_ms() -> u64 {
+    600
+}
+
+fn default_consensus_snapshot_after_logs() -> u64 {
+    1_000
+}
+
+fn default_consensus_logs_after_snapshot() -> u64 {
+    128
+}
+
+fn default_consensus_checkpoint_log_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_consensus_restore_target_ms() -> u64 {
+    2_000
+}
+
+fn default_namespace_max_staging_leases() -> usize {
+    10_000
+}
+
+fn default_namespace_max_staging_bytes() -> u64 {
+    16 * 1024 * 1024 * 1024
+}
+
+fn default_namespace_staging_ttl_seconds() -> u64 {
+    15 * 60
+}
+
+fn default_namespace_read_lease_ttl_seconds() -> u64 {
+    60 * 60
 }
 
 fn default_repair_interval_seconds() -> u64 {
@@ -456,6 +582,61 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
     if config.node.name.trim().is_empty() {
         return Err(ConfigError::Invalid(
             "node.name must not be empty".to_string(),
+        ));
+    }
+
+    if config.namespace.consensus_enabled && !config.namespace.enabled {
+        return Err(ConfigError::Invalid(
+            "namespace.consensus_enabled requires namespace.enabled".to_string(),
+        ));
+    }
+    if config.namespace.max_namespace_groups == 0
+        || config.namespace.max_consensus_log_bytes == 0
+        || config.namespace.max_namespace_write_rate == 0
+        || config.namespace.max_consensus_command_bytes == 0
+        || config.namespace.snapshot_after_logs == 0
+        || config.namespace.max_logs_after_snapshot == 0
+        || config.namespace.checkpoint_log_bytes == 0
+        || config.namespace.checkpoint_restore_target_ms == 0
+        || config.namespace.max_staging_leases == 0
+        || config.namespace.max_staging_bytes == 0
+        || config.namespace.staging_ttl_seconds == 0
+        || config.namespace.read_lease_ttl_seconds == 0
+    {
+        return Err(ConfigError::Invalid(
+            "namespace consensus limits must be greater than zero".to_string(),
+        ));
+    }
+    if config.namespace.staging_ttl_seconds > i64::MAX as u64
+        || config.namespace.read_lease_ttl_seconds > i64::MAX as u64
+    {
+        return Err(ConfigError::Invalid(
+            "namespace lease TTL values exceed the supported range".to_string(),
+        ));
+    }
+    if config.namespace.max_logs_after_snapshot >= config.namespace.snapshot_after_logs {
+        return Err(ConfigError::Invalid(
+            "namespace.max_logs_after_snapshot must be below snapshot_after_logs".to_string(),
+        ));
+    }
+    if config.namespace.max_consensus_command_bytes >= config.namespace.max_consensus_log_bytes {
+        return Err(ConfigError::Invalid(
+            "namespace.max_consensus_command_bytes must be below max_consensus_log_bytes"
+                .to_string(),
+        ));
+    }
+    if config.namespace.checkpoint_log_bytes >= config.namespace.max_consensus_log_bytes {
+        return Err(ConfigError::Invalid(
+            "namespace.checkpoint_log_bytes must be below max_consensus_log_bytes".to_string(),
+        ));
+    }
+    if config.namespace.heartbeat_interval_ms == 0
+        || config.namespace.election_timeout_min_ms <= config.namespace.heartbeat_interval_ms
+        || config.namespace.election_timeout_max_ms <= config.namespace.election_timeout_min_ms
+    {
+        return Err(ConfigError::Invalid(
+            "namespace election timeouts must satisfy 0 < heartbeat < election_min < election_max"
+                .to_string(),
         ));
     }
 
@@ -692,6 +873,7 @@ impl PepperConfig {
                 })
                 .collect(),
             bootstrap_peers: self.network.bootstrap_peers.clone(),
+            namespace_enabled: self.namespace.enabled,
         }
     }
 }
@@ -716,9 +898,30 @@ mod tests {
         assert_eq!(cfg.node.name, "node-a");
         assert_eq!(cfg.api.bind_addr, "127.0.0.1:9080");
         assert_eq!(cfg.replication.default_factor, 3);
+        assert!(!cfg.namespace.enabled);
         assert!(!cfg.erasure.enabled);
         assert_eq!(cfg.erasure.data_shards, 6);
         assert_eq!(cfg.erasure.parity_shards, 3);
+    }
+
+    #[test]
+    fn namespace_feature_gate_is_explicitly_configurable() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [namespace]
+            enabled = true
+            consensus_enabled = true
+            [[storage.locations]]
+            path = "/tmp/pepper-config-namespace-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.namespace.enabled);
+        assert!(cfg.namespace.consensus_enabled);
+        assert_eq!(cfg.namespace.max_namespace_groups, 128);
+        assert!(cfg.summary(Path::new("pepper.toml")).namespace_enabled);
     }
 
     #[test]

@@ -2,3 +2,8 @@
 /dev/*-data/
 /dev/*-storage/
 *.log
+**/fuzz/target/
+**/fuzz/artifacts/
+
+# Documentation is maintained outside this repository.
+/docs/

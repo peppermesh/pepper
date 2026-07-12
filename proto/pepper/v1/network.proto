@@ -38,6 +38,11 @@ message NodeDescriptor {
   uint64 storage_capacity_bytes = 8;
   uint64 storage_available_bytes = 9;
   string tls_certificate_digest_hex = 10;
+  bool namespace_consensus_enabled = 11;
+  uint64 namespace_group_capacity = 12;
+  uint64 namespace_group_count = 13;
+  uint64 max_consensus_log_bytes = 14;
+  uint64 max_namespace_write_rate = 15;
 }
 
 message HandshakeRequest {
@@ -66,6 +71,11 @@ message PeerInfo {
   map<string, string> placement_labels = 7;
   uint64 storage_capacity_bytes = 8;
   uint64 storage_available_bytes = 9;
+  bool namespace_consensus_enabled = 10;
+  uint64 namespace_group_capacity = 11;
+  uint64 namespace_group_count = 12;
+  uint64 max_consensus_log_bytes = 13;
+  uint64 max_namespace_write_rate = 14;
 }
 
 message ListPeersResponse {
@@ -182,4 +192,85 @@ message ComputeCancelRequest {
 
 message ComputeCancelResponse {
   string job_status_json = 1;
+}
+
+message NamespaceRpcContext {
+  string namespace_id = 1;
+  uint32 namespace_protocol_version = 2;
+  uint64 membership_epoch = 3;
+  uint64 term = 4;
+  string sender_identity = 5;
+  string request_id = 6;
+}
+
+message NamespaceDiscoveryRecord {
+  string namespace_id = 1;
+  uint32 namespace_protocol_version = 2;
+  uint64 membership_epoch = 3;
+  repeated string replica_node_ids = 4;
+  string leader_node_id = 5;
+  uint64 leader_term = 6;
+  int64 expires_at_unix_seconds = 7;
+  string announcer_node_id = 8;
+  string signature_hex = 9;
+}
+
+message NamespaceDiscoverRequest {
+  string namespace_id = 1;
+}
+
+message NamespaceDiscoverResponse {
+  repeated NamespaceDiscoveryRecord records = 1;
+}
+
+message NamespaceAnnounceRequest {
+  NamespaceDiscoveryRecord record = 1;
+}
+
+message NamespaceAnnounceResponse {
+  bool accepted = 1;
+}
+
+message NamespaceRaftRequest {
+  NamespaceRpcContext context = 1;
+  bytes request_json = 2;
+}
+
+message NamespaceRaftResponse {
+  bytes response_json = 1;
+}
+
+message NamespaceForwardRequest {
+  NamespaceRpcContext context = 1;
+  bytes command_json = 2;
+}
+
+message NamespaceForwardResponse {
+  bytes response_json = 1;
+  string leader_node_id = 2;
+  uint64 leader_term = 3;
+}
+
+message NamespaceStateRequest {
+  NamespaceRpcContext context = 1;
+}
+
+message NamespaceStateResponse {
+  bytes state_json = 1;
+}
+
+message NamespaceBootstrapRequest {
+  string namespace_id = 1;
+  string checkpoint_cid = 2;
+  uint64 membership_epoch = 3;
+  bool initialize = 4;
+  bool learner = 5;
+  repeated string current_voters = 6;
+  bool recovery = 7;
+  string recovery_confirmation = 8;
+}
+
+message NamespaceBootstrapResponse {
+  bool started = 1;
+  bool initialized = 2;
 }

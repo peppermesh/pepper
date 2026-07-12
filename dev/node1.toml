@@ -28,6 +28,9 @@ max_capacity_bytes = 1000000000
 [network]
 bootstrap_peers = []
 
+[namespace]
+enabled = false
+
 [replication]
 default_factor = 3
 repair_interval_seconds = 30

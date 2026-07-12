@@ -30,7 +30,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/pepper.v1.rs"));
 }
 
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 8;
 const MAX_FRAME_BYTES: usize = 68 * 1024 * 1024;
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const PROVIDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("providers");
@@ -105,6 +105,11 @@ pub struct NetworkConfig {
     pub placement_labels: HashMap<String, String>,
     pub storage_capacity_bytes: u64,
     pub storage_available_bytes: u64,
+    pub namespace_consensus_enabled: bool,
+    pub namespace_group_capacity: u64,
+    pub namespace_group_count: u64,
+    pub max_consensus_log_bytes: u64,
+    pub max_namespace_write_rate: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +123,11 @@ pub struct PeerStatus {
     pub placement_labels: HashMap<String, String>,
     pub storage_capacity_bytes: u64,
     pub storage_available_bytes: u64,
+    pub namespace_consensus_enabled: bool,
+    pub namespace_group_capacity: u64,
+    pub namespace_group_count: u64,
+    pub max_consensus_log_bytes: u64,
+    pub max_namespace_write_rate: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +144,16 @@ struct StoredPeer {
     storage_capacity_bytes: u64,
     #[serde(default)]
     storage_available_bytes: u64,
+    #[serde(default)]
+    namespace_consensus_enabled: bool,
+    #[serde(default)]
+    namespace_group_capacity: u64,
+    #[serde(default)]
+    namespace_group_count: u64,
+    #[serde(default)]
+    max_consensus_log_bytes: u64,
+    #[serde(default)]
+    max_namespace_write_rate: u64,
 }
 
 #[async_trait]
@@ -154,6 +174,50 @@ pub trait NetworkPinService: Send + Sync + 'static {
         authenticated_node: &str,
         pin_record_json: String,
     ) -> Result<(), NetworkError>;
+}
+
+#[async_trait]
+pub trait NetworkNamespaceService: Send + Sync + 'static {
+    async fn discover(
+        &self,
+        authenticated_node: &str,
+        namespace_id: String,
+    ) -> Result<Vec<proto::NamespaceDiscoveryRecord>, NetworkError>;
+    async fn announce(
+        &self,
+        authenticated_node: &str,
+        record: proto::NamespaceDiscoveryRecord,
+    ) -> Result<(), NetworkError>;
+    async fn raft_vote(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError>;
+    async fn raft_append(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError>;
+    async fn raft_install_snapshot(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError>;
+    async fn forward(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceForwardRequest,
+    ) -> Result<proto::NamespaceForwardResponse, NetworkError>;
+    async fn state(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceStateRequest,
+    ) -> Result<proto::NamespaceStateResponse, NetworkError>;
+    async fn bootstrap(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceBootstrapRequest,
+    ) -> Result<proto::NamespaceBootstrapResponse, NetworkError>;
 }
 
 #[async_trait]
@@ -178,6 +242,7 @@ pub struct NetworkHandle {
     peers: Arc<RwLock<HashMap<String, PeerStatus>>>,
     compute_service: Arc<RwLock<Option<Arc<dyn NetworkComputeService>>>>,
     pin_service: Arc<RwLock<Option<Arc<dyn NetworkPinService>>>>,
+    namespace_service: Arc<RwLock<Option<Arc<dyn NetworkNamespaceService>>>>,
     cluster_secret: Option<Arc<[u8]>>,
     requests_per_minute: Option<u64>,
     rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
@@ -213,6 +278,7 @@ impl NetworkHandle {
             peers,
             compute_service: Arc::new(RwLock::new(None)),
             pin_service: Arc::new(RwLock::new(None)),
+            namespace_service: Arc::new(RwLock::new(None)),
             cluster_secret: config.cluster_secret.map(Arc::from),
             requests_per_minute: config.requests_per_minute,
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -250,6 +316,10 @@ impl NetworkHandle {
         *self.pin_service.write().await = Some(service);
     }
 
+    pub async fn set_namespace_service(&self, service: Arc<dyn NetworkNamespaceService>) {
+        *self.namespace_service.write().await = Some(service);
+    }
+
     pub fn local_descriptor(&self) -> proto::NodeDescriptor {
         self.descriptor
             .lock()
@@ -264,6 +334,19 @@ impl NetworkHandle {
             .expect("local descriptor lock poisoned");
         descriptor.storage_capacity_bytes = capacity_bytes;
         descriptor.storage_available_bytes = available_bytes;
+        descriptor.signature_hex.clear();
+        let signature = self
+            .identity
+            .sign(&descriptor_signature_payload(&descriptor));
+        descriptor.signature_hex = hex::encode(signature);
+    }
+
+    pub fn update_namespace_group_count(&self, group_count: u64) {
+        let mut descriptor = self
+            .descriptor
+            .lock()
+            .expect("local descriptor lock poisoned");
+        descriptor.namespace_group_count = group_count;
         descriptor.signature_hex.clear();
         let signature = self
             .identity
@@ -458,6 +541,11 @@ impl NetworkHandle {
                     placement_labels: peer.placement_labels,
                     storage_capacity_bytes: peer.storage_capacity_bytes,
                     storage_available_bytes: peer.storage_available_bytes,
+                    namespace_consensus_enabled: peer.namespace_consensus_enabled,
+                    namespace_group_capacity: peer.namespace_group_capacity,
+                    namespace_group_count: peer.namespace_group_count,
+                    max_consensus_log_bytes: peer.max_consensus_log_bytes,
+                    max_namespace_write_rate: peer.max_namespace_write_rate,
                 },
             );
         }
@@ -595,6 +683,11 @@ impl NetworkHandle {
                     placement_labels: peer.placement_labels,
                     storage_capacity_bytes: peer.storage_capacity_bytes,
                     storage_available_bytes: peer.storage_available_bytes,
+                    namespace_consensus_enabled: peer.namespace_consensus_enabled,
+                    namespace_group_capacity: peer.namespace_group_capacity,
+                    namespace_group_count: peer.namespace_group_count,
+                    max_consensus_log_bytes: peer.max_consensus_log_bytes,
+                    max_namespace_write_rate: peer.max_namespace_write_rate,
                 });
             }
         }
@@ -785,6 +878,215 @@ impl NetworkHandle {
         .await
     }
 
+    pub fn make_namespace_discovery_record(
+        &self,
+        namespace_id: String,
+        membership_epoch: u64,
+        mut replica_node_ids: Vec<String>,
+        leader_node_id: String,
+        leader_term: u64,
+        expires_at_unix_seconds: i64,
+    ) -> proto::NamespaceDiscoveryRecord {
+        replica_node_ids.sort();
+        replica_node_ids.dedup();
+        let mut record = proto::NamespaceDiscoveryRecord {
+            namespace_id,
+            namespace_protocol_version: 1,
+            membership_epoch,
+            replica_node_ids,
+            leader_node_id,
+            leader_term,
+            expires_at_unix_seconds,
+            announcer_node_id: self.local_descriptor().node_id,
+            signature_hex: String::new(),
+        };
+        record.signature_hex = hex::encode(
+            self.identity
+                .sign(&namespace_discovery_signature_payload(&record)),
+        );
+        record
+    }
+
+    pub fn verify_namespace_discovery_record(
+        &self,
+        record: &proto::NamespaceDiscoveryRecord,
+    ) -> Result<(), NetworkError> {
+        if record.namespace_protocol_version != 1
+            || record.membership_epoch == 0
+            || record.namespace_id.is_empty()
+            || record.namespace_id.len() > 256
+            || record.replica_node_ids.len() != 3
+            || record.expires_at_unix_seconds <= unix_seconds()
+            || record.expires_at_unix_seconds > unix_seconds().saturating_add(300)
+        {
+            return Err(NetworkError::InvalidDescriptor(
+                "invalid namespace discovery record".to_string(),
+            ));
+        }
+        let mut replicas = record.replica_node_ids.clone();
+        replicas.sort();
+        replicas.dedup();
+        if replicas != record.replica_node_ids {
+            return Err(NetworkError::InvalidDescriptor(
+                "namespace replicas must be sorted and unique".to_string(),
+            ));
+        }
+        self.verify_node_signature(
+            &record.announcer_node_id,
+            &namespace_discovery_signature_payload(record),
+            &record.signature_hex,
+        )
+    }
+
+    pub async fn namespace_discover(
+        &self,
+        peer: SocketAddr,
+        namespace_id: String,
+    ) -> Result<Vec<proto::NamespaceDiscoveryRecord>, NetworkError> {
+        let response: proto::NamespaceDiscoverResponse = self
+            .rpc(
+                peer,
+                "/namespace/discover",
+                proto::NamespaceDiscoverRequest { namespace_id },
+            )
+            .await?;
+        Ok(response
+            .records
+            .into_iter()
+            .filter(|record| self.verify_namespace_discovery_record(record).is_ok())
+            .take(16)
+            .collect())
+    }
+
+    pub async fn namespace_announce(
+        &self,
+        peer: SocketAddr,
+        record: proto::NamespaceDiscoveryRecord,
+    ) -> Result<(), NetworkError> {
+        let response: proto::NamespaceAnnounceResponse = self
+            .rpc(
+                peer,
+                "/namespace/announce",
+                proto::NamespaceAnnounceRequest {
+                    record: Some(record),
+                },
+            )
+            .await?;
+        if response.accepted {
+            Ok(())
+        } else {
+            Err(NetworkError::BlockService(
+                "namespace announcement rejected".to_string(),
+            ))
+        }
+    }
+
+    pub async fn namespace_raft_vote(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        let response: proto::NamespaceRaftResponse = self
+            .rpc_identified(peer, "/namespace/raft/vote", request, request_id)
+            .await?;
+        Ok(response.response_json)
+    }
+
+    pub async fn namespace_raft_append(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        let response: proto::NamespaceRaftResponse = self
+            .rpc_identified(peer, "/namespace/raft/append", request, request_id)
+            .await?;
+        Ok(response.response_json)
+    }
+
+    pub async fn namespace_raft_install_snapshot(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceRaftRequest,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        let response: proto::NamespaceRaftResponse = self
+            .rpc_identified(
+                peer,
+                "/namespace/raft/install_snapshot",
+                request,
+                request_id,
+            )
+            .await?;
+        Ok(response.response_json)
+    }
+
+    pub async fn namespace_forward(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceForwardRequest,
+    ) -> Result<proto::NamespaceForwardResponse, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        self.rpc_identified(peer, "/namespace/forward", request, request_id)
+            .await
+    }
+
+    pub async fn namespace_state(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceStateRequest,
+    ) -> Result<proto::NamespaceStateResponse, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        self.rpc_identified(peer, "/namespace/state", request, request_id)
+            .await
+    }
+
+    pub async fn namespace_bootstrap(
+        &self,
+        peer: SocketAddr,
+        request: proto::NamespaceBootstrapRequest,
+    ) -> Result<proto::NamespaceBootstrapResponse, NetworkError> {
+        self.rpc(peer, "/namespace/bootstrap", request).await
+    }
+
+    pub async fn peer_address(&self, node_id: &str) -> Option<SocketAddr> {
+        self.peers()
+            .await
+            .into_iter()
+            .find(|peer| peer.node_id == node_id)
+            .and_then(|peer| {
+                sorted_routable_addresses(peer.addresses)
+                    .into_iter()
+                    .find_map(|address| address.parse().ok())
+            })
+    }
+
     fn authenticated_envelope(
         &self,
         request_id: String,
@@ -822,7 +1124,26 @@ impl NetworkHandle {
     {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            self.rpc_inner(peer, method, request),
+            self.rpc_inner(peer, method, request, None),
+        )
+        .await
+        .map_err(|_| NetworkError::DeadlineExceeded)?
+    }
+
+    async fn rpc_identified<Req, Resp>(
+        &self,
+        peer: SocketAddr,
+        method: &str,
+        request: Req,
+        request_id: String,
+    ) -> Result<Resp, NetworkError>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.rpc_inner(peer, method, request, Some(request_id)),
         )
         .await
         .map_err(|_| NetworkError::DeadlineExceeded)?
@@ -833,6 +1154,7 @@ impl NetworkHandle {
         peer: SocketAddr,
         method: &str,
         request: Req,
+        request_id: Option<String>,
     ) -> Result<Resp, NetworkError>
     where
         Req: Message,
@@ -843,7 +1165,7 @@ impl NetworkHandle {
         let (mut send, mut recv) = connection.open_bi().await?;
         let mut payload = Vec::new();
         request.encode(&mut payload)?;
-        let request_id = next_request_id();
+        let request_id = request_id.unwrap_or_else(next_request_id);
         let envelope = self.authenticated_envelope(request_id.clone(), method.to_string(), payload);
         write_frame(&mut send, &envelope).await?;
         let response = read_frame::<proto::ResponseEnvelope>(&mut recv).await?;
@@ -1109,9 +1431,118 @@ impl NetworkHandle {
                         placement_labels: peer.placement_labels,
                         storage_capacity_bytes: peer.storage_capacity_bytes,
                         storage_available_bytes: peer.storage_available_bytes,
+                        namespace_consensus_enabled: peer.namespace_consensus_enabled,
+                        namespace_group_capacity: peer.namespace_group_capacity,
+                        namespace_group_count: peer.namespace_group_count,
+                        max_consensus_log_bytes: peer.max_consensus_log_bytes,
+                        max_namespace_write_rate: peer.max_namespace_write_rate,
                     })
                     .collect();
                 encode_payload(proto::ListPeersResponse { peers })
+            }
+            "/namespace/discover" => {
+                let namespace_request =
+                    proto::NamespaceDiscoverRequest::decode(request.payload.as_slice())?;
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let records = service
+                    .discover(&request.node_id, namespace_request.namespace_id)
+                    .await?;
+                encode_payload(proto::NamespaceDiscoverResponse { records })
+            }
+            "/namespace/announce" => {
+                let namespace_request =
+                    proto::NamespaceAnnounceRequest::decode(request.payload.as_slice())?;
+                let record = namespace_request.record.ok_or_else(|| {
+                    NetworkError::BlockService("missing namespace discovery record".to_string())
+                })?;
+                if record.announcer_node_id != request.node_id {
+                    return Err(NetworkError::Unauthenticated);
+                }
+                self.verify_namespace_discovery_record(&record)?;
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                service.announce(&request.node_id, record).await?;
+                encode_payload(proto::NamespaceAnnounceResponse { accepted: true })
+            }
+            "/namespace/raft/vote"
+            | "/namespace/raft/append"
+            | "/namespace/raft/install_snapshot" => {
+                let namespace_request =
+                    proto::NamespaceRaftRequest::decode(request.payload.as_slice())?;
+                validate_namespace_context(request, namespace_request.context.as_ref())?;
+                if namespace_request.request_json.len() > 1024 * 1024 {
+                    return Err(NetworkError::BlockService(
+                        "namespace Raft request exceeds limit".to_string(),
+                    ));
+                }
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let response_json = match request.method.as_str() {
+                    "/namespace/raft/vote" => {
+                        service
+                            .raft_vote(&request.node_id, namespace_request)
+                            .await?
+                    }
+                    "/namespace/raft/append" => {
+                        service
+                            .raft_append(&request.node_id, namespace_request)
+                            .await?
+                    }
+                    _ => {
+                        service
+                            .raft_install_snapshot(&request.node_id, namespace_request)
+                            .await?
+                    }
+                };
+                encode_payload(proto::NamespaceRaftResponse { response_json })
+            }
+            "/namespace/bootstrap" => {
+                let namespace_request =
+                    proto::NamespaceBootstrapRequest::decode(request.payload.as_slice())?;
+                if namespace_request.namespace_id.len() > 256
+                    || namespace_request.checkpoint_cid.len() > 256
+                    || namespace_request.membership_epoch == 0
+                {
+                    return Err(NetworkError::BlockService(
+                        "invalid namespace bootstrap request".to_string(),
+                    ));
+                }
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let response = service
+                    .bootstrap(&request.node_id, namespace_request)
+                    .await?;
+                encode_payload(response)
+            }
+            "/namespace/forward" => {
+                let namespace_request =
+                    proto::NamespaceForwardRequest::decode(request.payload.as_slice())?;
+                validate_namespace_context(request, namespace_request.context.as_ref())?;
+                if namespace_request.command_json.len() > 1024 * 1024 {
+                    return Err(NetworkError::BlockService(
+                        "namespace forwarded command exceeds limit".to_string(),
+                    ));
+                }
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let response = service.forward(&request.node_id, namespace_request).await?;
+                encode_payload(response)
+            }
+            "/namespace/state" => {
+                let namespace_request =
+                    proto::NamespaceStateRequest::decode(request.payload.as_slice())?;
+                validate_namespace_context(request, namespace_request.context.as_ref())?;
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let response = service.state(&request.node_id, namespace_request).await?;
+                encode_payload(response)
             }
             "/block/has" => {
                 let block_request = proto::BlockHasRequest::decode(request.payload.as_slice())?;
@@ -1389,6 +1820,11 @@ impl NetworkHandle {
             placement_labels: descriptor.placement_labels.clone(),
             storage_capacity_bytes: descriptor.storage_capacity_bytes,
             storage_available_bytes: descriptor.storage_available_bytes,
+            namespace_consensus_enabled: descriptor.namespace_consensus_enabled,
+            namespace_group_capacity: descriptor.namespace_group_capacity,
+            namespace_group_count: descriptor.namespace_group_count,
+            max_consensus_log_bytes: descriptor.max_consensus_log_bytes,
+            max_namespace_write_rate: descriptor.max_namespace_write_rate,
         };
         self.peers
             .write()
@@ -1427,6 +1863,11 @@ impl NetworkHandle {
                 placement_labels: descriptor.placement_labels.clone(),
                 storage_capacity_bytes: descriptor.storage_capacity_bytes,
                 storage_available_bytes: descriptor.storage_available_bytes,
+                namespace_consensus_enabled: descriptor.namespace_consensus_enabled,
+                namespace_group_capacity: descriptor.namespace_group_capacity,
+                namespace_group_count: descriptor.namespace_group_count,
+                max_consensus_log_bytes: descriptor.max_consensus_log_bytes,
+                max_namespace_write_rate: descriptor.max_namespace_write_rate,
             };
             let bytes = serde_json::to_vec(&stored)?;
             nodes
@@ -1524,6 +1965,11 @@ fn make_descriptor(
         storage_capacity_bytes: config.storage_capacity_bytes,
         storage_available_bytes: config.storage_available_bytes,
         tls_certificate_digest_hex,
+        namespace_consensus_enabled: config.namespace_consensus_enabled,
+        namespace_group_capacity: config.namespace_group_capacity,
+        namespace_group_count: config.namespace_group_count,
+        max_consensus_log_bytes: config.max_consensus_log_bytes,
+        max_namespace_write_rate: config.max_namespace_write_rate,
     };
     let signature = identity.sign(&descriptor_signature_payload(&descriptor));
     descriptor.signature_hex = hex::encode(signature);
@@ -1736,6 +2182,22 @@ fn verify_descriptor(descriptor: &proto::NodeDescriptor) -> Result<(), NetworkEr
     Ok(())
 }
 
+fn namespace_discovery_signature_payload(record: &proto::NamespaceDiscoveryRecord) -> Vec<u8> {
+    let mut out = b"pepper/namespace/discovery/v1".to_vec();
+    append_len_prefixed(&mut out, record.namespace_id.as_bytes());
+    out.extend_from_slice(&record.namespace_protocol_version.to_be_bytes());
+    out.extend_from_slice(&record.membership_epoch.to_be_bytes());
+    out.extend_from_slice(&(record.replica_node_ids.len() as u64).to_be_bytes());
+    for replica in &record.replica_node_ids {
+        append_len_prefixed(&mut out, replica.as_bytes());
+    }
+    append_len_prefixed(&mut out, record.leader_node_id.as_bytes());
+    out.extend_from_slice(&record.leader_term.to_be_bytes());
+    out.extend_from_slice(&record.expires_at_unix_seconds.to_be_bytes());
+    append_len_prefixed(&mut out, record.announcer_node_id.as_bytes());
+    out
+}
+
 fn descriptor_signature_payload(descriptor: &proto::NodeDescriptor) -> Vec<u8> {
     let mut out = Vec::new();
     append_len_prefixed(&mut out, descriptor.node_id.as_bytes());
@@ -1756,7 +2218,30 @@ fn descriptor_signature_payload(descriptor: &proto::NodeDescriptor) -> Vec<u8> {
     out.extend_from_slice(&descriptor.storage_capacity_bytes.to_be_bytes());
     out.extend_from_slice(&descriptor.storage_available_bytes.to_be_bytes());
     append_len_prefixed(&mut out, descriptor.tls_certificate_digest_hex.as_bytes());
+    out.push(u8::from(descriptor.namespace_consensus_enabled));
+    out.extend_from_slice(&descriptor.namespace_group_capacity.to_be_bytes());
+    out.extend_from_slice(&descriptor.namespace_group_count.to_be_bytes());
+    out.extend_from_slice(&descriptor.max_consensus_log_bytes.to_be_bytes());
+    out.extend_from_slice(&descriptor.max_namespace_write_rate.to_be_bytes());
     out
+}
+
+fn validate_namespace_context(
+    envelope: &proto::RequestEnvelope,
+    context: Option<&proto::NamespaceRpcContext>,
+) -> Result<(), NetworkError> {
+    let context = context
+        .ok_or_else(|| NetworkError::BlockService("missing namespace RPC context".to_string()))?;
+    if context.namespace_protocol_version != 1
+        || context.namespace_id.is_empty()
+        || context.namespace_id.len() > 256
+        || context.sender_identity != envelope.node_id
+        || context.request_id != envelope.request_id
+        || context.membership_epoch == 0
+    {
+        return Err(NetworkError::Unauthenticated);
+    }
+    Ok(())
 }
 
 fn encode_payload(message: impl Message) -> Result<Vec<u8>, NetworkError> {
@@ -2146,6 +2631,11 @@ mod tests {
             placement_labels: HashMap::new(),
             storage_capacity_bytes: 0,
             storage_available_bytes: 0,
+            namespace_consensus_enabled: false,
+            namespace_group_capacity: 0,
+            namespace_group_count: 0,
+            max_consensus_log_bytes: 0,
+            max_namespace_write_rate: 0,
         };
         let descriptor = make_descriptor(&config, &identity, "test-tls-digest".to_string());
         let cid = Cid::new(CODEC_RAW, b"hello");
@@ -2170,6 +2660,36 @@ mod tests {
     }
 
     #[test]
+    fn namespace_discovery_signature_binds_group_epoch_and_term() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity =
+            NodeIdentity::generate_and_store(directory.path().join("identity.ed25519")).unwrap();
+        let mut record = proto::NamespaceDiscoveryRecord {
+            namespace_id: "namespace-a".to_string(),
+            namespace_protocol_version: 1,
+            membership_epoch: 3,
+            replica_node_ids: vec!["a".into(), "b".into(), "c".into()],
+            leader_node_id: "a".to_string(),
+            leader_term: 7,
+            expires_at_unix_seconds: unix_seconds() + 60,
+            announcer_node_id: identity.node_id().to_string(),
+            signature_hex: String::new(),
+        };
+        let signature = identity.sign(&namespace_discovery_signature_payload(&record));
+        assert!(verify_signature(
+            &identity.public_key_bytes(),
+            &namespace_discovery_signature_payload(&record),
+            &signature
+        ));
+        record.membership_epoch += 1;
+        assert!(!verify_signature(
+            &identity.public_key_bytes(),
+            &namespace_discovery_signature_payload(&record),
+            &signature
+        ));
+    }
+
+    #[test]
     fn routing_prefers_closer_peer_ids() {
         let cid = Cid {
             version: pepper_types::CID_VERSION,
@@ -2187,6 +2707,11 @@ mod tests {
             placement_labels: HashMap::new(),
             storage_capacity_bytes: 0,
             storage_available_bytes: 0,
+            namespace_consensus_enabled: false,
+            namespace_group_capacity: 0,
+            namespace_group_count: 0,
+            max_consensus_log_bytes: 0,
+            max_namespace_write_rate: 0,
         };
         let near = PeerStatus {
             node_id: format!("{}01", "00".repeat(31)),
@@ -2198,6 +2723,11 @@ mod tests {
             placement_labels: HashMap::new(),
             storage_capacity_bytes: 0,
             storage_available_bytes: 0,
+            namespace_consensus_enabled: false,
+            namespace_group_capacity: 0,
+            namespace_group_count: 0,
+            max_consensus_log_bytes: 0,
+            max_namespace_write_rate: 0,
         };
         let addresses = routing_addresses_for_cid(vec![far, near], &cid);
         assert_eq!(addresses[0], "127.0.0.1:9002");

@@ -2,23 +2,22 @@
 
 [package]
 name = "pepper-crypto"
-version = "0.1.0"
+version = { workspace = true }
 publish = false
-rust-version.workspace = true
-edition.workspace = true
+rust-version = { workspace = true }
+edition = { workspace = true }
 license = "Apache-2.0"
-repository.workspace = true
-homepage.workspace = true
+repository = { workspace = true }
+homepage = { workspace = true }
 description = "Node identity and signature primitives for PepperMesh"
 
 [dependencies]
-blake3.workspace = true
-ed25519-dalek.workspace = true
-getrandom.workspace = true
-hex.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 [dev-dependencies]
 tempfile = "3.23"
