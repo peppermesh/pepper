@@ -18,6 +18,7 @@ use std::{
 };
 
 static API_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+static JSON_OUTPUT: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "pepper", about = "Pepper command-line client")]
@@ -51,7 +52,276 @@ enum Command {
     Dir(DirCommand),
     Pin(PinCommand),
     Compute(ComputeCommand),
+    Namespace(NamespaceCliCommand),
+    Kv(KvCommand),
+    Bucket(BucketCommand),
+    Fs(FsCommand),
     Admin(AdminCommand),
+}
+
+#[derive(Debug, Parser)]
+struct NamespaceCliCommand {
+    #[command(subcommand)]
+    command: NamespaceSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum NamespaceSubcommand {
+    Create {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    Inspect {
+        namespace: String,
+    },
+    Status {
+        namespace: String,
+    },
+    Replicas {
+        namespace: String,
+    },
+    History {
+        namespace: String,
+    },
+    Diff {
+        namespace: String,
+        revision_a: u64,
+        revision_b: u64,
+    },
+    Rollback {
+        namespace: String,
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotSubcommand {
+    Create {
+        namespace: String,
+        name: String,
+        #[arg(long)]
+        revision: Option<u64>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Delete {
+        namespace: String,
+        name: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    List {
+        namespace: String,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct KvCommand {
+    #[command(subcommand)]
+    command: KvSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KvSubcommand {
+    Get {
+        namespace: String,
+        key: String,
+        #[arg(long)]
+        revision: Option<u64>,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        checkpoint: Option<String>,
+    },
+    Put {
+        namespace: String,
+        key: String,
+        #[arg(long)]
+        cid: String,
+        #[arg(long)]
+        if_generation: Option<u64>,
+        #[arg(long)]
+        if_cid: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Delete {
+        namespace: String,
+        key: String,
+        #[arg(long)]
+        if_generation: Option<u64>,
+        #[arg(long)]
+        if_cid: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Scan {
+        namespace: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    PutFile {
+        namespace: String,
+        key: String,
+        path: PathBuf,
+        #[arg(long)]
+        if_generation: Option<u64>,
+        #[arg(long)]
+        if_cid: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Txn {
+        #[command(subcommand)]
+        command: TxnSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TxnSubcommand {
+    Apply {
+        namespace: String,
+        path: PathBuf,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct BucketCommand {
+    #[command(subcommand)]
+    command: BucketSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BucketSubcommand {
+    Create {
+        alias: String,
+    },
+    Put {
+        bucket: String,
+        key: String,
+        path: PathBuf,
+        #[arg(long)]
+        content_type: Option<String>,
+        #[arg(long)]
+        if_generation: Option<u64>,
+        #[arg(long)]
+        if_cid: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Get {
+        bucket: String,
+        key: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    Head {
+        bucket: String,
+        key: String,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    Delete {
+        bucket: String,
+        key: String,
+        #[arg(long)]
+        if_generation: Option<u64>,
+        #[arg(long)]
+        if_cid: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    List {
+        bucket: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    Versions {
+        bucket: String,
+        key: String,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct FsCommand {
+    #[command(subcommand)]
+    command: FsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum FsSubcommand {
+    Create {
+        alias: String,
+    },
+    Checkout {
+        filesystem: String,
+        destination: PathBuf,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
+    Commit {
+        filesystem: String,
+        source: PathBuf,
+        #[arg(long)]
+        base_revision: u64,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    History {
+        filesystem: String,
+    },
+    Diff {
+        filesystem: String,
+        revision_a: u64,
+        revision_b: u64,
+    },
+    Restore {
+        filesystem: String,
+        revision: u64,
+        destination: PathBuf,
+    },
+    Rollback {
+        filesystem: String,
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    CloneFromRoot {
+        filesystem: String,
+        root_cid: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Mount {
+        filesystem: String,
+        mountpoint: PathBuf,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -134,6 +404,34 @@ enum AdminSubcommand {
     CorruptionScan,
     /// Permanently remove quarantined invalid block files.
     QuarantinePurge,
+    Namespace {
+        #[command(subcommand)]
+        command: AdminNamespaceSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminNamespaceSubcommand {
+    Checkpoint {
+        namespace: String,
+    },
+    Rebalance {
+        namespace: String,
+    },
+    ReplaceReplica {
+        namespace: String,
+        failed_node: String,
+        #[arg(long)]
+        replacement_node: Option<String>,
+    },
+    Recover {
+        namespace: String,
+        checkpoint_cid: String,
+        #[arg(long, num_args = 3)]
+        members: Vec<String>,
+        #[arg(long)]
+        confirm_fork_risk: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -194,9 +492,45 @@ enum BlockSubcommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        let message = error.to_string();
+        eprintln!("{message}");
+        let code = if message.contains("GenerationConflict")
+            || message.contains("generation_conflict")
+        {
+            20
+        } else if message.contains("NamespaceUnavailable")
+            || message.contains("NotLeader")
+            || message.contains("namespace_unavailable")
+            || message.contains("not_leader")
+        {
+            21
+        } else if message.contains("DurabilityNotMet") || message.contains("durability_not_met") {
+            22
+        } else if message.contains("Unauthorized")
+            || message.contains("Forbidden")
+            || message.contains("unauthorized")
+            || message.contains("forbidden")
+        {
+            23
+        } else if message.contains("InvalidCursor")
+            || message.contains("InvalidRequest")
+            || message.contains("invalid_cursor")
+            || message.contains("invalid_request")
+        {
+            24
+        } else {
+            1
+        };
+        std::process::exit(code);
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     let _ = API_TOKEN.set(args.api_token.clone());
+    let _ = JSON_OUTPUT.set(args.json);
     match args.command {
         Command::Node(node) => match node.command {
             NodeSubcommand::Status => node_status(&args.api, args.json).await,
@@ -235,6 +569,12 @@ async fn main() -> Result<()> {
             }
             ComputeSubcommand::Output { job_id } => compute_output(&args.api, job_id).await,
         },
+        Command::Namespace(namespace) => {
+            namespace_command(&args.api, args.json, namespace.command).await
+        }
+        Command::Kv(kv) => kv_command(&args.api, args.json, kv.command).await,
+        Command::Bucket(bucket) => bucket_command(&args.api, args.json, bucket.command).await,
+        Command::Fs(fs) => fs_command(&args.api, args.json, fs.command).await,
         Command::Admin(admin) => match admin.command {
             AdminSubcommand::Gc { dry_run } => admin_gc(&args.api, args.json, dry_run).await,
             AdminSubcommand::Repair => {
@@ -252,6 +592,9 @@ async fn main() -> Result<()> {
             AdminSubcommand::CorruptionScan => {
                 admin_json_post(&args.api, args.json, &["v1", "admin", "corruption-scan"]).await
             }
+            AdminSubcommand::Namespace { command } => {
+                admin_namespace_command(&args.api, args.json, command).await
+            }
             AdminSubcommand::QuarantinePurge => {
                 admin_json_post(
                     &args.api,
@@ -262,6 +605,568 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+fn request_id() -> String {
+    format!(
+        "cli-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+async fn send_json(
+    api: &str,
+    method: reqwest::Method,
+    path: &[&str],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let url = resource_url(api, path)?;
+    let mut request = http_client()?.request(method, url.clone());
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to connect to Pepper agent at {url}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .context("failed to read agent response")?;
+    if !status.is_success() {
+        if let Ok(error) = serde_json::from_slice::<pepper_types::ErrorResponse>(&bytes) {
+            if JSON_OUTPUT.get().copied().unwrap_or(false) {
+                anyhow::bail!("{}", serde_json::to_string(&error)?);
+            }
+            anyhow::bail!("{:?}: {}", error.code, error.error);
+        }
+        anyhow::bail!(
+            "agent returned HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    serde_json::from_slice(&bytes).context("failed to decode agent JSON response")
+}
+
+fn print_namespace_json(value: &serde_json::Value, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            println!(
+                "{key}: {}",
+                value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_string)
+            );
+        }
+    } else {
+        println!("{value}");
+    }
+    Ok(())
+}
+
+async fn namespace_command(api: &str, json: bool, command: NamespaceSubcommand) -> Result<()> {
+    let value = match command {
+        NamespaceSubcommand::Create { kind, alias } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "namespaces"],
+            Some(serde_json::json!({"kind": kind, "alias": alias, "request_id": request_id()})),
+        ).await?,
+        NamespaceSubcommand::Inspect { namespace } => send_json(api, reqwest::Method::GET, &["v1", "namespaces", &namespace], None).await?,
+        NamespaceSubcommand::Status { namespace } => send_json(api, reqwest::Method::GET, &["v1", "namespaces", &namespace, "status"], None).await?,
+        NamespaceSubcommand::Replicas { namespace } => send_json(api, reqwest::Method::GET, &["v1", "namespaces", &namespace, "replicas"], None).await?,
+        NamespaceSubcommand::History { namespace } => send_json(api, reqwest::Method::GET, &["v1", "namespaces", &namespace, "history"], None).await?,
+        NamespaceSubcommand::Diff { namespace, revision_a, revision_b } => send_json(api, reqwest::Method::POST, &["v1", "namespaces", &namespace, "diff"], Some(serde_json::json!({"revision_a": revision_a, "revision_b": revision_b}))).await?,
+        NamespaceSubcommand::Rollback { namespace, revision, request_id: id } => send_json(api, reqwest::Method::POST, &["v1", "namespaces", &namespace, "rollback"], Some(serde_json::json!({"revision": revision, "request_id": id.unwrap_or_else(request_id)}))).await?,
+        NamespaceSubcommand::Snapshot { command } => match command {
+            SnapshotSubcommand::List { namespace } => send_json(api, reqwest::Method::GET, &["v1", "namespaces", &namespace, "snapshots"], None).await?,
+            SnapshotSubcommand::Create { namespace, name, revision, request_id: id } => send_json(api, reqwest::Method::POST, &["v1", "namespaces", &namespace, "snapshots"], Some(serde_json::json!({"action":"create", "name":name, "revision":revision, "request_id":id.unwrap_or_else(request_id)}))).await?,
+            SnapshotSubcommand::Delete { namespace, name, request_id: id } => send_json(api, reqwest::Method::POST, &["v1", "namespaces", &namespace, "snapshots"], Some(serde_json::json!({"action":"delete", "name":name, "request_id":id.unwrap_or_else(request_id)}))).await?,
+        },
+    };
+    print_namespace_json(&value, json)
+}
+
+fn mutation_body(
+    namespace: String,
+    key: String,
+    value_cid: Option<String>,
+    if_generation: Option<u64>,
+    if_cid: Option<String>,
+    id: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "namespace": namespace,
+        "key_hex": hex::encode(key.as_bytes()),
+        "value_cid": value_cid,
+        "if_generation": if_generation,
+        "if_cid": if_cid,
+        "request_id": id.unwrap_or_else(request_id)
+    })
+}
+
+async fn kv_command(api: &str, json: bool, command: KvSubcommand) -> Result<()> {
+    let value = match command {
+        KvSubcommand::Get { namespace, key, revision, root, checkpoint } => send_json(api, reqwest::Method::POST, &["v1", "kv", "get"], Some(serde_json::json!({"namespace":namespace, "key_hex":hex::encode(key.as_bytes()), "consistency":"linearizable", "revision":revision, "root_cid":root, "checkpoint_cid":checkpoint}))).await?,
+        KvSubcommand::Put { namespace, key, cid, if_generation, if_cid, request_id: id } => send_json(api, reqwest::Method::POST, &["v1", "kv", "put"], Some(mutation_body(namespace, key, Some(cid), if_generation, if_cid, id))).await?,
+        KvSubcommand::Delete { namespace, key, if_generation, if_cid, request_id: id } => send_json(api, reqwest::Method::POST, &["v1", "kv", "delete"], Some(mutation_body(namespace, key, None, if_generation, if_cid, id))).await?,
+        KvSubcommand::Scan { namespace, prefix, limit, cursor, revision } => send_json(api, reqwest::Method::POST, &["v1", "kv", "scan"], Some(serde_json::json!({"namespace":namespace, "prefix_hex":prefix.map(|value| hex::encode(value.as_bytes())), "limit":limit, "cursor":cursor, "revision":revision, "consistency":"linearizable"}))).await?,
+        KvSubcommand::PutFile { namespace, key, path, if_generation, if_cid, request_id: id } => {
+            let receipt = put_object_file(api, &path, None, true).await?;
+            let uploaded = receipt.cid.to_string();
+            let mut body = mutation_body(namespace, key, Some(uploaded.clone()), if_generation, if_cid, id);
+            body["uploaded_roots"] = serde_json::json!([uploaded]);
+            body["staged_bytes"] = serde_json::json!(receipt.size);
+            body["retain_uploaded_on_conflict"] = serde_json::json!(true);
+            match send_json(api, reqwest::Method::POST, &["v1", "kv", "put"], Some(body)).await {
+                Ok(mut value) => { value["uploaded_object_cid"] = serde_json::json!(receipt.cid); value },
+                Err(error) => anyhow::bail!("{error}; uploaded_object_cid={}", receipt.cid),
+            }
+        }
+        KvSubcommand::Txn { command: TxnSubcommand::Apply { namespace, path, request_id: id } } => {
+            let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+            let mut transaction: serde_json::Value = serde_json::from_slice(&bytes).context("invalid transaction JSON")?;
+            if transaction.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+                anyhow::bail!("transaction file version must be 1");
+            }
+            if !transaction.get("mutations").is_some_and(serde_json::Value::is_array) {
+                anyhow::bail!("transaction file mutations must be an array");
+            }
+            transaction["namespace"] = serde_json::json!(namespace);
+            if transaction.get("request_id").is_none() {
+                transaction["request_id"] = serde_json::json!(id.unwrap_or_else(request_id));
+            }
+            if transaction.get("writer_identity").is_none() { transaction["writer_identity"] = serde_json::json!("cli"); }
+            if transaction.get("signature_hex").is_none() { transaction["signature_hex"] = serde_json::json!("00"); }
+            send_json(api, reqwest::Method::POST, &["v1", "kv", "transactions"], Some(transaction)).await?
+        }
+    };
+    print_namespace_json(&value, json)
+}
+
+async fn bucket_command(api: &str, json: bool, command: BucketSubcommand) -> Result<()> {
+    let value = match command {
+        BucketSubcommand::Create { alias } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "buckets"],
+            Some(serde_json::json!({"alias": alias})),
+        )
+        .await?,
+        BucketSubcommand::Put {
+            bucket,
+            key,
+            path,
+            content_type,
+            if_generation,
+            if_cid,
+            request_id: id,
+        } => {
+            let receipt = put_object_file(api, &path, None, true).await?;
+            let mut value = send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "bucket", "put"],
+                Some(serde_json::json!({
+                    "bucket": bucket,
+                    "key_hex": hex::encode(key.as_bytes()),
+                    "content_cid": receipt.cid,
+                    "logical_size": receipt.size,
+                    "content_type": content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    "if_generation": if_generation,
+                    "if_cid": if_cid,
+                    "request_id": id.unwrap_or_else(request_id)
+                })),
+            )
+            .await
+            .with_context(|| format!("uploaded_object_cid={}", receipt.cid))?;
+            value["uploaded_object_cid"] = serde_json::json!(receipt.cid);
+            value
+        }
+        BucketSubcommand::Get { bucket, key, output, revision } => {
+            let value = send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "bucket", "get"],
+                Some(serde_json::json!({"bucket":bucket, "key_hex":hex::encode(key.as_bytes()), "revision":revision})),
+            )
+            .await?;
+            let cid = value["object"]["content_cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("bucket response is missing content CID"))?;
+            object_get(api, cid.to_string(), output).await?;
+            value
+        }
+        BucketSubcommand::Head { bucket, key, revision } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "bucket", "head"],
+            Some(serde_json::json!({"bucket":bucket, "key_hex":hex::encode(key.as_bytes()), "revision":revision})),
+        ).await?,
+        BucketSubcommand::Delete { bucket, key, if_generation, if_cid, request_id: id } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "bucket", "delete"],
+            Some(serde_json::json!({"bucket":bucket, "key_hex":hex::encode(key.as_bytes()), "if_generation":if_generation, "if_cid":if_cid, "request_id":id.unwrap_or_else(request_id)})),
+        ).await?,
+        BucketSubcommand::List { bucket, prefix, limit, cursor, revision } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "bucket", "list"],
+            Some(serde_json::json!({"bucket":bucket, "prefix_hex":prefix.map(|value| hex::encode(value.as_bytes())), "limit":limit, "cursor":cursor, "revision":revision})),
+        ).await?,
+        BucketSubcommand::Versions { bucket, key } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "bucket", "versions"],
+            Some(serde_json::json!({"bucket":bucket, "key_hex":hex::encode(key.as_bytes())})),
+        ).await?,
+    };
+    print_namespace_json(&value, json)
+}
+
+async fn fs_command(api: &str, json: bool, command: FsSubcommand) -> Result<()> {
+    match command {
+        FsSubcommand::Create { alias } => {
+            let value = send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "filesystems"],
+                Some(serde_json::json!({"alias":alias})),
+            )
+            .await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Commit {
+            filesystem,
+            source,
+            base_revision,
+            message,
+            request_id: id,
+        } => {
+            let (root_mode, entries) = collect_filesystem_entries(api, &source).await?;
+            if !json {
+                eprintln!(
+                    "Note: ownership, ACLs, extended attributes, and platform-specific attributes are unsupported and are not committed"
+                );
+            }
+            let value = send_json(api, reqwest::Method::POST, &["v1", "fs", "commit"], Some(serde_json::json!({"filesystem":filesystem,"base_revision":base_revision,"root_mode":root_mode,"entries":entries,"message":message,"request_id":id.unwrap_or_else(request_id)}))).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Checkout {
+            filesystem,
+            destination,
+            revision,
+        } => {
+            let value = send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "fs", "checkout"],
+                Some(serde_json::json!({"filesystem":filesystem,"revision":revision})),
+            )
+            .await?;
+            restore_filesystem_response(api, &value, &destination).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Restore {
+            filesystem,
+            revision,
+            destination,
+        } => {
+            let value = send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "fs", "restore"],
+                Some(serde_json::json!({"filesystem":filesystem,"revision":revision})),
+            )
+            .await?;
+            restore_filesystem_response(api, &value, &destination).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::History { filesystem } => {
+            let value = send_json(
+                api,
+                reqwest::Method::GET,
+                &["v1", "fs", "history", &filesystem],
+                None,
+            )
+            .await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Diff {
+            filesystem,
+            revision_a,
+            revision_b,
+        } => {
+            let value = send_json(api, reqwest::Method::POST, &["v1", "fs", "diff"], Some(serde_json::json!({"filesystem":filesystem,"revision_a":revision_a,"revision_b":revision_b}))).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Rollback {
+            filesystem,
+            revision,
+            request_id: id,
+        } => {
+            let value = send_json(api, reqwest::Method::POST, &["v1", "fs", "rollback"], Some(serde_json::json!({"filesystem":filesystem,"revision":revision,"request_id":id.unwrap_or_else(request_id)}))).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::CloneFromRoot {
+            filesystem,
+            root_cid,
+            request_id: id,
+        } => {
+            let value = send_json(api, reqwest::Method::POST, &["v1", "fs", "clone"], Some(serde_json::json!({"filesystem":filesystem,"root_cid":root_cid,"request_id":id.unwrap_or_else(request_id)}))).await?;
+            print_namespace_json(&value, json)
+        }
+        FsSubcommand::Mount {
+            filesystem,
+            mountpoint,
+        } => anyhow::bail!(
+            "experimental FUSE support is not enabled; {filesystem} was not mounted at {}. Use checkout/edit/commit instead",
+            mountpoint.display()
+        ),
+    }
+}
+
+async fn collect_filesystem_entries(
+    api: &str,
+    root: &Path,
+) -> Result<(u32, Vec<pepper_filesystem::TreeInputEntry>)> {
+    use pepper_filesystem::{InodeKind, TreeInputEntry};
+    let root_metadata =
+        fs::symlink_metadata(root).with_context(|| format!("failed to stat {}", root.display()))?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        anyhow::bail!("filesystem source must be a real directory");
+    }
+    #[cfg(unix)]
+    let root_mode = {
+        use std::os::unix::fs::MetadataExt;
+        if root_metadata.mode() & 0o7000 != 0 {
+            anyhow::bail!("setuid, setgid, and sticky bits are unsupported on the root directory");
+        }
+        root_metadata.mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let root_mode = 0o755;
+    let mut output = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let mut children = fs::read_dir(&directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children.into_iter().rev() {
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            let relative = path
+                .strip_prefix(root)?
+                .components()
+                .map(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("filesystem paths must be UTF-8"))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("/");
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("symlinks are unsupported: {relative}");
+            }
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.mode() & 0o7000 != 0 {
+                    anyhow::bail!("setuid, setgid, and sticky bits are unsupported: {relative}");
+                }
+                if metadata.is_file() && metadata.nlink() > 1 {
+                    anyhow::bail!("hard links are unsupported: {relative}");
+                }
+                if metadata.is_file()
+                    && metadata.len() > 0
+                    && metadata.blocks().saturating_mul(512) < metadata.len()
+                {
+                    anyhow::bail!("sparse files are unsupported: {relative}");
+                }
+                metadata.mode() & 0o777
+            };
+            #[cfg(not(unix))]
+            let mode = if metadata.is_dir() {
+                0o755
+            } else if metadata.permissions().readonly() {
+                0o444
+            } else {
+                0o644
+            };
+            if metadata.is_dir() {
+                output.push(TreeInputEntry {
+                    path: relative,
+                    kind: InodeKind::Directory,
+                    mode,
+                    logical_size: 0,
+                    content_cid: None,
+                });
+                stack.push(path);
+            } else if metadata.is_file() {
+                let receipt = put_object_file(api, &path, None, true).await?;
+                output.push(TreeInputEntry {
+                    path: relative,
+                    kind: InodeKind::RegularFile,
+                    mode,
+                    logical_size: metadata.len(),
+                    content_cid: Some(receipt.cid),
+                });
+            } else {
+                anyhow::bail!(
+                    "devices, sockets, and other special files are unsupported: {relative}"
+                );
+            }
+        }
+    }
+    output.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((root_mode, output))
+}
+
+async fn restore_filesystem_response(
+    api: &str,
+    value: &serde_json::Value,
+    destination: &Path,
+) -> Result<()> {
+    if destination.exists() {
+        anyhow::bail!("destination already exists: {}", destination.display());
+    }
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid destination"))?;
+    let temporary = parent.join(format!(".{name}.pepper-tmp-{}", std::process::id()));
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary)?;
+    }
+    fs::create_dir(&temporary)?;
+    let root = fs::canonicalize(&temporary)?;
+    let result: Result<()> = async {
+        let entries = value["entries"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("filesystem response is missing entries"))?;
+        let mut directory_modes = Vec::new();
+        for entry in entries {
+            let path = entry["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("filesystem entry is missing path"))?;
+            let target = safe_restore_path(&root, path)?;
+            let kind = entry["inode"]["kind"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("filesystem entry is missing kind"))?;
+            let mode = entry["inode"]["mode"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("filesystem entry is missing mode"))?
+                as u32;
+            match kind {
+                "directory" => {
+                    fs::create_dir_all(&target)?;
+                    directory_modes.push((target, mode));
+                }
+                "regular_file" => {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let cid = entry["inode"]["content_cid"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("file content CID is missing"))?;
+                    let parsed = cid.parse::<pepper_types::Cid>()?;
+                    let url = if parsed.codec == CODEC_RAW {
+                        resource_url(api, &["v1", "blocks", cid])?
+                    } else {
+                        resource_url(api, &["v1", "objects", cid])?
+                    };
+                    let file_tmp = target.with_extension("pepper-part");
+                    download_to_file(url, &file_tmp).await?;
+                    fs::rename(&file_tmp, &target)?;
+                    set_mode(&target, mode)?;
+                }
+                other => anyhow::bail!("unsupported filesystem inode kind {other}"),
+            }
+        }
+        directory_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, mode) in directory_modes {
+            set_mode(&path, mode)?;
+        }
+        let root_mode = value["root_inode"]["mode"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("filesystem response is missing root mode"))?
+            as u32;
+        set_mode(&root, root_mode)?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    fs::rename(&temporary, destination)
+        .with_context(|| format!("failed to atomically publish {}", destination.display()))?;
+    eprintln!("Restored {}", destination.display());
+    Ok(())
+}
+
+async fn admin_namespace_command(
+    api: &str,
+    json: bool,
+    command: AdminNamespaceSubcommand,
+) -> Result<()> {
+    let value = match command {
+        AdminNamespaceSubcommand::Checkpoint { namespace } => {
+            send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "admin", "namespaces", &namespace, "checkpoint"],
+                Some(serde_json::json!({})),
+            )
+            .await?
+        }
+        AdminNamespaceSubcommand::Rebalance { namespace } => {
+            send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "admin", "namespaces", &namespace, "rebalance"],
+                Some(serde_json::json!({})),
+            )
+            .await?
+        }
+        AdminNamespaceSubcommand::ReplaceReplica {
+            namespace,
+            failed_node,
+            replacement_node,
+        } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "admin", "namespaces", &namespace, "replace-replica"],
+            Some(
+                serde_json::json!({"failed_node":failed_node, "replacement_node":replacement_node}),
+            ),
+        )
+        .await?,
+        AdminNamespaceSubcommand::Recover {
+            namespace,
+            checkpoint_cid,
+            members,
+            confirm_fork_risk,
+        } => {
+            if !confirm_fork_risk {
+                anyhow::bail!("recovery requires --confirm-fork-risk");
+            }
+            send_json(api, reqwest::Method::POST, &["v1", "admin", "namespaces", &namespace, "recover"], Some(serde_json::json!({"checkpoint_cid":checkpoint_cid, "members":members, "confirmation":"I_ACCEPT_NAMESPACE_FORK_RISK"}))).await?
+        }
+    };
+    print_namespace_json(&value, json)
 }
 
 fn http_client() -> Result<reqwest::Client> {

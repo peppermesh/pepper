@@ -3,20 +3,28 @@
 [workspace]
 members = [
     "crates/pepper-agent",
+    "crates/pepper-bucket",
     "crates/pepper-cli",
     "crates/pepper-compute",
     "crates/pepper-config",
+    "crates/pepper-consensus",
     "crates/pepper-crypto",
+    "crates/pepper-dag",
+    "crates/pepper-filesystem",
     "crates/pepper-guest-agent",
+    "crates/pepper-merkle",
     "crates/pepper-metadata",
+    "crates/pepper-namespace",
     "crates/pepper-network",
     "crates/pepper-placement",
+    "crates/pepper-publication",
     "crates/pepper-storage",
     "crates/pepper-types",
 ]
 resolver = "2"
 
 [workspace.package]
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -31,6 +39,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = "3.0"
 getrandom = "0.3"
 hex = "0.4"
+openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
 prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"

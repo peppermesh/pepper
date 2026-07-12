@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: namespace-integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: namespace-integration
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TOKIO_WORKER_THREADS: "2"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: transactional namespace HTTP contract
+            command: cargo test --locked -p pepper-agent --test multinode transactional_namespace_http_contract -- --ignored --exact --nocapture --test-threads=1
+          - name: churn and partition soak
+            command: cargo test --locked -p pepper-agent --test multinode churn_partition_soak_harness -- --ignored --exact --nocapture --test-threads=1
+          - name: authenticated QUIC failover and quorum loss
+            command: cargo test --locked -p pepper-consensus tests::authenticated_quic_discovers_routes_fails_over_and_stops_without_quorum -- --ignored --exact --nocapture --test-threads=1
+          - name: learner replacement during writes
+            command: cargo test --locked -p pepper-consensus tests::learner_replacement_catches_up_during_writes_and_promotes_safely -- --ignored --exact --nocapture --test-threads=1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run integration scenario in isolation
+        run: ${{ matrix.command }}

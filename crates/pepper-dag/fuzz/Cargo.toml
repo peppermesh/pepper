@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-dag-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pepper-dag = { path = ".." }
+pepper-types = { path = "../../pepper-types" }
+
+[[bin]]
+name = "builtin_handlers"
+path = "fuzz_targets/builtin_handlers.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the cargo-fuzz harness out of the repository workspace.
+[workspace]

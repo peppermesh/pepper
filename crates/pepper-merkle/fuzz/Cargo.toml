@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-merkle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pepper-dag = { path = "../../pepper-dag" }
+pepper-merkle = { path = ".." }
+
+[[bin]]
+name = "node_decoder"
+path = "fuzz_targets/node_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

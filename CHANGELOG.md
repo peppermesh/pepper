@@ -4,6 +4,26 @@
 
 All notable changes to Pepper are documented here.
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- Completed transactional namespace implementation Phase 0: modularized agent service boundaries, transactional metadata schema-1 to schema-2 migration, centralized pin persistence, verified backup metadata, stable machine-readable API errors, and a disabled-by-default namespace feature gate.
+- Completed Phase 1 typed DAG traversal with a reusable codec registry, bounded deterministic traversal, built-in manifest handlers, GC/pin/repair/locality integration, DAG inspection, custom-codec retention tests, and parser fuzzing.
+- Completed Phase 2 with the canonical `0x07` ordered Merkle radix map, copy-on-write updates, deterministic roots, bounded point/range/prefix reads, root-bound cursors, whole-tree validation, DAG/GC value retention, randomized model testing, stable vectors, decoder fuzzing, and a verified one-million-key benchmark.
+- Completed Phase 3 with canonical namespace descriptor/checkpoint/commit formats (`0x08`–`0x0a`), deterministic snapshot transactions, read-your-writes, CID/generation conflicts, idempotent replay, immutable history, named snapshots, monotonic rollback, retention intents, checkpoint recovery, authorization hooks, stable vectors, and decoder fuzzing.
+- Completed Phase 4 with OpenRaft-backed three-node namespace groups, schema-3 redb consensus repositories, durable vote/log/applied state, immutable checkpoint snapshots and compaction, restart recovery, multi-group isolation, consensus resource admission, and signed node capacity advertisements.
+- Completed Phase 5 with authenticated QUIC Raft/forwarding RPCs, signed expiring discovery records, bounded leader rediscovery, exact-three capacity-aware placement, CID-verified checkpoint fetches over Pepper's data plane, learner catch-up and safe replacement, membership epochs, and explicit fork-risk disaster recovery.
+- Completed Phase 6 with the shared durability-gated publication coordinator, schema-4 staging/read leases and publication intents, atomic Raft-log/state protection records, distributed signed-pin reconciliation, retention-driven release, GC/repair integration, conflict-retained uploads, abandoned-staging cleanup, and publication fault injection.
+- Completed Phase 7 with namespace lifecycle, historical consistency, KV mutation/scan/transaction, snapshot, diff/rollback, and administrative HTTP APIs; native `pepper namespace`, `pepper kv`, and `pepper admin namespace` commands; authenticated replica bootstrap/recovery; stable namespace errors and CLI exit categories; and put-file conflict retention.
+- Completed Phase 8 with canonical `0x0b` bucket object/tombstone descriptors, conditional versioned put/get/head/delete/list/versions, root-bound pagination, immutable version chains, namespace snapshot/rollback reuse, durability-gated object publication, bucket HTTP endpoints, and the native `pepper bucket` CLI.
+- Completed Phase 9 with canonical filesystem root/inode codecs `0x0c` and `0x0d`, Merkle-map directories, ordinary object-backed files, structurally shared atomic tree commits, history/diff/checkout/restore/rollback/clone operations, safe atomic restoration, explicit rejection of unsupported filesystem types, HTTP endpoints, and the native `pepper fs` CLI.
+- Completed Phase 10 with namespace/Raft/publication/Merkle metrics and readiness, persisted-group startup recovery, leader-routed publication, signed identity-bound backup manifests and verified restore, single-live-process identity fencing, release benchmarks and acceptance mapping, consistency/durability documentation, and replacement/quorum-loss operator runbooks.
+
+### Planned
+
+- Transactional namespace and immutable-state publication layer, including traversable DAG codecs, persistent Merkle maps, three-node Raft namespace groups, snapshot transactions, native `namespace`/`kv`/`bucket`/`fs` CLI surfaces, a versioned object namespace, and snapshot filesystem tooling.
+
 ## [0.1.0] - 2026-07-11
 
 Initial developer-preview release of Pepper's distributed content-addressed storage and data-local Firecracker compute platform.

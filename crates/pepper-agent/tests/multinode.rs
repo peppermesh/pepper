@@ -42,7 +42,33 @@ fn metadata_backup_command_copies_redb() -> TestResult<()> {
     let backup = temp.path().join("backup.redb");
     run_backup(agent, &config, &backup)?;
     assert!(backup.exists());
-    assert!(fs::metadata(backup)?.len() > 0);
+    assert!(fs::metadata(&backup)?.len() > 0);
+    assert!(temp.path().join("backup.redb.manifest.json").exists());
+    let restored = Command::new(agent)
+        .arg("--config")
+        .arg(&config)
+        .arg("restore")
+        .arg("--input")
+        .arg(&backup)
+        .arg("--force")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(restored.success());
+    let mut damaged = fs::read(&backup)?;
+    damaged[0] ^= 1;
+    fs::write(&backup, damaged)?;
+    let rejected = Command::new(agent)
+        .arg("--config")
+        .arg(&config)
+        .arg("restore")
+        .arg("--input")
+        .arg(&backup)
+        .arg("--force")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(!rejected.success());
     Ok(())
 }
 
@@ -66,6 +92,16 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
     let _node = spawn_agent(agent, &config)?;
     let client = reqwest::Client::new();
     wait_health_with_token(api, Some("dev-token")).await?;
+    let duplicate = Command::new(agent)
+        .arg("--config")
+        .arg(&config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(
+        !duplicate.success(),
+        "duplicate live identity must be rejected"
+    );
 
     let unauthorized = client
         .get(format!("http://127.0.0.1:{api}/v1/admin/status"))
@@ -79,6 +115,22 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(status.status(), StatusCode::OK);
+    let metrics = client
+        .get(format!("http://127.0.0.1:{api}/metrics"))
+        .bearer_auth("dev-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(metrics.contains("pepper_namespace_commits_total"));
+    assert!(metrics.contains("pepper_merkle_nodes_written_total"));
+    let ready = client
+        .get(format!("http://127.0.0.1:{api}/readyz"))
+        .bearer_auth("dev-token")
+        .send()
+        .await?;
+    assert_eq!(ready.status(), StatusCode::OK);
 
     let too_large = client
         .post(format!("http://127.0.0.1:{api}/v1/blocks"))
@@ -108,6 +160,53 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(invalid_pin.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dag_inspection_uses_shared_traversal() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p = free_port()?;
+    let api = free_port()?;
+    let config = write_config_with_options(TestConfigOptions {
+        root: temp.path(),
+        name: "dag-node",
+        p2p_port: p2p,
+        api_port: api,
+        bootstrap: &[],
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 1,
+    })?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    run_init(agent, &config)?;
+    let _node = spawn_agent(agent, &config)?;
+    wait_health(api).await?;
+
+    let client = reqwest::Client::new();
+    let put: DurabilityReceipt = client
+        .post(format!("http://127.0.0.1:{api}/v1/objects"))
+        .body("dag inspection payload")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let inspection: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/dag/{}",
+            encode_path_segment(&put.cid.to_string())
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(inspection["root_cid"], put.cid.to_string());
+    assert_eq!(inspection["reachable_count"], 2);
+    assert_eq!(inspection["links_examined"], 1);
+    assert_eq!(inspection["codecs"]["0x1"], 1);
+    assert_eq!(inspection["codecs"]["0x2"], 1);
     Ok(())
 }
 
@@ -294,6 +393,314 @@ async fn erasure_repair_proactively_rebalances_after_nodes_join() -> TestResult<
 }
 
 #[tokio::test]
+#[ignore = "scheduled multi-process namespace integration test"]
+async fn transactional_namespace_http_contract() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_config(temp.path(), "namespace1", p2p1, api1, &[])?;
+    let config2 = write_config(
+        temp.path(),
+        "namespace2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_config(
+        temp.path(),
+        "namespace3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    for config in [&config1, &config2, &config3] {
+        let contents = fs::read_to_string(config)?;
+        fs::write(
+            config,
+            contents
+                .replace("default_factor = 2", "default_factor = 3")
+                .replace(
+                    "consensus_enabled = true",
+                    "consensus_enabled = true\nheartbeat_interval_ms = 500\nelection_timeout_min_ms = 3000\nelection_timeout_max_ms = 6000",
+                ),
+        )?;
+    }
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let _one = spawn_agent(agent, &config1)?;
+    let _two = spawn_agent(agent, &config2)?;
+    let _three = spawn_agent(agent, &config3)?;
+    for port in [api1, api2, api3] {
+        wait_health(port).await?;
+    }
+    wait_for_peer_count(api1, 2).await?;
+    wait_for_peer_count(api2, 2).await?;
+    wait_for_peer_count(api3, 2).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let create_response = client
+        .post(format!("http://127.0.0.1:{api1}/v1/namespaces"))
+        .json(&serde_json::json!({"kind":"kv", "alias":"contract"}))
+        .send()
+        .await?;
+    if !create_response.status().is_success() {
+        return Err(format!(
+            "namespace create failed: {} {}",
+            create_response.status(),
+            create_response.text().await?
+        )
+        .into());
+    }
+    let created: serde_json::Value = create_response.json().await?;
+    let namespace = created["namespace_id"]
+        .as_str()
+        .ok_or("missing namespace_id")?;
+    assert_eq!(namespace, created["descriptor_cid"].as_str().unwrap());
+    wait_for_namespace_quorum(&[api1, api2, api3], namespace).await?;
+
+    let block: DurabilityReceipt = client
+        .post(format!("http://127.0.0.1:{api1}/v1/blocks"))
+        .body("namespace-value")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let leader_api = api1;
+    let committed = post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{leader_api}/v1/kv/put"),
+        serde_json::json!({
+            "namespace": namespace,
+            "key_hex": hex::encode("key"),
+            "value_cid": block.cid,
+            "request_id": "contract-put"
+        }),
+    )
+    .await?;
+    assert_eq!(committed["namespace_revision"], 1);
+    let got: serde_json::Value = client.post(format!("http://127.0.0.1:{leader_api}/v1/kv/get"))
+        .json(&serde_json::json!({"namespace":namespace, "key_hex":hex::encode("key"), "consistency":"linearizable"}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(got["value"]["cid"], block.cid.to_string());
+    let replay = post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{leader_api}/v1/kv/put"),
+        serde_json::json!({"namespace":namespace, "key_hex":hex::encode("key"), "value_cid":block.cid, "request_id":"contract-put"}),
+    )
+    .await?;
+    assert_eq!(replay["replayed"], true);
+    let conflict = post_json_until_terminal(
+        client.clone(),
+        format!("http://127.0.0.1:{leader_api}/v1/kv/put"),
+        serde_json::json!({"namespace":namespace, "key_hex":hex::encode("key"), "value_cid":block.cid, "if_generation":0, "request_id":"contract-conflict"}),
+    )
+    .await?;
+    assert_eq!(conflict, reqwest::StatusCode::CONFLICT);
+    let historical: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{leader_api}/v1/kv/get"))
+        .json(
+            &serde_json::json!({"namespace":namespace, "key_hex":hex::encode("key"), "revision":0}),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(historical["stale"], true);
+    assert!(historical["value"].is_null());
+    let scan: serde_json::Value = client.post(format!("http://127.0.0.1:{leader_api}/v1/kv/scan"))
+        .json(&serde_json::json!({"namespace":namespace, "prefix_hex":hex::encode("k"), "limit":10, "consistency":"linearizable"}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(scan["entries"].as_array().unwrap().len(), 1);
+    let history: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{leader_api}/v1/namespaces/{}/history",
+            encode_path_segment(namespace)
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(history["history"].get("1").is_some());
+
+    let bucket_created: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{api1}/v1/buckets"))
+        .json(&serde_json::json!({"alias":"objects"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let bucket = bucket_created["namespace_id"].as_str().unwrap();
+    wait_for_namespace_quorum(&[api1, api2, api3], bucket).await?;
+    let bucket_leader = api1;
+    let bucket_commit = post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{bucket_leader}/v1/bucket/put"),
+        serde_json::json!({
+            "bucket":bucket,
+            "key_hex":hex::encode("object"),
+            "content_cid":block.cid,
+            "logical_size":15,
+            "content_type":"text/plain",
+            "request_id":"bucket-put-1"
+        }),
+    )
+    .await?;
+    assert_eq!(bucket_commit["namespace_revision"], 1);
+    let object: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{bucket_leader}/v1/bucket/get"))
+        .json(&serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object")}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(object["object"]["content_cid"], block.cid.to_string());
+    let object_generation = object["key_generation"]
+        .as_u64()
+        .ok_or("bucket response is missing key generation")?;
+    let race_url = format!("http://127.0.0.1:{bucket_leader}/v1/bucket/put");
+    let race_a = post_json_until_terminal(
+        client.clone(),
+        race_url.clone(),
+        serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object"), "content_cid":block.cid, "logical_size":15, "if_generation":object_generation, "request_id":"bucket-race-a"}),
+    )
+    .await?;
+    assert!(race_a.is_success());
+    let race_b = post_json_until_terminal(
+        client.clone(),
+        race_url,
+        serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object"), "content_cid":block.cid, "logical_size":15, "if_generation":object_generation, "request_id":"bucket-race-b"}),
+    )
+    .await?;
+    assert_eq!(race_b, reqwest::StatusCode::CONFLICT);
+    post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{bucket_leader}/v1/bucket/put"),
+        serde_json::json!({"bucket":bucket, "key_hex":hex::encode("other"), "content_cid":block.cid, "logical_size":15, "request_id":"bucket-other"}),
+    )
+    .await?;
+    let first_page: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{bucket_leader}/v1/bucket/list"))
+        .json(&serde_json::json!({"bucket":bucket, "limit":1}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let cursor = first_page["next_cursor"]
+        .as_str()
+        .ok_or("missing bucket cursor")?;
+    post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{bucket_leader}/v1/bucket/put"),
+        serde_json::json!({"bucket":bucket, "key_hex":hex::encode("third"), "content_cid":block.cid, "logical_size":15, "request_id":"bucket-third"}),
+    )
+    .await?;
+    let mixed_page = client
+        .post(format!("http://127.0.0.1:{bucket_leader}/v1/bucket/list"))
+        .json(&serde_json::json!({"bucket":bucket, "limit":1, "cursor":cursor}))
+        .send()
+        .await?;
+    assert_eq!(mixed_page.status(), reqwest::StatusCode::BAD_REQUEST);
+    let mixed_error: serde_json::Value = mixed_page.json().await?;
+    assert_eq!(mixed_error["code"], "invalid_cursor");
+    let deleted = post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{bucket_leader}/v1/bucket/delete"),
+        serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object"), "request_id":"bucket-delete"}),
+    )
+    .await?;
+    assert_eq!(deleted["tombstone"], true);
+    let versions: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{bucket_leader}/v1/bucket/versions"
+        ))
+        .json(&serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object")}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(versions["versions"].as_array().unwrap().len() >= 3);
+    let historical: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{bucket_leader}/v1/bucket/get"))
+        .json(&serde_json::json!({"bucket":bucket, "key_hex":hex::encode("object"), "revision":1}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(historical["stale"], true);
+
+    let filesystem_created: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{api1}/v1/filesystems"))
+        .json(&serde_json::json!({"alias":"tree"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let filesystem = filesystem_created["namespace_id"].as_str().unwrap();
+    wait_for_namespace_quorum(&[api1, api2, api3], filesystem).await?;
+    let first_tree = serde_json::json!([
+        {"path":"bin","kind":"directory","mode":493,"logical_size":0,"content_cid":null},
+        {"path":"bin/hello","kind":"regular_file","mode":493,"logical_size":15,"content_cid":block.cid}
+    ]);
+    let filesystem_leader = api1;
+    let first_commit = post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{filesystem_leader}/v1/fs/commit"),
+        serde_json::json!({"filesystem":filesystem,"base_revision":0,"entries":first_tree,"message":"initial tree","request_id":"fs-commit-1"}),
+    )
+    .await?;
+    assert_eq!(first_commit["namespace_revision"], 1);
+    let checkout: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{filesystem_leader}/v1/fs/checkout"
+        ))
+        .json(&serde_json::json!({"filesystem":filesystem}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(checkout["entries"].as_array().unwrap().len(), 2);
+    let second_tree = serde_json::json!([
+        {"path":"README","kind":"regular_file","mode":420,"logical_size":15,"content_cid":block.cid},
+        {"path":"bin","kind":"directory","mode":493,"logical_size":0,"content_cid":null},
+        {"path":"bin/hello","kind":"regular_file","mode":493,"logical_size":15,"content_cid":block.cid}
+    ]);
+    post_json_success_with_retry(
+        client.clone(),
+        format!("http://127.0.0.1:{filesystem_leader}/v1/fs/commit"),
+        serde_json::json!({"filesystem":filesystem,"base_revision":1,"entries":second_tree,"request_id":"fs-commit-2"}),
+    )
+    .await?;
+    let tree_diff: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{filesystem_leader}/v1/fs/diff"))
+        .json(&serde_json::json!({"filesystem":filesystem,"revision_a":1,"revision_b":2}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tree_diff["changes"][0]["path"], "README");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "scheduled multi-process churn integration test"]
 async fn churn_partition_soak_harness() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let p2p1 = free_port()?;
@@ -1056,6 +1463,10 @@ max_capacity_bytes = 104857600
 [network]
 bootstrap_peers = [{bootstrap}]
 
+[namespace]
+enabled = true
+consensus_enabled = true
+
 [replication]
 default_factor = {replication_factor}
 repair_interval_seconds = 5
@@ -1127,6 +1538,11 @@ fn spawn_agent_with_env(
     command
         .arg("--config")
         .arg(config)
+        // Keep process-level tests from creating one Tokio worker per visible
+        // host CPU for every spawned agent. CI executes several agents and
+        // consensus runtimes concurrently; two workers are sufficient for the
+        // loopback transport while avoiding scheduler starvation.
+        .env("TOKIO_WORKER_THREADS", "2")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     for (key, value) in envs {
@@ -1201,19 +1617,167 @@ async fn wait_for_peer(api_port: u16) -> TestResult<()> {
 }
 
 async fn wait_for_peer_count(api_port: u16, count: usize) -> TestResult<()> {
-    let client = reqwest::Client::new();
+    const ATTEMPTS: usize = 600;
+    const INTERVAL: Duration = Duration::from_millis(100);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
     let url = format!("http://127.0.0.1:{api_port}/v1/node/peers");
-    for _ in 0..100 {
-        let response = client.get(&url).send().await?;
-        if response.status() == StatusCode::OK {
-            let peers = response.json::<Vec<serde_json::Value>>().await?;
-            if peers.len() >= count {
-                return Ok(());
+    let mut observed = 0usize;
+    let mut last_error = None;
+    for _ in 0..ATTEMPTS {
+        match client.get(&url).send().await {
+            Ok(response) if response.status() == StatusCode::OK => {
+                match response.json::<Vec<serde_json::Value>>().await {
+                    Ok(peers) => {
+                        observed = observed.max(peers.len());
+                        if peers.len() >= count {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+    Err(format!(
+        "agent on port {api_port} discovered at most {observed}/{count} peer(s) after {} seconds{}",
+        ATTEMPTS as u64 * INTERVAL.as_millis() as u64 / 1_000,
+        last_error.map_or_else(String::new, |error| format!("; last error: {error}"))
+    )
+    .into())
+}
+
+async fn post_json_success_with_retry(
+    client: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    let mut last = None;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(180) {
+        match client
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                return Ok(response.json().await?);
+            }
+            Ok(response)
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                last = Some(format!(
+                    "HTTP {}: {}",
+                    response.status(),
+                    response.text().await?
+                ));
+            }
+            Ok(response) => {
+                return Err(format!(
+                    "non-retryable response from {url}: HTTP {}: {}",
+                    response.status(),
+                    response.text().await?
+                )
+                .into());
+            }
+            Err(error) => last = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "request to {url} did not succeed after 180 seconds: {}",
+        last.unwrap_or_else(|| "no response".to_string())
+    )
+    .into())
+}
+
+async fn post_json_until_terminal(
+    client: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+) -> TestResult<StatusCode> {
+    let mut last = None;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(180) {
+        match client
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::CONFLICT =>
+            {
+                return Ok(response.status());
+            }
+            Ok(response)
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                last = Some(format!(
+                    "HTTP {}: {}",
+                    response.status(),
+                    response.text().await?
+                ));
+            }
+            Ok(response) => {
+                return Err(format!(
+                    "non-retryable response from {url}: HTTP {}: {}",
+                    response.status(),
+                    response.text().await?
+                )
+                .into());
+            }
+            Err(error) => last = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "request to {url} did not reach a terminal result: {}",
+        last.unwrap_or_else(|| "no response".to_string())
+    )
+    .into())
+}
+
+async fn wait_for_namespace_quorum(api_ports: &[u16], namespace: &str) -> TestResult<()> {
+    const ATTEMPTS: usize = 600;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let mut errors = Vec::new();
+    for _ in 0..ATTEMPTS {
+        errors.clear();
+        for api_port in api_ports {
+            let response = client
+                .post(format!("http://127.0.0.1:{api_port}/v1/kv/get"))
+                .json(&serde_json::json!({
+                    "namespace": namespace,
+                    "key_hex": hex::encode("quorum-probe"),
+                    "consistency": "linearizable"
+                }))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) => errors.push(format!("{api_port}: HTTP {}", response.status())),
+                Err(error) => errors.push(format!("{api_port}: {error}")),
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("agent on port {api_port} did not discover {count} peer(s)").into())
+    Err(format!(
+        "namespace {namespace} did not establish a linearizable quorum after 60 seconds; {}",
+        errors.join("; ")
+    )
+    .into())
 }
 
 async fn wait_compute_finished(api_port: u16, job_id: &str) -> TestResult<ComputeJobStatus> {

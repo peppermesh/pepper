@@ -25,7 +25,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked --workspace
+        # The workspace includes real multi-process QUIC/Raft tests. Running
+        # those in parallel on a two-core hosted runner starves heartbeats and
+        # produces false quorum-loss failures, so libtest cases are serialized.
+        run: cargo test --locked --workspace -- --test-threads=1
 
   audit:
     runs-on: ubuntu-latest

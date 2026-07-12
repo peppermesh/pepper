@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 use time::OffsetDateTime;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const CID_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -16,6 +16,48 @@ pub const CODEC_DIR_MANIFEST: Codec = Codec(0x03);
 pub const CODEC_COMPUTE_JOB: Codec = Codec(0x04);
 pub const CODEC_COMPUTE_RECEIPT: Codec = Codec(0x05);
 pub const CODEC_ERASURE_MANIFEST: Codec = Codec(0x06);
+pub const CODEC_MERKLE_NODE: Codec = Codec(0x07);
+pub const CODEC_NAMESPACE_DESCRIPTOR: Codec = Codec(0x08);
+pub const CODEC_NAMESPACE_CHECKPOINT: Codec = Codec(0x09);
+pub const CODEC_NAMESPACE_COMMIT: Codec = Codec(0x0a);
+pub const CODEC_BUCKET_OBJECT: Codec = Codec(0x0b);
+pub const CODEC_FILESYSTEM_ROOT: Codec = Codec(0x0c);
+pub const CODEC_FILESYSTEM_INODE: Codec = Codec(0x0d);
+
+/// Stable machine-readable error categories shared by HTTP, CLI, and future
+/// namespace services. New variants may be added; existing serialized names
+/// are part of the public API contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidRequest,
+    NotFound,
+    Conflict,
+    Unauthorized,
+    Forbidden,
+    PayloadTooLarge,
+    CapacityExceeded,
+    RateLimited,
+    IntegrityFailure,
+    Unavailable,
+    UpstreamFailure,
+    UnsupportedCodec,
+    GenerationConflict,
+    NamespaceUnavailable,
+    NotLeader,
+    StaleMembership,
+    DurabilityNotMet,
+    TransactionExpired,
+    InvalidCursor,
+    StagingUnavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorResponse {
+    pub code: ErrorCode,
+    pub error: String,
+}
 
 impl Codec {
     pub fn canonical_display(self) -> String {
@@ -640,6 +682,8 @@ pub struct ConfigSummary {
     pub api_bind_addr: String,
     pub storage_locations: Vec<StorageLocationStatus>,
     pub bootstrap_peers: Vec<String>,
+    #[serde(default)]
+    pub namespace_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -723,6 +767,18 @@ fn parse_codec(value: &str) -> Result<Codec, CidParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_response_has_stable_machine_code() {
+        let response = ErrorResponse {
+            code: ErrorCode::GenerationConflict,
+            error: "changed".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"code":"generation_conflict","error":"changed"}"#
+        );
+    }
 
     #[test]
     fn cid_roundtrips() {

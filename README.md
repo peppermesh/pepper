@@ -6,7 +6,7 @@
 
 Pepper is a private peer-to-peer fabric for content-addressed storage and data-local Firecracker compute.
 
-> **Developer preview:** Pepper 0.1.0 is intended for evaluation and controlled deployments, not untrusted public networks or production multi-tenant workloads.
+> **Development target:** The `main` branch targets Pepper 0.2.0. The latest released version, Pepper 0.1.0, is intended for evaluation and controlled deployments, not untrusted public networks or production multi-tenant workloads.
 
 ## Features
 
@@ -77,13 +77,10 @@ Compute requires Linux, KVM, Firecracker, a configured guest kernel, and an allo
 
 ## Security
 
-The HTTP API binds to loopback. Use an authenticated proxy or VPN for remote access. Non-loopback P2P listeners require a protected cluster secret. Review [`docs/design/TRUST_BOUNDARIES.md`](docs/design/TRUST_BOUNDARIES.md) before deployment.
+The HTTP API binds to loopback. Use an authenticated proxy or VPN for remote access. Non-loopback P2P listeners require a protected cluster secret.
 
-## Documentation
+## Project policies
 
-- [Product requirements](docs/design/PRD.md)
-- [Detailed design](docs/design/DETAILED_DESIGN.md)
-- [Implementation status](docs/design/IMPLEMENTATION_STATUS.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 

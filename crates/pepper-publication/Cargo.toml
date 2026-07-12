@@ -1,0 +1,27 @@
+[package]
+name = "pepper-publication"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Durable transactional publication coordination for Pepper namespaces"
+
+[dependencies]
+async-trait = { workspace = true }
+hex = { workspace = true }
+pepper-consensus = { version = "0.2.0", path = "../pepper-consensus" }
+pepper-dag = { version = "0.2.0", path = "../pepper-dag" }
+pepper-metadata = { version = "0.2.0", path = "../pepper-metadata" }
+pepper-namespace = { version = "0.2.0", path = "../pepper-namespace" }
+pepper-types = { version = "0.2.0", path = "../pepper-types" }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+[dev-dependencies]
+pepper-config = { version = "0.2.0", path = "../pepper-config" }
+pepper-merkle = { version = "0.2.0", path = "../pepper-merkle" }
+pepper-storage = { version = "0.2.0", path = "../pepper-storage" }
+tempfile = "3.23"
