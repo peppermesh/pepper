@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: system-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: system-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: smoke process ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        scenario: [BOOT-002, BLOCK-001, NS-003, LIN-001]
+    env:
+      TOKIO_WORKER_THREADS: "2"
+      SYSTEM_TEST_SEED: "20260712"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build process backend binaries
+        run: cargo build --locked -p pepper-agent -p pepper-cli
+      - name: Run deterministic smoke scenario
+        run: >-
+          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          run --scenario "${{ matrix.scenario }}" --seed "$SYSTEM_TEST_SEED"
+          --backend process --no-build
+      - name: Upload forensic artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-process-${{ matrix.scenario }}
+          path: system-tests/artifacts/
+          if-no-files-found: error
+          retention-days: 7

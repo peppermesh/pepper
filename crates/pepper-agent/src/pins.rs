@@ -5,6 +5,19 @@
 use super::*;
 
 pub(super) async fn ensure_implicit_pin(state: &AppState, root_cid: &Cid) -> Result<(), ApiError> {
+    ensure_implicit_pin_with_factor(state, root_cid, state.replication_factor).await
+}
+
+pub(super) async fn ensure_implicit_pin_with_factor(
+    state: &AppState,
+    root_cid: &Cid,
+    replication_factor: usize,
+) -> Result<(), ApiError> {
+    if replication_factor == 0 || replication_factor > u16::MAX as usize {
+        return Err(ApiError::bad_request(
+            "invalid implicit pin replication factor",
+        ));
+    }
     if active_pins_for_root(state, root_cid)?
         .iter()
         .any(|pin| pin.owner == state.status.node_id && pin.expires_at_unix_seconds.is_none())
@@ -16,7 +29,7 @@ pub(super) async fn ensure_implicit_pin(state: &AppState, root_cid: &Cid) -> Res
         pin_id: next_pin_id(),
         root_cid: root_cid.clone(),
         owner: state.status.node_id.clone(),
-        replication_factor: state.replication_factor as u16,
+        replication_factor: replication_factor as u16,
         created_at_unix_seconds: now,
         expires_at_unix_seconds: None,
         status: "active".to_string(),

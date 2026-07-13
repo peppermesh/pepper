@@ -4,6 +4,22 @@
 
 use super::*;
 
+pub(super) fn record_repair(state: &AppState, mut record: RepairDiagnosticRecord) {
+    let mut records = state
+        .repair_diagnostics
+        .lock()
+        .expect("repair diagnostic lock poisoned");
+    let sequence = records
+        .back()
+        .map_or(1, |record| record.sequence.saturating_add(1));
+    if records.len() == 512 {
+        records.pop_front();
+    }
+    record.sequence = sequence;
+    record.timestamp_unix_seconds = unix_seconds();
+    records.push_back(record);
+}
+
 pub(super) fn spawn_repair_loop(state: AppState) {
     tokio::spawn(async move {
         let mut interval = time::interval(state.repair_interval);
@@ -217,6 +233,20 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
                     Ok(record) => {
                         healthy_provider_node_ids.push(node.node_id.clone());
                         state.network.announce_provider_to_peers(&record).await;
+                        record_repair(
+                            state,
+                            RepairDiagnosticRecord {
+                                sequence: 0,
+                                cid: stat.cid.clone(),
+                                repair_kind: "replica".to_string(),
+                                reason: "under_replicated".to_string(),
+                                source_node: Some(state.status.node_id.clone()),
+                                destination_node: Some(node.node_id.clone()),
+                                result: "verified".to_string(),
+                                verified_bytes: stat.size,
+                                timestamp_unix_seconds: 0,
+                            },
+                        );
                     }
                     Err(error) => {
                         warn!(%error.message, node_id = %node.node_id, "repair acknowledgement validation failed")
@@ -272,15 +302,30 @@ pub(super) async fn repair_erasure_manifest(
                 .await
                 .map_err(|error| ApiError::internal(error.to_string()))?;
             throttle_erasure_repair(state, shard_payload.len()).await;
-            store_erasure_shard(
+            let verified_bytes = shard_payload.len() as u64;
+            let (destination, _) = store_erasure_shard(
                 state,
                 candidates,
-                shard_cid,
+                shard_cid.clone(),
                 shard_payload,
                 &HashSet::new(),
                 &HashSet::new(),
             )
             .await?;
+            record_repair(
+                state,
+                RepairDiagnosticRecord {
+                    sequence: 0,
+                    cid: shard_cid,
+                    repair_kind: "erasure_shard".to_string(),
+                    reason: "missing_shard".to_string(),
+                    source_node: None,
+                    destination_node: Some(destination),
+                    result: "verified".to_string(),
+                    verified_bytes,
+                    timestamp_unix_seconds: 0,
+                },
+            );
             ERASURE_SHARD_REPAIRS.fetch_add(1, Ordering::Relaxed);
         }
         healthy_by_index.clear();

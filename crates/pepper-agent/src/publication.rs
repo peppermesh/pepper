@@ -9,6 +9,9 @@ use pepper_publication::{
     reconcile_pin_intents,
 };
 
+static PIN_BROADCAST_LIMIT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(super) struct AgentDurabilityBackend(pub(super) AppState);
@@ -145,6 +148,20 @@ impl AgentProtectionBackend {
         Ok(())
     }
 
+    fn schedule_broadcast(&self, pin: PinRecord) {
+        let Ok(permit) = PIN_BROADCAST_LIMIT.clone().try_acquire_owned() else {
+            warn!(pin_id = %pin.pin_id, "namespace pin broadcast concurrency limit reached; periodic repair will retry");
+            return;
+        };
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = backend.broadcast(&pin).await {
+                warn!(pin_id = %pin.pin_id, %error, "namespace pin broadcast failed; reconciliation will retry");
+            }
+        });
+    }
+
     async fn broadcast(&self, pin: &PinRecord) -> Result<(), PublicationError> {
         let json = serde_json::to_string(pin)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
@@ -169,7 +186,7 @@ impl AgentProtectionBackend {
                         };
                         if matches!(
                             time::timeout(
-                                Duration::from_secs(5),
+                                Duration::from_millis(500),
                                 network.apply_pin(address, json.clone())
                             )
                             .await,
@@ -218,7 +235,8 @@ impl ProtectionBackend for AgentProtectionBackend {
                     && pin.expires_at_unix_seconds == expires_at_unix_seconds
             })
         {
-            return self.broadcast(&existing).await;
+            self.schedule_broadcast(existing);
+            return Ok(());
         }
         let mut pin = PinRecord {
             pin_id: format!(
@@ -240,7 +258,8 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .put(&pin)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        self.broadcast(&pin).await
+        self.schedule_broadcast(pin);
+        Ok(())
     }
 
     async fn release(
@@ -266,8 +285,8 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .replace(&pins)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        for pin in &pins {
-            self.broadcast(pin).await?;
+        for pin in pins {
+            self.schedule_broadcast(pin);
         }
         Ok(())
     }

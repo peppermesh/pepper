@@ -1622,19 +1622,45 @@ impl GroupHandle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusCommandMetric {
+    pub command_class: String,
+    pub count: u64,
+    pub total_encoded_bytes: u64,
+    pub max_encoded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConsensusCommandAccumulator {
+    count: u64,
+    total_encoded_bytes: u64,
+    max_encoded_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamespaceOperationalStatus {
     pub namespace_id: NamespaceId,
     pub membership_epoch: u64,
+    pub current_revision: u64,
+    pub current_root_cid: Cid,
     pub role: String,
     pub term: u64,
     pub leader_raft_id: Option<NodeId>,
     pub last_log_index: Option<u64>,
+    pub commit_index: Option<u64>,
     pub applied_index: Option<u64>,
     pub snapshot_index: Option<u64>,
     pub log_lag: u64,
     pub quorum_recently_acknowledged: bool,
     pub millis_since_quorum_ack: Option<u64>,
     pub voter_count: usize,
+    pub voter_raft_ids: Vec<NodeId>,
+    pub learner_raft_ids: Vec<NodeId>,
+    pub local_raft_id: NodeId,
+    pub local_voting: bool,
+    pub membership_joint: bool,
+    pub replication_match_indexes: BTreeMap<NodeId, Option<u64>>,
+    pub checkpoint_cid: Option<Cid>,
+    pub checkpoint_verified: bool,
     pub running: bool,
 }
 
@@ -1703,6 +1729,7 @@ pub struct NamespaceGroupManager {
     default_data_store: Option<ConsensusDataStore>,
     config: ConsensusConfig,
     groups: RwLock<HashMap<String, Arc<GroupHandle>>>,
+    command_metrics: Mutex<BTreeMap<String, ConsensusCommandAccumulator>>,
 }
 
 impl NamespaceGroupManager {
@@ -1723,6 +1750,7 @@ impl NamespaceGroupManager {
             default_data_store: None,
             config,
             groups: RwLock::new(HashMap::new()),
+            command_metrics: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1743,6 +1771,7 @@ impl NamespaceGroupManager {
             default_data_store: None,
             config,
             groups: RwLock::new(HashMap::new()),
+            command_metrics: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2095,6 +2124,20 @@ impl NamespaceGroupManager {
         self.routed_linearizable_namespace_state(namespace_id).await
     }
 
+    pub async fn command_metrics(&self) -> Vec<ConsensusCommandMetric> {
+        self.command_metrics
+            .lock()
+            .await
+            .iter()
+            .map(|(command_class, metric)| ConsensusCommandMetric {
+                command_class: command_class.clone(),
+                count: metric.count,
+                total_encoded_bytes: metric.total_encoded_bytes,
+                max_encoded_bytes: metric.max_encoded_bytes,
+            })
+            .collect()
+    }
+
     pub async fn client_write(
         &self,
         namespace_id: &NamespaceId,
@@ -2102,6 +2145,21 @@ impl NamespaceGroupManager {
     ) -> Result<NamespaceClientWriteResponse, ConsensusError> {
         let command_bytes = serde_json::to_vec(&command)
             .map_err(|error| ConsensusError::Serde(error.to_string()))?;
+        let command_class = match &command.command {
+            NamespaceCommand::ApplyTransaction { .. } => "apply_transaction",
+            NamespaceCommand::CreateSnapshot { .. } => "create_snapshot",
+            NamespaceCommand::DeleteSnapshot { .. } => "delete_snapshot",
+            NamespaceCommand::Rollback { .. } => "rollback",
+        };
+        {
+            let mut metrics = self.command_metrics.lock().await;
+            let metric = metrics.entry(command_class.to_string()).or_default();
+            metric.count = metric.count.saturating_add(1);
+            metric.total_encoded_bytes = metric
+                .total_encoded_bytes
+                .saturating_add(command_bytes.len().min(u64::MAX as usize) as u64);
+            metric.max_encoded_bytes = metric.max_encoded_bytes.max(command_bytes.len() as u64);
+        }
         if command_bytes.len() as u64 > self.config.max_command_bytes {
             return Err(ConsensusError::CommandTooLarge(
                 self.config.max_command_bytes,
@@ -2440,34 +2498,76 @@ impl NamespaceGroupManager {
     }
 
     pub async fn operational_statuses(&self) -> Vec<NamespaceOperationalStatus> {
-        let groups = self.groups.read().await;
-        let mut statuses = groups
+        let groups = self
+            .groups
+            .read()
+            .await
             .values()
-            .map(|group| {
-                let metrics = group.raft.metrics().borrow().clone();
-                let last_log_index = metrics.last_log_index;
-                let applied_index = metrics.last_applied.map(|log| log.index);
-                NamespaceOperationalStatus {
-                    namespace_id: group.namespace_id.clone(),
-                    membership_epoch: group.membership_epoch(),
-                    role: format!("{:?}", metrics.state).to_lowercase(),
-                    term: metrics.current_term,
-                    leader_raft_id: metrics.current_leader,
-                    last_log_index,
-                    applied_index,
-                    snapshot_index: metrics.snapshot.map(|log| log.index),
-                    log_lag: last_log_index
-                        .unwrap_or(0)
-                        .saturating_sub(applied_index.unwrap_or(0)),
-                    quorum_recently_acknowledged: metrics.current_leader.is_some()
-                        && metrics.millis_since_quorum_ack.unwrap_or(0)
-                            <= self.config.election_timeout_max_ms.saturating_mul(2),
-                    millis_since_quorum_ack: metrics.millis_since_quorum_ack,
-                    voter_count: metrics.membership_config.membership().voter_ids().count(),
-                    running: metrics.running_state.is_ok(),
-                }
-            })
+            .cloned()
             .collect::<Vec<_>>();
+        let mut statuses = Vec::with_capacity(groups.len());
+        for group in groups {
+            let metrics = group.raft.metrics().borrow().clone();
+            let last_log_index = metrics.last_log_index;
+            let applied_index = metrics.last_applied.map(|log| log.index);
+            let commit_index = group
+                .log_store
+                .clone()
+                .read_committed()
+                .await
+                .ok()
+                .flatten()
+                .map(|log| log.index);
+            let membership = metrics.membership_config.membership();
+            let voter_raft_ids = membership.voter_ids().collect::<Vec<_>>();
+            let learner_raft_ids = membership.learner_ids().collect::<Vec<_>>();
+            let local_voting = voter_raft_ids.contains(&self.node_id);
+            let replication_match_indexes = metrics
+                .replication
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(node_id, log)| (node_id, log.map(|log| log.index)))
+                .collect();
+            let namespace_state = group.namespace_state().await;
+            let checkpoint_cid = group
+                .state_machine
+                .current_snapshot
+                .read()
+                .await
+                .as_ref()
+                .map(|snapshot| snapshot.pointer.checkpoint_cid.clone());
+            statuses.push(NamespaceOperationalStatus {
+                namespace_id: group.namespace_id.clone(),
+                membership_epoch: group.membership_epoch(),
+                current_revision: namespace_state.current_revision,
+                current_root_cid: namespace_state.current_root_cid,
+                role: format!("{:?}", metrics.state).to_lowercase(),
+                term: metrics.current_term,
+                leader_raft_id: metrics.current_leader,
+                last_log_index,
+                commit_index,
+                applied_index,
+                snapshot_index: metrics.snapshot.map(|log| log.index),
+                log_lag: last_log_index
+                    .unwrap_or(0)
+                    .saturating_sub(applied_index.unwrap_or(0)),
+                quorum_recently_acknowledged: metrics.millis_since_quorum_ack.is_some_and(
+                    |millis| millis <= self.config.election_timeout_max_ms.saturating_mul(2),
+                ),
+                millis_since_quorum_ack: metrics.millis_since_quorum_ack,
+                voter_count: voter_raft_ids.len(),
+                voter_raft_ids,
+                learner_raft_ids,
+                local_raft_id: self.node_id,
+                local_voting,
+                membership_joint: membership.get_joint_config().len() > 1,
+                replication_match_indexes,
+                checkpoint_verified: checkpoint_cid.is_some(),
+                checkpoint_cid,
+                running: metrics.running_state.is_ok(),
+            });
+        }
         statuses.sort_by_key(|status| status.namespace_id.to_string());
         statuses
     }
@@ -2623,10 +2723,13 @@ impl NamespaceGroupManager {
             .await
             .map_err(namespace_network_error)?;
         let current_epoch = group.membership_epoch.load(Ordering::Acquire);
-        if context.membership_epoch < current_epoch
-            || (!allow_membership_transition && context.membership_epoch != current_epoch)
-            || context.membership_epoch > current_epoch.saturating_add(4)
-        {
+        let epoch_valid = if allow_membership_transition {
+            context.membership_epoch >= current_epoch.saturating_sub(4)
+                && context.membership_epoch <= current_epoch.saturating_add(4)
+        } else {
+            context.membership_epoch == current_epoch
+        };
+        if !epoch_valid {
             return Err(namespace_network_error("stale namespace membership epoch"));
         }
         Ok(group)
@@ -3528,6 +3631,15 @@ mod tests {
             .await
             .unwrap();
         assert!(response.data.result.is_some());
+        let command_metrics = leader.manager.command_metrics().await;
+        assert_eq!(command_metrics.len(), 1);
+        assert_eq!(command_metrics[0].command_class, "apply_transaction");
+        assert_eq!(command_metrics[0].count, 1);
+        assert!(command_metrics[0].total_encoded_bytes > 0);
+        assert_eq!(
+            command_metrics[0].total_encoded_bytes,
+            command_metrics[0].max_encoded_bytes
+        );
         wait_for_revision(&a, 1).await;
         wait_for_revision(&b, 1).await;
         wait_for_revision(&c, 1).await;
@@ -3554,6 +3666,20 @@ mod tests {
             .unwrap()
             .expect("snapshot should be persisted");
         assert!(snapshot.snapshot.get_ref().len() < 512);
+        let operational = leader.manager.operational_statuses().await;
+        let status = operational
+            .iter()
+            .find(|status| status.namespace_id == namespace_id)
+            .expect("namespace operational status should exist");
+        assert_eq!(
+            status
+                .checkpoint_cid
+                .as_ref()
+                .expect("checkpoint CID should be reported")
+                .codec,
+            pepper_types::CODEC_NAMESPACE_CHECKPOINT
+        );
+        assert!(status.checkpoint_verified);
 
         leader.manager.shutdown_group(&namespace_id).await.unwrap();
         let survivors = if first_leader == raft_node_id("node-a") {
@@ -3628,7 +3754,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-    #[ignore = "scheduled real-QUIC consensus integration test"]
+    #[ignore = "manual focused protocol smoke; system replacements are NS-002, RAFT-001, and RAFT-002"]
     async fn authenticated_quic_discovers_routes_fails_over_and_stops_without_quorum() {
         let a = network_test_node("rack-a").await;
         let b = network_test_node("rack-b").await;
@@ -3814,7 +3940,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-    #[ignore = "scheduled learner replacement integration test"]
+    #[ignore = "manual legacy removal gate; system replacement is RAFT-004"]
     async fn learner_replacement_catches_up_during_writes_and_promotes_safely() {
         let a = network_test_node("replace-a").await;
         let b = network_test_node("replace-b").await;

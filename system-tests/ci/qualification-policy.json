@@ -1,0 +1,392 @@
+{
+  "schema_version": 1,
+  "release": "0.2.0",
+  "tiers": [
+    {
+      "name": "smoke",
+      "requirements": [
+        {
+          "scenario": "BOOT-002",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
+        },
+        {
+          "scenario": "BLOCK-001",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
+        },
+        {
+          "scenario": "NS-003",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
+        },
+        {
+          "scenario": "LIN-001",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
+        }
+      ]
+    },
+    {
+      "name": "functional",
+      "requirements": [
+        {
+          "scenario": "BOOT-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BOOT-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BLOCK-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BLOCK-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "REPL-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "REPL-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "REPL-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "REPL-004",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "REPL-005",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "OBJECT-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "DIR-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "EC-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "EC-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "EC-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "PIN-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "PIN-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "GC-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "DAG-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "CORRUPT-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "NS-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "NS-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "NS-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "NS-004",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "RAFT-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "RAFT-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BUCKET-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BUCKET-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BUCKET-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FS-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FS-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FS-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BACKUP-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "BACKUP-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FAULT-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FAULT-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "LIN-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        }
+      ]
+    },
+    {
+      "name": "chaos",
+      "requirements": [
+        {
+          "scenario": "FAULT-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "FAULT-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "NEMESIS-001",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "RAFT-002",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "RAFT-004",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
+        }
+      ]
+    },
+    {
+      "name": "soak",
+      "requirements": [
+        {
+          "scenario": "SOAK-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [
+            "observations/kernel-lock.json",
+            "observations/resource-samples.json",
+            "observations/growth-analysis.json",
+            "observations/soak-report.json"
+          ],
+          "require_image_digest": true
+        }
+      ]
+    },
+    {
+      "name": "wan",
+      "requirements": [
+        {
+          "scenario": "WAN-001",
+          "backend": "wan",
+          "minimum_passes": 1,
+          "required_files": [
+            "observations/wan-report.json"
+          ],
+          "require_image_digest": false,
+          "required_capability": "tailscale"
+        },
+        {
+          "scenario": "WAN-001",
+          "backend": "wan",
+          "minimum_passes": 1,
+          "required_files": [
+            "observations/wan-report.json"
+          ],
+          "require_image_digest": false,
+          "required_capability": "direct"
+        }
+      ]
+    },
+    {
+      "name": "host-gated",
+      "requirements": [
+        {
+          "scenario": "KVM-001",
+          "backend": "kvm",
+          "minimum_passes": 1,
+          "required_files": [
+            "observations/kvm-report.json"
+          ],
+          "require_image_digest": false
+        }
+      ]
+    }
+  ]
+}

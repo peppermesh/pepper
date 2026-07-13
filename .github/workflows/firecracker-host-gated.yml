@@ -6,27 +6,60 @@ on:
   workflow_dispatch:
     inputs:
       rootfs_image:
-        description: "Path to a Firecracker-compatible ext4 rootfs image on the runner"
+        description: "Path to a disposable Firecracker-compatible ext4 rootfs"
         required: true
         default: "/var/lib/pepper/rootfs.ext4"
       kernel_image:
-        description: "Path to a Firecracker-compatible guest kernel on the runner"
+        description: "Path to the pinned guest kernel"
         required: true
         default: "/var/lib/pepper/vmlinux"
+      seed:
+        description: "Exact reproduction seed"
+        required: true
+        default: "20260712"
 
 permissions:
   contents: read
 
+concurrency:
+  group: firecracker-host-gated
+  cancel-in-progress: false
+
 jobs:
   firecracker-host-gated:
     runs-on: [self-hosted, linux, kvm, firecracker]
+    timeout-minutes: 45
     env:
       PEPPER_FIRECRACKER_ROOTFS_IMAGE: ${{ inputs.rootfs_image }}
       PEPPER_FIRECRACKER_KERNEL_IMAGE: ${{ inputs.kernel_image }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - name: Build workspace
-        run: cargo build --locked --workspace
-      - name: Run host-gated Firecracker rootfs/cancel test
-        run: cargo test --locked -p pepper-agent --test multinode firecracker_rootfs_cid_and_cancel_host_gated -- --ignored --exact --nocapture
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate disposable KVM host
+        run: |
+          test -r /dev/kvm && test -w /dev/kvm
+          test -s "$PEPPER_FIRECRACKER_ROOTFS_IMAGE"
+          test -s "$PEPPER_FIRECRACKER_KERNEL_IMAGE"
+          firecracker --version
+      - name: Run KVM Firecracker system scenario
+        run: >-
+          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          run --scenario KVM-001 --seed "${{ inputs.seed }}" --backend kvm
+      - name: Refuse leaked Firecracker processes
+        if: always()
+        run: |
+          if pgrep -x firecracker; then
+            pkill -TERM -x firecracker || true
+            sleep 2
+            pkill -KILL -x firecracker || true
+            exit 1
+          fi
+      - name: Upload KVM qualification archive
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kvm-${{ github.sha }}-${{ inputs.seed }}
+          path: system-tests/artifacts/
+          if-no-files-found: error
+          retention-days: 60

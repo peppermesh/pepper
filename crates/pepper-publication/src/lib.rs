@@ -234,8 +234,7 @@ impl PublicationRepository {
     }
 
     pub fn put_staging(&self, lease: &StagingLease) -> Result<(), PublicationError> {
-        if lease.roots.is_empty()
-            || lease.roots.len() > self.limits.max_staging_roots
+        if lease.roots.len() > self.limits.max_staging_roots
             || lease.staged_bytes > self.limits.max_staging_bytes
             || lease.expires_at_unix_seconds <= lease.created_at_unix_seconds
             || lease.expires_at_unix_seconds - lease.created_at_unix_seconds
@@ -335,6 +334,13 @@ impl PublicationRepository {
                 .filter(|lease| lease.expires_at_unix_seconds > now)
                 .collect(),
         )
+    }
+
+    pub fn all_intents(&self) -> Result<Vec<PublicationIntentRecord>, PublicationError> {
+        let mut intents =
+            read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?;
+        intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+        Ok(intents)
     }
 
     pub fn pending_intents(&self) -> Result<Vec<PublicationIntentRecord>, PublicationError> {

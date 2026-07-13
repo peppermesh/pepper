@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "required_successful_runs": 20,
+  "required_distinct_days": 7,
+  "tests": [
+    {
+      "legacy_test": "transactional_namespace_http_contract",
+      "replacement_scenarios": ["NS-001", "NS-002", "NS-003", "NS-004", "BUCKET-001", "BUCKET-002", "BUCKET-003", "FS-001", "FS-002", "FS-003"],
+      "replacement_complete": true,
+      "decision": "remove-after-historical-gate",
+      "evidence_source": "system-nightly",
+      "owner": "storage-and-consensus"
+    },
+    {
+      "legacy_test": "churn_partition_soak_harness",
+      "replacement_scenarios": ["RAFT-002", "NEMESIS-001", "PUB-002", "SOAK-001"],
+      "replacement_complete": false,
+      "decision": "retain-until-soak-qualification",
+      "evidence_source": "system-chaos,system-soak",
+      "owner": "storage-and-consensus"
+    },
+    {
+      "legacy_test": "authenticated_quic_discovers_routes_fails_over_and_stops_without_quorum",
+      "replacement_scenarios": ["NS-002", "RAFT-001", "RAFT-002"],
+      "replacement_complete": true,
+      "decision": "retain-focused-protocol-smoke",
+      "evidence_source": "system-nightly,system-chaos",
+      "owner": "storage-and-consensus"
+    },
+    {
+      "legacy_test": "learner_replacement_catches_up_during_writes_and_promotes_safely",
+      "replacement_scenarios": ["RAFT-004"],
+      "replacement_complete": true,
+      "decision": "remove-after-historical-gate",
+      "evidence_source": "system-chaos",
+      "owner": "storage-and-consensus"
+    },
+    {
+      "legacy_test": "erasure_repair_proactively_rebalances_after_nodes_join",
+      "replacement_scenarios": ["EC-003", "REPL-002"],
+      "replacement_complete": true,
+      "decision": "remove-after-historical-gate",
+      "evidence_source": "system-nightly",
+      "owner": "storage-and-consensus"
+    }
+  ]
+}

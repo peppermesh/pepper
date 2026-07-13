@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peppermesh.org/schemas/system-test/v1/artifact-manifest.schema.json",
+  "title": "Pepper system test artifact manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "created_at", "redaction", "files"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "secrets_scanned", "payloads_included"],
+      "properties": {
+        "profile": { "enum": ["ci-public", "ci-private", "local", "encrypted-forensic"] },
+        "secrets_scanned": { "type": "boolean" },
+        "payloads_included": { "type": "boolean" },
+        "notes": { "type": ["string", "null"], "maxLength": 4096 }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/file" }
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "media_type", "bytes", "sha256", "required", "redacted"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "not": { "pattern": "^(?:/|[A-Za-z]:|.*(?:^|/)\\.\\.(?:/|$))" }
+        },
+        "kind": {
+          "enum": [
+            "run", "topology", "events", "junit", "failure", "reproduce", "compose",
+            "config", "log", "metrics", "observation", "diagnostic", "inventory",
+            "network", "volume_manifest", "corrupt_original", "other"
+          ]
+        },
+        "node_id": { "type": ["string", "null"], "maxLength": 256 },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "required": { "type": "boolean" },
+        "redacted": { "type": "boolean" },
+        "encrypted": { "type": "boolean" },
+        "description": { "type": ["string", "null"], "maxLength": 4096 }
+      }
+    }
+  }
+}

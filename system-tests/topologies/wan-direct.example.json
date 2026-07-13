@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "run_id": "operator-direct-template",
+  "profile": "wan-direct",
+  "network": {
+    "name": "operator-direct",
+    "subnet": "public-routed",
+    "mtu": 1500,
+    "internal": false
+  },
+  "nodes": [
+    {
+      "name": "wan-node-1",
+      "node_id": "0101010101010101010101010101010101010101010101010101010101010101",
+      "address": "192.0.2.10",
+      "p2p_port": 7447,
+      "api_port": 8080,
+      "failure_domain": "region-1",
+      "bootstrap_nodes": [],
+      "storage": [
+        {
+          "volume": "operator-owned-1",
+          "capacity_bytes": 1073741824
+        }
+      ],
+      "resources": {
+        "cpu_limit": 1.0,
+        "memory_bytes": 536870912,
+        "tokio_workers": 2
+      },
+      "identity_fixture": "remote-public-v1:0101010101010101010101010101010101010101010101010101010101010101",
+      "consensus_enabled": true,
+      "compute_enabled": false
+    },
+    {
+      "name": "wan-node-2",
+      "node_id": "0202020202020202020202020202020202020202020202020202020202020202",
+      "address": "198.51.100.10",
+      "p2p_port": 7447,
+      "api_port": 8080,
+      "failure_domain": "region-2",
+      "bootstrap_nodes": [
+        "wan-node-1"
+      ],
+      "storage": [
+        {
+          "volume": "operator-owned-2",
+          "capacity_bytes": 1073741824
+        }
+      ],
+      "resources": {
+        "cpu_limit": 1.0,
+        "memory_bytes": 536870912,
+        "tokio_workers": 2
+      },
+      "identity_fixture": "remote-public-v1:0202020202020202020202020202020202020202020202020202020202020202",
+      "consensus_enabled": true,
+      "compute_enabled": false
+    },
+    {
+      "name": "wan-node-3",
+      "node_id": "0303030303030303030303030303030303030303030303030303030303030303",
+      "address": "203.0.113.10",
+      "p2p_port": 7447,
+      "api_port": 8080,
+      "failure_domain": "region-3",
+      "bootstrap_nodes": [
+        "wan-node-1"
+      ],
+      "storage": [
+        {
+          "volume": "operator-owned-3",
+          "capacity_bytes": 1073741824
+        }
+      ],
+      "resources": {
+        "cpu_limit": 1.0,
+        "memory_bytes": 536870912,
+        "tokio_workers": 2
+      },
+      "identity_fixture": "remote-public-v1:0303030303030303030303030303030303030303030303030303030303030303",
+      "consensus_enabled": true,
+      "compute_enabled": false
+    }
+  ],
+  "policies": {
+    "replication_factor": 3,
+    "erasure_data_shards": null,
+    "erasure_parity_shards": null,
+    "namespace_voter_count": 3
+  }
+}

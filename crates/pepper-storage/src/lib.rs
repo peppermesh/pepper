@@ -123,6 +123,26 @@ pub struct StorageLocationSummary {
     pub healthy: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockInventoryEntry {
+    pub cid: Cid,
+    pub codec: Codec,
+    pub logical_size_bytes: u64,
+    pub stored_size_bytes: Option<u64>,
+    pub storage_location_id: String,
+    pub integrity_state: String,
+    pub retention_class: String,
+    pub pin_state: String,
+    pub replica_state: String,
+    pub verified_at_unix_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockInventoryPage {
+    pub entries: Vec<BlockInventoryEntry>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct BlockStore {
     metadata: Arc<MetadataStore>,
@@ -379,6 +399,68 @@ impl BlockStore {
             .filter(|meta| !meta.corrupt && self.block_path(meta).exists())
             .map(|meta| meta.to_stat_response())
             .collect())
+    }
+
+    pub fn inventory_page(
+        &self,
+        after: Option<&Cid>,
+        limit: usize,
+    ) -> Result<BlockInventoryPage, StorageError> {
+        let mut metas = self.list_block_metas()?;
+        metas.sort_by_key(|meta| meta.cid.to_string());
+        let after = after.map(ToString::to_string);
+        let mut matching = metas
+            .into_iter()
+            .filter(|meta| {
+                after
+                    .as_ref()
+                    .is_none_or(|cursor| meta.cid.to_string() > *cursor)
+            })
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = matching.len() > limit;
+        matching.truncate(limit);
+        let entries = matching
+            .iter()
+            .map(|meta| {
+                let path = self.block_path(meta);
+                let stored_size_bytes = path
+                    .symlink_metadata()
+                    .ok()
+                    .filter(|file| file.is_file())
+                    .map(|file| file.len());
+                let integrity_state = if meta.corrupt {
+                    "corrupt"
+                } else if stored_size_bytes.is_none() {
+                    "missing"
+                } else if stored_size_bytes != Some(meta.size_bytes) {
+                    "size_mismatch"
+                } else if meta.verified_at_unix_seconds.is_some() {
+                    "verified"
+                } else {
+                    "unverified"
+                };
+                BlockInventoryEntry {
+                    cid: meta.cid.clone(),
+                    codec: meta.codec,
+                    logical_size_bytes: meta.size_bytes,
+                    stored_size_bytes,
+                    storage_location_id: meta.storage_location_id.clone(),
+                    integrity_state: integrity_state.to_string(),
+                    retention_class: meta.retention_class.clone(),
+                    pin_state: meta.pin_state.clone(),
+                    replica_state: meta.replica_state.clone(),
+                    verified_at_unix_seconds: meta.verified_at_unix_seconds,
+                }
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = has_more
+            .then(|| entries.last().map(|entry| entry.cid.to_string()))
+            .flatten();
+        Ok(BlockInventoryPage {
+            entries,
+            next_cursor,
+        })
     }
 
     pub fn storage_location_summaries(&self) -> Result<Vec<StorageLocationSummary>, StorageError> {
@@ -1312,6 +1394,48 @@ mod tests {
         let put_again = store.put_raw(b"hello").unwrap();
         assert_eq!(put.cid, put_again.cid);
         assert!(put_again.already_existed);
+    }
+
+    #[test]
+    fn inventory_is_paginated_stable_and_payload_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let location = StorageLocationConfig {
+            path: dir.path().join("store"),
+            max_capacity_bytes: 1024 * 1024,
+        };
+        let store = BlockStore::open(metadata, &[location]).unwrap();
+        for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+            store.put_raw(payload).unwrap();
+        }
+        let first = store.inventory_page(None, 2).unwrap();
+        assert_eq!(first.entries.len(), 2);
+        assert!(
+            first
+                .entries
+                .iter()
+                .all(|entry| entry.integrity_state == "verified")
+        );
+        assert!(
+            first
+                .entries
+                .iter()
+                .all(|entry| entry.stored_size_bytes == Some(entry.logical_size_bytes))
+        );
+        let cursor = Cid::from_str(first.next_cursor.as_deref().unwrap()).unwrap();
+        let second = store.inventory_page(Some(&cursor), 2).unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let all = first
+            .entries
+            .into_iter()
+            .chain(second.entries)
+            .map(|entry| entry.cid.to_string())
+            .collect::<Vec<_>>();
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(all, sorted);
     }
 
     #[test]

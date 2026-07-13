@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-system-tests"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+name = "pepper_system_tests"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pepper-system-test"
+path = "src/bin/pepper-system-test.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+blake3 = "1.8"
+bollard = "0.19"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = "3.0"
+futures-util = "0.3"
+hex = "0.4"
+libc = "0.2"
+pepper-types = { path = "../crates/pepper-types" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.23"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "serde"] }
+tokio = { version = "1.48", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+toml = "1.1"
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
+
+[workspace]
