@@ -3,6 +3,7 @@
 //! Namespace publication pin reconciliation and lease expiry.
 
 use super::*;
+use futures_util::{StreamExt, stream};
 use pepper_publication::{
     DurabilityBackend, ProtectionBackend, PublicationError, expire_staging_leases,
     reconcile_pin_intents,
@@ -147,29 +148,43 @@ impl AgentProtectionBackend {
     async fn broadcast(&self, pin: &PinRecord) -> Result<(), PublicationError> {
         let json = serde_json::to_string(pin)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        let mut failed = Vec::new();
-        for peer in self.network.peers().await {
-            let mut accepted = false;
-            for address in peer.addresses {
-                let Ok(address) = address.parse() else {
-                    continue;
-                };
-                if matches!(
-                    time::timeout(
-                        Duration::from_millis(250),
-                        self.network.apply_pin(address, json.clone())
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    accepted = true;
-                    break;
+        let peers = self
+            .network
+            .peers()
+            .await
+            .into_iter()
+            // Gossip may teach a node its own signed descriptor. Local pin
+            // persistence already happened before broadcast, so never dial
+            // ourselves as a synchronization target.
+            .filter(|peer| peer.node_id != self.node_id)
+            .collect::<Vec<_>>();
+        let failed = stream::iter(peers)
+            .map(|peer| {
+                let network = self.network.clone();
+                let json = json.clone();
+                async move {
+                    for address in peer.addresses {
+                        let Ok(address) = address.parse() else {
+                            continue;
+                        };
+                        if matches!(
+                            time::timeout(
+                                Duration::from_secs(5),
+                                network.apply_pin(address, json.clone())
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
+                            return None;
+                        }
+                    }
+                    Some(peer.node_id)
                 }
-            }
-            if !accepted {
-                failed.push(peer.node_id);
-            }
-        }
+            })
+            .buffer_unordered(8)
+            .filter_map(|node| async move { node })
+            .collect::<Vec<_>>()
+            .await;
         if !failed.is_empty() {
             warn!(
                 pin_id = %pin.pin_id,

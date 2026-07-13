@@ -310,7 +310,11 @@ impl PublicationRepository {
         let pending_pin_intents =
             read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?
                 .into_iter()
-                .filter(|intent| intent.status != "applied" && intent.status != "released")
+                // Only actionable records are pending. `resolved` is a terminal state
+                // used when a proposal can no longer commit; counting it here made the
+                // operational gauge stay non-zero forever even though reconciliation
+                // correctly had no work left.
+                .filter(|intent| intent.status == "pending")
                 .count();
         let durability_receipts =
             read_all::<StoredDurabilityReceipt>(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS)?
@@ -1017,7 +1021,7 @@ mod tests {
         repository
             .put_staging(&StagingLease {
                 lease_id: "lease".to_string(),
-                namespace_id: namespace,
+                namespace_id: namespace.clone(),
                 request_id: "request".to_string(),
                 roots: vec![protected.clone()],
                 staged_bytes: 9,
@@ -1041,6 +1045,26 @@ mod tests {
         let roots = repository.protected_roots(11).unwrap();
         store.garbage_collect(&roots).unwrap();
         assert!(!store.has(&protected).unwrap());
+
+        let resolved = PublicationIntentRecord {
+            intent_id: "resolved-proposal".to_string(),
+            namespace_id: namespace,
+            log_index: 7,
+            request_id: "request".to_string(),
+            cid: protected,
+            action: PinAction::Protect,
+            reason: "proposal-input".to_string(),
+            status: "pending".to_string(),
+            created_at_unix_seconds: 1,
+        };
+        repository.mark_intent_resolved(&resolved).unwrap();
+        assert_eq!(
+            repository
+                .operational_stats(11)
+                .unwrap()
+                .pending_pin_intents,
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
