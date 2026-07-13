@@ -3,6 +3,7 @@
 mod api_error;
 mod bucket_api;
 mod compute;
+mod diagnostics;
 mod filesystem_api;
 mod http;
 mod metrics;
@@ -56,6 +57,7 @@ use pepper_merkle::MerkleNodeCodecHandler;
 use pepper_metadata::MetadataStore;
 use pepper_namespace::{
     NamespaceCheckpointCodecHandler, NamespaceCommitCodecHandler, NamespaceDescriptorCodecHandler,
+    NamespaceId, PinAction,
 };
 use pepper_network::{
     NetworkBlockService, NetworkComputeService, NetworkConfig, NetworkError, NetworkHandle,
@@ -146,6 +148,8 @@ struct AppState {
     replication_factor: usize,
     repair_interval: Duration,
     repair_semaphore: Arc<Semaphore>,
+    repair_diagnostics: Arc<Mutex<VecDeque<RepairDiagnosticRecord>>>,
+    read_diagnostics: Arc<Mutex<VecDeque<ReadDiagnosticRecord>>>,
     operation_lock: Arc<RwLock<()>>,
     compute_enabled: bool,
     compute_runtime: String,
@@ -189,10 +193,38 @@ struct AppState {
     _identity_lock: Arc<std::fs::File>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReadDiagnosticRecord {
+    sequence: u64,
+    cid: Cid,
+    source_node: String,
+    route: String,
+    verified_bytes: u64,
+    timestamp_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairDiagnosticRecord {
+    sequence: u64,
+    cid: Cid,
+    repair_kind: String,
+    reason: String,
+    source_node: Option<String>,
+    destination_node: Option<String>,
+    result: String,
+    verified_bytes: u64,
+    timestamp_unix_seconds: i64,
+}
+
 #[derive(Debug, Clone)]
 struct RateLimitBucket {
     window_start_unix_seconds: i64,
     count: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BlockPutQuery {
+    replication_factor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -692,6 +724,8 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         replication_factor: loaded.config.replication.default_factor as usize,
         repair_interval: Duration::from_secs(loaded.config.replication.repair_interval_seconds),
         repair_semaphore: Arc::new(Semaphore::new(1)),
+        repair_diagnostics: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
+        read_diagnostics: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
         operation_lock,
         compute_enabled: loaded.config.compute.enabled,
         compute_runtime: loaded.config.compute.runtime.clone(),
@@ -852,12 +886,20 @@ async fn node_peers(State(state): State<AppState>) -> Json<Vec<PeerStatus>> {
 
 async fn put_block(
     State(state): State<AppState>,
+    Query(query): Query<BlockPutQuery>,
     body: Body,
 ) -> Result<Json<DurabilityReceipt>, ApiError> {
     let _guard = state.operation_lock.read().await;
+    let replication_factor = query.replication_factor.unwrap_or(state.replication_factor);
+    if !(1..=32).contains(&replication_factor) {
+        return Err(ApiError::bad_request(
+            "block replication_factor must be between 1 and 32",
+        ));
+    }
     let body = read_body_limited(body, state.max_block_bytes, "block").await?;
-    let receipt = put_replicated_block(&state, CODEC_RAW, body).await?;
-    ensure_implicit_pin(&state, &receipt.cid).await?;
+    let receipt =
+        put_replicated_block_with_factor(&state, CODEC_RAW, body, replication_factor).await?;
+    ensure_implicit_pin_with_factor(&state, &receipt.cid, replication_factor).await?;
     Ok(Json(receipt))
 }
 
@@ -888,9 +930,14 @@ async fn get_block_resolved(state: &AppState, cid: &Cid) -> Result<pepper_types:
     match tokio::task::block_in_place(|| state.block_store.get(cid)) {
         Ok(block) => Ok(block),
         Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {
-            let Some(payload) = state.network.get_block_from_any_peer(cid).await? else {
+            let Some(resolution) = state
+                .network
+                .get_block_from_any_peer_with_source(cid)
+                .await?
+            else {
                 return Err(ApiError::from(StorageError::NotFound(cid.clone())));
             };
+            let payload = resolution.payload;
             if !cid.verify(&payload) {
                 return Err(ApiError::network(NetworkError::BlockService(
                     "remote block hash mismatch".to_string(),
@@ -900,6 +947,25 @@ async fn get_block_resolved(state: &AppState, cid: &Cid) -> Result<pepper_types:
             if repaired.cid != *cid {
                 return Err(ApiError::internal("recovered block CID mismatch"));
             }
+            let mut records = state
+                .read_diagnostics
+                .lock()
+                .map_err(|_| ApiError::internal("read diagnostic lock poisoned"))?;
+            let sequence = records
+                .back()
+                .map_or(1, |record| record.sequence.saturating_add(1));
+            if records.len() == 512 {
+                records.pop_front();
+            }
+            records.push_back(ReadDiagnosticRecord {
+                sequence,
+                cid: cid.clone(),
+                source_node: resolution.source_node_id,
+                route: resolution.route,
+                verified_bytes: payload.len() as u64,
+                timestamp_unix_seconds: unix_seconds(),
+            });
+            drop(records);
             Ok(pepper_types::Block {
                 cid: cid.clone(),
                 codec: cid.codec,
@@ -1015,8 +1081,18 @@ async fn put_replicated_block_with_factor(
     let candidates = placement_candidates(state, state.network.peers().await);
 
     let selected = select_replicas(&local_put.cid, &candidates, replication_factor);
-    let mut replica_nodes = vec![local_descriptor.node_id.clone()];
-    let mut providers = vec![local_provider];
+    // The ingress keeps a verified cache copy, but durability credit follows
+    // deterministic placement. Do not over-credit the local cache when the
+    // ingress is not one of the selected replicas.
+    let local_selected = selected.iter().any(|node| node.is_local);
+    let mut replica_nodes = local_selected
+        .then(|| local_descriptor.node_id.clone())
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut providers = local_selected
+        .then_some(local_provider)
+        .into_iter()
+        .collect::<Vec<_>>();
 
     let payload = Arc::new(payload);
     let writes = selected
@@ -1567,12 +1643,22 @@ async fn admin_dag_inspect(
     for cid in &traversal.cids {
         *codecs.entry(cid.codec.canonical_display()).or_default() += 1;
     }
+    const MAX_DIAGNOSTIC_CIDS: usize = 256;
+    let truncated = traversal.cids.len() > MAX_DIAGNOSTIC_CIDS;
+    let cids = traversal
+        .cids
+        .iter()
+        .take(MAX_DIAGNOSTIC_CIDS)
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "root_cid": root,
         "reachable_count": traversal.cids.len(),
         "decoded_payload_bytes": traversal.decoded_payload_bytes,
         "links_examined": traversal.links_examined,
         "codecs": codecs,
+        "cids": cids,
+        "truncated": truncated,
     })))
 }
 
@@ -1590,7 +1676,23 @@ async fn admin_corruption_scan(
     let mut unrecovered = Vec::new();
     for cid in corrupt_cids {
         match get_block_resolved(&state, &cid).await {
-            Ok(_) => recovered.push(cid.to_string()),
+            Ok(block) => {
+                record_repair(
+                    &state,
+                    RepairDiagnosticRecord {
+                        sequence: 0,
+                        cid: cid.clone(),
+                        repair_kind: "corruption_recovery".to_string(),
+                        reason: "hash_mismatch".to_string(),
+                        source_node: None,
+                        destination_node: Some(state.status.node_id.clone()),
+                        result: "verified".to_string(),
+                        verified_bytes: block.size,
+                        timestamp_unix_seconds: 0,
+                    },
+                );
+                recovered.push(cid.to_string());
+            }
             Err(_) => {
                 state.block_store.quarantine_block(&cid)?;
                 unrecovered.push(cid.to_string());

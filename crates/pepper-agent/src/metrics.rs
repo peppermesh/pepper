@@ -197,6 +197,41 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
             publication.durability_receipts,
         ));
     }
+    body.push_str(
+        "# TYPE pepper_rpc_requests_total counter\n\
+         # TYPE pepper_rpc_request_bytes_total counter\n\
+         # TYPE pepper_rpc_response_bytes_total counter\n\
+         # TYPE pepper_rpc_errors_total counter\n",
+    );
+    for metric in state.network.rpc_metrics() {
+        body.push_str(&format!(
+            "pepper_rpc_requests_total{{peer=\"{}\",method=\"{}\",direction=\"{}\"}} {}\n\
+             pepper_rpc_request_bytes_total{{peer=\"{}\",method=\"{}\",direction=\"{}\"}} {}\n\
+             pepper_rpc_response_bytes_total{{peer=\"{}\",method=\"{}\",direction=\"{}\"}} {}\n\
+             pepper_rpc_errors_total{{peer=\"{}\",method=\"{}\",direction=\"{}\"}} {}\n",
+            metric.peer_id,
+            metric.method,
+            metric.direction,
+            metric.requests,
+            metric.peer_id,
+            metric.method,
+            metric.direction,
+            metric.request_bytes,
+            metric.peer_id,
+            metric.method,
+            metric.direction,
+            metric.response_bytes,
+            metric.peer_id,
+            metric.method,
+            metric.direction,
+            metric.errors,
+        ));
+    }
+    body.push_str(
+        "# TYPE pepper_raft_command_encoded_bytes_total counter\n\
+         # TYPE pepper_raft_command_encoded_bytes_max gauge\n\
+         # TYPE pepper_raft_commands_total counter\n",
+    );
     if let Some(manager) = &state.namespace_groups {
         let statuses = manager.operational_statuses().await;
         body.push_str(&format!(
@@ -213,6 +248,19 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
                 status.log_lag,
                 u8::from(status.quorum_recently_acknowledged),
                 status.snapshot_index.unwrap_or(0),
+            ));
+        }
+        for metric in manager.command_metrics().await {
+            body.push_str(&format!(
+                "pepper_raft_commands_total{{class=\"{}\"}} {}\n\
+                 pepper_raft_command_encoded_bytes_total{{class=\"{}\"}} {}\n\
+                 pepper_raft_command_encoded_bytes_max{{class=\"{}\"}} {}\n",
+                metric.command_class,
+                metric.count,
+                metric.command_class,
+                metric.total_encoded_bytes,
+                metric.command_class,
+                metric.max_encoded_bytes,
             ));
         }
     }

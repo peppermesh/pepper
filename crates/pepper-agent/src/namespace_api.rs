@@ -565,7 +565,10 @@ pub(super) async fn apply_command(
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
-    if let Some(response) = current.idempotent_response(&command.request_id) {
+    if let Some(response) = current
+        .idempotent_response_for(&command)
+        .map_err(namespace_error)?
+    {
         let (revision, root, commit) = match &response {
             CommandResponse::Commit(commit) => (
                 commit.namespace_revision,

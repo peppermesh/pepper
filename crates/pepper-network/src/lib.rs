@@ -14,7 +14,7 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
@@ -111,6 +111,34 @@ pub struct NetworkConfig {
     pub max_consensus_log_bytes: u64,
     pub max_namespace_write_rate: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockResolution {
+    pub payload: Vec<u8>,
+    pub source_node_id: String,
+    pub route: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcMetric {
+    pub peer_id: String,
+    pub method: String,
+    pub direction: String,
+    pub requests: u64,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub errors: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RpcMetricAccumulator {
+    requests: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+    errors: u64,
+}
+
+type RpcMetricMap = BTreeMap<(String, String, String), RpcMetricAccumulator>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -248,6 +276,7 @@ pub struct NetworkHandle {
     rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
     seen_requests: Arc<Mutex<HashMap<String, i64>>>,
     inbound_connections: Arc<Semaphore>,
+    rpc_metrics: Arc<Mutex<RpcMetricMap>>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +313,7 @@ impl NetworkHandle {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             seen_requests: Arc::new(Mutex::new(HashMap::new())),
             inbound_connections: Arc::new(Semaphore::new(256)),
+            rpc_metrics: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         handle.load_persisted_peers().await?;
@@ -352,6 +382,67 @@ impl NetworkHandle {
             .identity
             .sign(&descriptor_signature_payload(&descriptor));
         descriptor.signature_hex = hex::encode(signature);
+    }
+
+    pub fn rpc_metrics(&self) -> Vec<RpcMetric> {
+        self.rpc_metrics
+            .lock()
+            .expect("RPC metrics lock poisoned")
+            .iter()
+            .take(512)
+            .map(|((peer_id, method, direction), metric)| RpcMetric {
+                peer_id: peer_id.clone(),
+                method: method.clone(),
+                direction: direction.clone(),
+                requests: metric.requests,
+                request_bytes: metric.request_bytes,
+                response_bytes: metric.response_bytes,
+                errors: metric.errors,
+            })
+            .collect()
+    }
+
+    fn record_rpc(
+        &self,
+        peer_id: &str,
+        method: &str,
+        direction: &str,
+        request_bytes: usize,
+        response_bytes: usize,
+        error: bool,
+    ) {
+        let peer_id = if peer_id.len() == 64 && peer_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            peer_id
+        } else {
+            "unauthenticated"
+        };
+        let method = normalize_rpc_method(method);
+        let mut metrics = self.rpc_metrics.lock().expect("RPC metrics lock poisoned");
+        if metrics.len() >= 512
+            && !metrics.contains_key(&(
+                peer_id.to_string(),
+                method.to_string(),
+                direction.to_string(),
+            ))
+        {
+            return;
+        }
+        let metric = metrics
+            .entry((
+                peer_id.to_string(),
+                method.to_string(),
+                direction.to_string(),
+            ))
+            .or_default();
+        metric.requests = metric.requests.saturating_add(1);
+        metric.request_bytes = metric
+            .request_bytes
+            .saturating_add(request_bytes.min(u64::MAX as usize) as u64);
+        metric.response_bytes = metric
+            .response_bytes
+            .saturating_add(response_bytes.min(u64::MAX as usize) as u64);
+        metric.errors = metric.errors.saturating_add(u64::from(error));
     }
 
     pub fn local_provider_record(&self, cid: &Cid) -> ProviderRecord {
@@ -587,18 +678,40 @@ impl NetworkHandle {
         &self,
         cid: &Cid,
     ) -> Result<Option<Vec<u8>>, NetworkError> {
+        Ok(self
+            .get_block_from_any_peer_with_source(cid)
+            .await?
+            .map(|resolution| resolution.payload))
+    }
+
+    pub async fn get_block_from_any_peer_with_source(
+        &self,
+        cid: &Cid,
+    ) -> Result<Option<BlockResolution>, NetworkError> {
         for record in self.find_providers(cid).await? {
             for address in sorted_routable_addresses(record.addresses.clone()) {
                 let Ok(addr) = SocketAddr::from_str(&address) else {
                     continue;
                 };
                 match self.block_get(addr, cid).await {
-                    Ok(payload) => return Ok(Some(payload)),
+                    Ok(payload) => {
+                        return Ok(Some(BlockResolution {
+                            payload,
+                            source_node_id: record.node_id.clone(),
+                            route: "direct_provider".to_string(),
+                        }));
+                    }
                     Err(error) => debug!(%addr, %error, "provider block get failed"),
                 }
             }
             match self.get_block_via_relays(&record.node_id, cid).await {
-                Ok(Some(payload)) => return Ok(Some(payload)),
+                Ok(Some(payload)) => {
+                    return Ok(Some(BlockResolution {
+                        payload,
+                        source_node_id: record.node_id.clone(),
+                        route: "relay_provider".to_string(),
+                    }));
+                }
                 Ok(None) => {}
                 Err(error) => {
                     debug!(%error, target_node_id = %record.node_id, "relayed block get failed")
@@ -612,7 +725,13 @@ impl NetworkHandle {
                     continue;
                 };
                 match self.block_get(addr, cid).await {
-                    Ok(payload) => return Ok(Some(payload)),
+                    Ok(payload) => {
+                        return Ok(Some(BlockResolution {
+                            payload,
+                            source_node_id: peer.node_id.clone(),
+                            route: "peer_fallback".to_string(),
+                        }));
+                    }
                     Err(error) => debug!(%addr, %error, "peer block get failed"),
                 }
             }
@@ -1167,12 +1286,29 @@ impl NetworkHandle {
         request.encode(&mut payload)?;
         let request_id = request_id.unwrap_or_else(next_request_id);
         let envelope = self.authenticated_envelope(request_id.clone(), method.to_string(), payload);
+        let request_wire_bytes = envelope.encoded_len();
         write_frame(&mut send, &envelope).await?;
         let response = read_frame::<proto::ResponseEnvelope>(&mut recv).await?;
         verify_response_envelope(&response, &request_id)?;
         if response.node_id != peer_node_id {
+            self.record_rpc(
+                &peer_node_id,
+                method,
+                "outbound",
+                request_wire_bytes,
+                response.encoded_len(),
+                true,
+            );
             return Err(NetworkError::Unauthenticated);
         }
+        self.record_rpc(
+            &peer_node_id,
+            method,
+            "outbound",
+            request_wire_bytes,
+            response.encoded_len(),
+            !response.ok,
+        );
         if !response.ok {
             return Err(NetworkError::Rpc {
                 code: response.error_code,
@@ -1192,8 +1328,17 @@ impl NetworkHandle {
         let request_id = next_request_id();
         let envelope =
             self.authenticated_envelope(request_id.clone(), "/handshake".to_string(), payload);
+        let request_wire_bytes = envelope.encoded_len();
         write_frame(&mut send, &envelope).await?;
         let response = read_frame::<proto::ResponseEnvelope>(&mut recv).await?;
+        self.record_rpc(
+            &response.node_id,
+            "/handshake",
+            "outbound",
+            request_wire_bytes,
+            response.encoded_len(),
+            !response.ok,
+        );
         verify_response_envelope(&response, &request_id)?;
         if !response.ok {
             return Err(NetworkError::Rpc {
@@ -1336,6 +1481,7 @@ impl NetworkHandle {
         )
         .await
         .map_err(|_| NetworkError::DeadlineExceeded)??;
+        let request_wire_bytes = request.encoded_len();
         let mut response = match self
             .process_request(&request, block_service, &authenticated_node)
             .await
@@ -1361,6 +1507,14 @@ impl NetworkHandle {
                 signature_hex: String::new(),
             },
         };
+        self.record_rpc(
+            &request.node_id,
+            &request.method,
+            "inbound",
+            request_wire_bytes,
+            response.encoded_len(),
+            !response.ok,
+        );
         response.signature_hex =
             hex::encode(self.identity.sign(&response_signature_payload(&response)));
         write_frame(&mut send, &response).await?;
@@ -2350,6 +2504,19 @@ impl ServerCertVerifier for SkipServerVerification {
             SignatureScheme::RSA_PSS_SHA384,
             SignatureScheme::RSA_PSS_SHA512,
         ]
+    }
+}
+
+fn normalize_rpc_method(method: &str) -> &str {
+    if method.len() <= 96
+        && method.starts_with('/')
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-'))
+    {
+        method
+    } else {
+        "/other"
     }
 }
 

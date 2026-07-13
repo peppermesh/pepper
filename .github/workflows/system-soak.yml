@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: system-soak
+
+on:
+  schedule:
+    - cron: "23 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Exact reproduction seed (blank rotates weekly)"
+        required: false
+        type: string
+      duration_seconds:
+        description: "Soak duration in seconds"
+        required: true
+        default: "21600"
+        type: string
+      expected_kernel:
+        description: "Exact uname -r pinned on the soak runner"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: system-soak-fixed-kernel
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    runs-on: [self-hosted, linux, x64, pepper-soak]
+    timeout-minutes: 420
+    env:
+      EXPECTED_KERNEL: ${{ inputs.expected_kernel || vars.PEPPER_SOAK_KERNEL }}
+      DURATION_SECONDS: ${{ inputs.duration_seconds || '21600' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Enforce fixed kernel and choose seed
+        id: preflight
+        env:
+          REQUESTED_SEED: ${{ inputs.seed }}
+        run: |
+          test -n "$EXPECTED_KERNEL"
+          test "$(uname -r)" = "$EXPECTED_KERNEL"
+          test -r /proc/1/status
+          if [ -n "$REQUESTED_SEED" ]; then
+            seed="$REQUESTED_SEED"
+          else
+            week=$(( $(date -u +%s) / 604800 ))
+            seed=$(( week * 1000 + GITHUB_RUN_NUMBER ))
+          fi
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+      - name: Run fixed-kernel soak and growth analysis
+        run: >-
+          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          run --scenario SOAK-001 --seed "${{ steps.preflight.outputs.seed }}"
+          --backend docker --image "pepper-system-test:${GITHUB_SHA}"
+          --duration-seconds "$DURATION_SECONDS" --expected-kernel "$EXPECTED_KERNEL"
+      - name: Assert backend cleanup
+        if: always()
+        run: |
+          containers=$(docker ps -aq --filter label=pepper.system-test.run)
+          networks=$(docker network ls -q --filter label=pepper.system-test.run)
+          volumes=$(docker volume ls -q --filter label=pepper.system-test.run)
+          if [ -n "$containers$networks$volumes" ]; then
+            [ -z "$containers" ] || docker rm -f $containers || true
+            [ -z "$networks" ] || docker network rm $networks || true
+            [ -z "$volumes" ] || docker volume rm -f $volumes || true
+            exit 1
+          fi
+      - name: Upload soak qualification archive
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-${{ github.sha }}-${{ steps.preflight.outputs.seed }}
+          path: system-tests/artifacts/
+          if-no-files-found: error
+          retention-days: 60

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peppermesh.org/schemas/system-test/v1/event.schema.json",
+  "title": "Pepper system test event v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "run_id", "sequence", "type", "controller_monotonic_ns"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "$ref": "#/$defs/non_empty" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "type": {
+      "enum": ["run", "lifecycle", "invoke", "complete", "fault", "observation", "invariant", "artifact", "log"]
+    },
+    "controller_monotonic_ns": { "type": "integer", "minimum": 0 },
+    "wall_time_rfc3339": { "type": "string", "format": "date-time" },
+    "node_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "operation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "operation": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "result": { "enum": ["ok", "error", "timeout", "ambiguous", "cancelled", "skipped"] },
+    "error_code": { "type": "string", "maxLength": 128 },
+    "error": { "type": "string", "maxLength": 16384 },
+    "fault_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "fault_action": { "enum": ["apply", "heal", "failed"] },
+    "invariant_id": { "type": "string", "pattern": "^(SAF|LIV|CONV|SEC|PERF)-[A-Z]+-[0-9]{3}$" },
+    "invariant_result": { "enum": ["pass", "fail", "pending", "skipped"] },
+    "details": { "type": "object", "additionalProperties": true }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "invoke" } }, "required": ["type"] },
+      "then": { "required": ["operation_id", "attempt", "operation"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "complete" } }, "required": ["type"] },
+      "then": { "required": ["operation_id", "attempt", "operation", "result"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "fault" } }, "required": ["type"] },
+      "then": { "required": ["fault_id", "fault_action"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "invariant" } }, "required": ["type"] },
+      "then": { "required": ["invariant_id", "invariant_result"] }
+    }
+  ],
+  "$defs": {
+    "non_empty": { "type": "string", "minLength": 1, "maxLength": 256 }
+  }
+}

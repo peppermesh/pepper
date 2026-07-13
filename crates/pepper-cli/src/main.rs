@@ -480,7 +480,12 @@ struct BlockCommand {
 #[derive(Debug, Subcommand)]
 enum BlockSubcommand {
     /// Store a file as a raw immutable block.
-    Put { path: PathBuf },
+    Put {
+        path: PathBuf,
+        /// Override the configured durability factor for this block.
+        #[arg(long)]
+        replicas: Option<usize>,
+    },
     /// Retrieve a block by CID.
     Get {
         cid: String,
@@ -537,7 +542,9 @@ async fn run() -> Result<()> {
             NodeSubcommand::Peers => node_peers(&args.api, args.json).await,
         },
         Command::Block(block) => match block.command {
-            BlockSubcommand::Put { path } => block_put(&args.api, args.json, path).await,
+            BlockSubcommand::Put { path, replicas } => {
+                block_put(&args.api, args.json, path, replicas).await
+            }
             BlockSubcommand::Get { cid, output } => block_get(&args.api, cid, output).await,
             BlockSubcommand::Has { cid } => block_has(&args.api, args.json, cid).await,
         },
@@ -1257,9 +1264,12 @@ async fn node_peers(api: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn block_put(api: &str, json: bool, path: PathBuf) -> Result<()> {
+async fn block_put(api: &str, json: bool, path: PathBuf, replicas: Option<usize>) -> Result<()> {
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let url = format!("{}/v1/blocks", api.trim_end_matches('/'));
+    let mut url = format!("{}/v1/blocks", api.trim_end_matches('/'));
+    if let Some(replicas) = replicas {
+        url.push_str(&format!("?replication_factor={replicas}"));
+    }
     let response = http_client()?
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")

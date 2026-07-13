@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: system-wan
+
+on:
+  schedule:
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Exact reproduction seed (blank rotates weekly)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: system-wan-qualification
+  cancel-in-progress: false
+
+jobs:
+  wan:
+    name: ${{ matrix.mode }} WAN qualification
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - mode: tailscale
+            runner: pepper-wan-tailscale
+            topology: PEPPER_WAN_TAILSCALE_TOPOLOGY
+          - mode: direct
+            runner: pepper-wan-direct
+            topology: PEPPER_WAN_DIRECT_TOPOLOGY
+    runs-on: [self-hosted, linux, x64, "${{ matrix.runner }}"]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Select topology and archived seed
+        id: preflight
+        env:
+          REQUESTED_SEED: ${{ inputs.seed }}
+          TAILSCALE_TOPOLOGY: ${{ vars.PEPPER_WAN_TAILSCALE_TOPOLOGY }}
+          DIRECT_TOPOLOGY: ${{ vars.PEPPER_WAN_DIRECT_TOPOLOGY }}
+        run: |
+          if [ "${{ matrix.mode }}" = tailscale ]; then
+            topology="$TAILSCALE_TOPOLOGY"
+          else
+            topology="$DIRECT_TOPOLOGY"
+          fi
+          test -n "$topology" && test -r "$topology"
+          if [ -n "$REQUESTED_SEED" ]; then
+            seed="$REQUESTED_SEED"
+          else
+            week=$(( $(date -u +%s) / 604800 ))
+            seed=$(( week * 100 + GITHUB_RUN_NUMBER ))
+          fi
+          echo "topology=$topology" >> "$GITHUB_OUTPUT"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+      - name: Run non-owning WAN qualification
+        run: >-
+          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          run --scenario WAN-001 --seed "${{ steps.preflight.outputs.seed }}"
+          --backend remote --wan-mode "${{ matrix.mode }}"
+          --topology "${{ steps.preflight.outputs.topology }}"
+      - name: Upload WAN qualification archive
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wan-${{ matrix.mode }}-${{ github.sha }}-${{ steps.preflight.outputs.seed }}
+          path: system-tests/artifacts/
+          if-no-files-found: error
+          retention-days: 60

@@ -29,7 +29,8 @@ max_capacity_bytes = 1000000000
 bootstrap_peers = []
 
 [namespace]
-enabled = false
+enabled = true
+consensus_enabled = true
 
 [replication]
 default_factor = 3

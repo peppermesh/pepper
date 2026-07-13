@@ -1,0 +1,1 @@
+{"schema_version":1,"run_id":"run-1","scenario":"bootstrap-three-node","seed":1,"backend":"process","started_at":"2026-07-12T00:00:00Z","pepper_git_commit":"0000000000000000000000000000000000000000","topology_file":"topology.json","event_file":"events.jsonl","artifact_manifest_file":"artifact-manifest.json"}
