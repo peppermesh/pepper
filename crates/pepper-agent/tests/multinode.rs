@@ -108,6 +108,17 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let unauthorized_diagnostics = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/blocks"
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        unauthorized_diagnostics.status(),
+        StatusCode::UNAUTHORIZED,
+        "diagnostics must use the same authorization boundary as admin APIs"
+    );
 
     let status = client
         .get(format!("http://127.0.0.1:{api}/v1/admin/status"))
@@ -125,6 +136,8 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .await?;
     assert!(metrics.contains("pepper_namespace_commits_total"));
     assert!(metrics.contains("pepper_merkle_nodes_written_total"));
+    assert!(metrics.contains("pepper_rpc_request_bytes_total"));
+    assert!(metrics.contains("pepper_raft_command_encoded_bytes_total"));
     let ready = client
         .get(format!("http://127.0.0.1:{api}/readyz"))
         .bearer_auth("dev-token")
@@ -149,6 +162,91 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .error_for_status()?
         .json()
         .await?;
+
+    let inventory: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/blocks?limit=1"
+        ))
+        .bearer_auth("dev-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(inventory["diagnostic_version"], 1);
+    assert_eq!(inventory["consistency"], "local");
+    assert_eq!(inventory["data"]["entries"].as_array().unwrap().len(), 1);
+    let serialized_inventory = serde_json::to_string(&inventory)?;
+    assert!(!serialized_inventory.contains("payload"));
+    assert!(!serialized_inventory.contains("private_key"));
+    assert!(!serialized_inventory.contains("signature_hex"));
+    let encoded_cid = encode_path_segment(&accepted.cid.to_string());
+    for path in [
+        format!("/v1/admin/diagnostics/providers/{encoded_cid}"),
+        format!("/v1/admin/diagnostics/reads/{encoded_cid}"),
+        format!("/v1/admin/diagnostics/gc/{encoded_cid}"),
+        "/v1/admin/diagnostics/publication-intents?limit=1".to_string(),
+        "/v1/admin/diagnostics/network-rpc".to_string(),
+        "/v1/admin/diagnostics/repairs".to_string(),
+        "/v1/admin/diagnostics/namespaces".to_string(),
+    ] {
+        let diagnostic: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{api}{path}"))
+            .bearer_auth("dev-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(diagnostic["diagnostic_version"], 1, "path {path}");
+        assert_eq!(diagnostic["consistency"], "local", "path {path}");
+        let serialized = serde_json::to_string(&diagnostic)?;
+        assert!(!serialized.contains("private_key"), "path {path}");
+        assert!(!serialized.contains("signature_hex"), "path {path}");
+        assert!(!serialized.contains("dev-token"), "path {path}");
+    }
+    let wrong_erasure_codec = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/erasure/{encoded_cid}"
+        ))
+        .bearer_auth("dev-token")
+        .send()
+        .await?;
+    assert_eq!(wrong_erasure_codec.status(), StatusCode::BAD_REQUEST);
+    let oversized_page = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/blocks?limit=257"
+        ))
+        .bearer_auth("dev-token")
+        .send()
+        .await?;
+    assert_eq!(oversized_page.status(), StatusCode::BAD_REQUEST);
+    let oversized_namespace_page = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/namespaces?limit=257"
+        ))
+        .bearer_auth("dev-token")
+        .send()
+        .await?;
+    assert_eq!(oversized_namespace_page.status(), StatusCode::BAD_REQUEST);
+    let oversized_repair_page = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/admin/diagnostics/repairs?limit=257"
+        ))
+        .bearer_auth("dev-token")
+        .send()
+        .await?;
+    assert_eq!(oversized_repair_page.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_replication = client
+        .post(format!(
+            "http://127.0.0.1:{api}/v1/blocks?replication_factor=33"
+        ))
+        .bearer_auth("dev-token")
+        .body("bounded")
+        .send()
+        .await?;
+    assert_eq!(invalid_replication.status(), StatusCode::BAD_REQUEST);
 
     let invalid_pin = client
         .post(format!("http://127.0.0.1:{api}/v1/pins"))
@@ -393,7 +491,7 @@ async fn erasure_repair_proactively_rebalances_after_nodes_join() -> TestResult<
 }
 
 #[tokio::test]
-#[ignore = "scheduled multi-process namespace integration test"]
+#[ignore = "manual legacy removal gate; replaced by NS-001..004, BUCKET-001..003, and FS-001..003"]
 async fn transactional_namespace_http_contract() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let p2p1 = free_port()?;
@@ -700,7 +798,7 @@ async fn transactional_namespace_http_contract() -> TestResult<()> {
 }
 
 #[tokio::test]
-#[ignore = "scheduled multi-process churn integration test"]
+#[ignore = "manual legacy removal gate; replacements include RAFT-002, NEMESIS-001, and SOAK-001; publication-fault and historical gates remain"]
 async fn churn_partition_soak_harness() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let p2p1 = free_port()?;

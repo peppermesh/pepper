@@ -555,10 +555,18 @@ pub struct NamespaceState {
 }
 
 impl NamespaceState {
-    pub fn idempotent_response(&self, request_id: &str) -> Option<CommandResponse> {
-        self.idempotency
-            .get(request_id)
-            .map(|record| record.response.clone())
+    pub fn idempotent_response_for(
+        &self,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<CommandResponse>, NamespaceError> {
+        let Some(record) = self.idempotency.get(&envelope.request_id) else {
+            return Ok(None);
+        };
+        let fingerprint = idempotency_fingerprint(&self.namespace_id, envelope)?;
+        if record.command_fingerprint != fingerprint {
+            return Err(NamespaceError::IdempotencyConflict);
+        }
+        Ok(Some(record.response.clone()))
     }
 }
 
@@ -818,7 +826,7 @@ where
                 &envelope.signature_hex,
             )
             .map_err(NamespaceError::Unauthorized)?;
-        let fingerprint = Cid::new(CODEC_RAW, &signing_payload);
+        let fingerprint = idempotency_fingerprint(&self.state.namespace_id, &envelope)?;
         if let Some(existing) = self.state.idempotency.get(&envelope.request_id) {
             if existing.command_fingerprint != fingerprint {
                 return Err(NamespaceError::IdempotencyConflict);
@@ -1389,6 +1397,93 @@ fn canonical_signing_payload(
         timestamp_unix_seconds: envelope.timestamp_unix_seconds,
         command: &envelope.command,
     })
+}
+
+fn idempotency_fingerprint(
+    namespace_id: &NamespaceId,
+    envelope: &CommandEnvelope,
+) -> Result<Cid, NamespaceError> {
+    #[derive(Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    enum IntentMutation<'a> {
+        Put {
+            key_hex: &'a str,
+            value_cid: &'a Cid,
+            value_kind: &'a str,
+            metadata: &'a BTreeMap<String, String>,
+        },
+        Delete {
+            key_hex: &'a str,
+        },
+    }
+    #[derive(Serialize)]
+    #[serde(tag = "command", rename_all = "snake_case")]
+    enum IntentCommand<'a> {
+        ApplyTransaction {
+            mutations: Vec<IntentMutation<'a>>,
+            message: &'a Option<String>,
+        },
+        CreateSnapshot {
+            name: &'a str,
+            revision: Option<u64>,
+        },
+        DeleteSnapshot {
+            name: &'a str,
+        },
+        Rollback {
+            revision: u64,
+            message: &'a Option<String>,
+        },
+    }
+    #[derive(Serialize)]
+    struct IdempotencyPayload<'a> {
+        domain: &'static str,
+        namespace_id: &'a NamespaceId,
+        request_id: &'a str,
+        writer_identity: &'a str,
+        command: IntentCommand<'a>,
+    }
+    let command = match &envelope.command {
+        NamespaceCommand::ApplyTransaction { transaction } => IntentCommand::ApplyTransaction {
+            mutations: transaction
+                .mutations
+                .iter()
+                .map(|mutation| match mutation {
+                    NamespaceMutation::Put {
+                        key_hex,
+                        value_cid,
+                        value_kind,
+                        metadata,
+                        ..
+                    } => IntentMutation::Put {
+                        key_hex,
+                        value_cid,
+                        value_kind,
+                        metadata,
+                    },
+                    NamespaceMutation::Delete { key_hex, .. } => IntentMutation::Delete { key_hex },
+                })
+                .collect(),
+            message: &transaction.message,
+        },
+        NamespaceCommand::CreateSnapshot { name, revision } => IntentCommand::CreateSnapshot {
+            name,
+            revision: *revision,
+        },
+        NamespaceCommand::DeleteSnapshot { name } => IntentCommand::DeleteSnapshot { name },
+        NamespaceCommand::Rollback { revision, message } => IntentCommand::Rollback {
+            revision: *revision,
+            message,
+        },
+    };
+    let payload = canonical_bytes(&IdempotencyPayload {
+        domain: "pepper.namespace_idempotency.v1",
+        namespace_id,
+        request_id: &envelope.request_id,
+        writer_identity: &envelope.writer_identity,
+        command,
+    })?;
+    Ok(Cid::new(CODEC_RAW, &payload))
 }
 
 fn revision_root(state: &NamespaceState, revision: Option<u64>) -> Result<Cid, NamespaceError> {

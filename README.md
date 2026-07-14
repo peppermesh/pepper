@@ -90,7 +90,15 @@ The HTTP API binds to loopback. Use an authenticated proxy or VPN for remote acc
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+
+# Nested, backend-neutral system-test workspace
+cargo test --manifest-path system-tests/Cargo.toml --locked
+cargo run --manifest-path system-tests/Cargo.toml --locked -- list
+cargo run --manifest-path system-tests/Cargo.toml --locked -- \
+  run --scenario REPL-001 --backend docker --seed 42
 ```
+
+Three-node system scenarios run on the scheduled/manual integration workflow. See [`system-tests/README.md`](system-tests/README.md) for local execution and artifact reproduction.
 
 ## License
 

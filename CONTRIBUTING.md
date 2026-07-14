@@ -112,7 +112,7 @@ Disclose substantial generated or AI-assisted code in the pull request when that
 
 Do not copy third-party material into the repository without identifying its source, copyright holder, license, modifications, and required attribution or notice.
 
-New dependencies must have licenses compatible with Apache-2.0 and PepperMesh's distribution model. Unusual, source-available, noncommercial, field-of-use-restricted, strong-copyleft, or unknown licenses require maintainer review. See [docs/LICENSE_POLICY.md](docs/LICENSE_POLICY.md).
+New dependencies must have licenses compatible with Apache-2.0 and PepperMesh's distribution model. Unusual, source-available, noncommercial, field-of-use-restricted, strong-copyleft, or unknown licenses require maintainer review.
 
 ## Security Issues
 

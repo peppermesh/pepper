@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peppermesh.org/schemas/system-test/v1/run.schema.json",
+  "title": "Pepper system test run v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "run_id", "scenario", "seed", "backend", "started_at",
+    "pepper_git_commit", "topology_file", "event_file", "artifact_manifest_file"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "scenario": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "scenario_version": { "type": "integer", "minimum": 1 },
+    "seed": { "type": "integer", "minimum": 0 },
+    "backend": { "enum": ["process", "docker", "kubernetes", "vm", "kvm", "wan"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": ["string", "null"], "format": "date-time" },
+    "result": { "enum": ["running", "passed", "failed", "cancelled", "infrastructure_error"] },
+    "pepper_git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "framework_git_commit": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "image_reference": { "type": ["string", "null"], "maxLength": 1024 },
+    "image_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "kernel", "logical_cpus"],
+      "properties": {
+        "os": { "type": "string", "maxLength": 256 },
+        "arch": { "type": "string", "maxLength": 64 },
+        "kernel": { "type": "string", "maxLength": 256 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "docker_version": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "deadline_profile": { "type": "string", "maxLength": 128 },
+    "capabilities": { "type": "array", "items": { "type": "string", "maxLength": 128 }, "uniqueItems": true },
+    "topology_file": { "$ref": "#/$defs/relative_path" },
+    "event_file": { "$ref": "#/$defs/relative_path" },
+    "artifact_manifest_file": { "$ref": "#/$defs/relative_path" },
+    "failure_file": { "anyOf": [{ "$ref": "#/$defs/relative_path" }, { "type": "null" }] },
+    "reproduce_file": { "anyOf": [{ "$ref": "#/$defs/relative_path" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "not": { "pattern": "^(?:/|[A-Za-z]:|.*(?:^|/)\\.\\.(?:/|$))" }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+.git
+.github
+/docs
+/target
+/system-tests/target
+/system-tests/artifacts
+**/fuzz/target
+**/fuzz/artifacts
+*.log
+/dev/*-data
+/dev/*-storage

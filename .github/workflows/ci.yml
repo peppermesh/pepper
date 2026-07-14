@@ -29,6 +29,15 @@ jobs:
         # those in parallel on a two-core hosted runner starves heartbeats and
         # produces false quorum-loss failures, so libtest cases are serialized.
         run: cargo test --locked --workspace -- --test-threads=1
+      - name: Verify system-test workspace
+        # The nested workspace keeps orchestration dependencies out of product
+        # crates. Real three-node scenarios remain scheduled/manual; this step
+        # checks the runner, cleanup guards, schemas, and deterministic fixtures.
+        run: |
+          cargo metadata --manifest-path system-tests/Cargo.toml --locked --format-version 1 > /dev/null
+          cargo fmt --manifest-path system-tests/Cargo.toml -- --check
+          cargo clippy --manifest-path system-tests/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path system-tests/Cargo.toml --locked
 
   audit:
     runs-on: ubuntu-latest
@@ -38,4 +47,6 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit dependencies
-        run: cargo audit
+        run: |
+          cargo audit
+          cargo audit --file system-tests/Cargo.lock

@@ -1,0 +1,1 @@
+{"schema_version":1,"run_id":"run-1","observation_id":"obs-1","node_id":"node-1","captured_at":"2026-07-12T00:00:00Z","consistency":"local","source":"healthz","health":{"live":true,"ready":true}}

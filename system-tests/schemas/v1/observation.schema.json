@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peppermesh.org/schemas/system-test/v1/observation.schema.json",
+  "title": "Pepper node observation v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "run_id", "observation_id", "node_id", "captured_at", "consistency", "source", "health"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "observation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "node_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "controller_monotonic_ns": { "type": "integer", "minimum": 0 },
+    "consistency": { "enum": ["linearizable", "local", "eventual", "quiesced_offline"] },
+    "source": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["live", "ready"],
+      "properties": {
+        "live": { "type": "boolean" },
+        "ready": { "type": "boolean" },
+        "error": { "type": ["string", "null"], "maxLength": 16384 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "block_count": { "type": "integer", "minimum": 0 },
+        "verified_block_count": { "type": "integer", "minimum": 0 },
+        "corrupt_block_count": { "type": "integer", "minimum": 0 },
+        "used_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "type": "integer", "minimum": 0 },
+        "inventory_file": { "$ref": "#/$defs/relative_path" }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "connected_peers": { "type": "array", "items": { "type": "string", "maxLength": 256 }, "uniqueItems": true },
+        "rpc_metrics_file": { "$ref": "#/$defs/relative_path" }
+      }
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "active_staging_leases": { "type": "integer", "minimum": 0 },
+        "active_read_leases": { "type": "integer", "minimum": 0 },
+        "pending_pin_intents": { "type": "integer", "minimum": 0 },
+        "intent_status_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "namespace_groups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/group" }
+    },
+    "metrics_file": { "$ref": "#/$defs/relative_path" },
+    "diagnostics_file": { "$ref": "#/$defs/relative_path" }
+  },
+  "$defs": {
+    "group": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["namespace_id", "membership_epoch", "term", "role", "running", "commit_index", "applied_index", "revision", "root_cid", "voters"],
+      "properties": {
+        "namespace_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "membership_epoch": { "type": "integer", "minimum": 1 },
+        "term": { "type": "integer", "minimum": 0 },
+        "role": { "enum": ["leader", "follower", "learner", "shutdown", "unknown"] },
+        "running": { "type": "boolean" },
+        "leader_id": { "type": ["string", "null"], "maxLength": 256 },
+        "commit_index": { "type": ["integer", "null"], "minimum": 0 },
+        "applied_index": { "type": ["integer", "null"], "minimum": 0 },
+        "checkpoint_index": { "type": ["integer", "null"], "minimum": 0 },
+        "checkpoint_cid": { "type": ["string", "null"], "maxLength": 512 },
+        "revision": { "type": "integer", "minimum": 0 },
+        "root_cid": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "voters": { "type": "array", "items": { "type": "string", "maxLength": 256 }, "uniqueItems": true },
+        "learners": { "type": "array", "items": { "type": "string", "maxLength": 256 }, "uniqueItems": true }
+      }
+    },
+    "relative_path": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    }
+  }
+}

@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: system-chaos
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Optional exact reproduction seed
+        required: false
+        type: string
+  schedule:
+    - cron: "47 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: system-chaos
+  cancel-in-progress: false
+
+jobs:
+  chaos:
+    name: chaos ${{ matrix.scenario }} slot ${{ matrix.slot }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { scenario: FAULT-002, slot: 0, offset: 1 }
+          - { scenario: FAULT-003, slot: 0, offset: 2 }
+          - { scenario: NEMESIS-001, slot: 0, offset: 3 }
+          - { scenario: RAFT-002, slot: 0, offset: 4 }
+          - { scenario: RAFT-004, slot: 0, offset: 5 }
+          - { scenario: NEMESIS-001, slot: 1, offset: 103 }
+          - { scenario: RAFT-002, slot: 1, offset: 104 }
+          - { scenario: RAFT-004, slot: 1, offset: 105 }
+    env:
+      TOKIO_WORKER_THREADS: "2"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Select rotating seed
+        id: seed
+        env:
+          REQUESTED_SEED: ${{ inputs.seed }}
+          OFFSET: ${{ matrix.offset }}
+        run: |
+          if [ -n "$REQUESTED_SEED" ]; then
+            seed="$REQUESTED_SEED"
+          else
+            day=$(( $(date -u +%s) / 86400 ))
+            seed=$(( day * 10000 + GITHUB_RUN_NUMBER * 1000 + OFFSET ))
+          fi
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+      - name: Run isolated chaos scenario
+        run: >-
+          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          run --scenario "${{ matrix.scenario }}" --seed "${{ steps.seed.outputs.seed }}"
+          --backend docker --image "pepper-system-test:${GITHUB_SHA}"
+      - name: Assert and clean labeled resources
+        if: always()
+        run: |
+          containers=$(docker ps -aq --filter label=pepper.system-test.run)
+          networks=$(docker network ls -q --filter label=pepper.system-test.run)
+          volumes=$(docker volume ls -q --filter label=pepper.system-test.run)
+          if [ -n "$containers$networks$volumes" ]; then
+            echo "chaos scenario leaked labeled resources" >&2
+            [ -z "$containers" ] || docker rm -f $containers || true
+            [ -z "$networks" ] || docker network rm $networks || true
+            [ -z "$volumes" ] || docker volume rm -f $volumes || true
+            exit 1
+          fi
+      - name: Upload forensic artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: chaos-${{ matrix.scenario }}-slot-${{ matrix.slot }}-seed-${{ steps.seed.outputs.seed }}
+          path: system-tests/artifacts/
+          if-no-files-found: error
+          retention-days: ${{ job.status == 'success' && 30 || 60 }}

@@ -4,6 +4,8 @@
 *.log
 **/fuzz/target/
 **/fuzz/artifacts/
+/system-tests/target/
+/system-tests/artifacts/
 
 # Documentation is maintained outside this repository.
 /docs/
