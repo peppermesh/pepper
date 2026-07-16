@@ -25,18 +25,22 @@ pub(super) struct CreateNamespaceRequest {
     pub(super) alias: Option<String>,
     #[serde(default)]
     pub(super) request_id: Option<String>,
+    #[serde(skip)]
+    pub(super) retention_keep_last: Option<u32>,
+    #[serde(skip)]
+    pub(super) retention_max_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 pub(super) struct CreateNamespaceResponse {
-    namespace_id: NamespaceId,
-    descriptor_cid: Cid,
-    namespace_revision: u64,
-    root_cid: Cid,
-    checkpoint_cid: Cid,
-    replica_nodes: Vec<String>,
-    quorum_status: String,
-    alias: Option<String>,
+    pub(super) namespace_id: NamespaceId,
+    pub(super) descriptor_cid: Cid,
+    pub(super) namespace_revision: u64,
+    pub(super) root_cid: Cid,
+    pub(super) checkpoint_cid: Cid,
+    pub(super) replica_nodes: Vec<String>,
+    pub(super) quorum_status: String,
+    pub(super) alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -194,6 +198,10 @@ pub(super) fn parse_namespace(state: &AppState, value: &str) -> Result<Namespace
     if let Ok(cid) = value.parse::<Cid>() {
         return NamespaceId::new(cid).map_err(namespace_error);
     }
+    namespace_alias(state, value)
+}
+
+pub(super) fn namespace_alias(state: &AppState, value: &str) -> Result<NamespaceId, ApiError> {
     let read = state
         .metadata
         .database()
@@ -218,7 +226,34 @@ pub(super) fn parse_namespace(state: &AppState, value: &str) -> Result<Namespace
     NamespaceId::new(cid).map_err(namespace_error)
 }
 
-fn persist_alias(
+pub(super) fn namespace_aliases(state: &AppState) -> Result<Vec<(String, NamespaceId)>, ApiError> {
+    let read = state
+        .metadata
+        .database()
+        .begin_read()
+        .map_err(ApiError::redb_transaction)?;
+    let table = match read.open_table(NAMESPACE_ALIASES) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(ApiError::redb_table(error)),
+    };
+    let mut aliases = Vec::new();
+    for entry in table.iter().map_err(ApiError::redb_storage)? {
+        let (alias, namespace) = entry.map_err(ApiError::redb_storage)?;
+        let cid = namespace
+            .value()
+            .parse::<Cid>()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        aliases.push((
+            alias.value().to_string(),
+            NamespaceId::new(cid).map_err(namespace_error)?,
+        ));
+    }
+    aliases.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(aliases)
+}
+
+pub(super) fn persist_alias(
     state: &AppState,
     alias: &str,
     namespace_id: &NamespaceId,
@@ -235,7 +270,10 @@ fn persist_alias(
         let mut table = write
             .open_table(NAMESPACE_ALIASES)
             .map_err(ApiError::redb_table)?;
-        if table.get(alias).map_err(ApiError::redb_storage)?.is_some() {
+        if let Some(existing) = table.get(alias).map_err(ApiError::redb_storage)? {
+            if existing.value() == namespace_id.to_string() {
+                return Ok(());
+            }
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 ErrorCode::Conflict,
@@ -275,13 +313,19 @@ pub(super) async fn namespace_create(
             "exactly three consensus replicas are required",
         ));
     }
-    let descriptor = NamespaceDescriptor::new(
+    let mut descriptor = NamespaceDescriptor::new(
         request.kind,
         replicas.clone(),
         state.status.node_id.clone(),
         "00",
         unix_seconds(),
     );
+    if let Some(keep_last) = request.retention_keep_last {
+        descriptor.retention.keep_last = keep_last;
+    }
+    if request.retention_max_age_seconds.is_some() {
+        descriptor.retention.max_age_seconds = request.retention_max_age_seconds;
+    }
     let created = create_namespace(
         &state.namespace_data_store,
         descriptor,

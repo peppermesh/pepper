@@ -27,8 +27,81 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .await
             .map_err(|error| PublicationError::Storage(error.message))?;
         let payload = block.payload;
+
+        // Object ingestion already persists signed provider records for every
+        // acknowledged replica. Confirm those replicas with a cheap authenticated
+        // BlockHas request before transferring the complete block again. This is
+        // particularly important for multipart publication, which walks every
+        // part chunk immediately after the upload path replicated it.
+        let local_provider = self.0.network.local_provider_record(cid);
+        self.0
+            .network
+            .persist_provider_record(&local_provider)
+            .map_err(|error| PublicationError::Protection(error.to_string()))?;
+        let local_node_id = self.0.status.node_id.clone();
+        let provider_records = if replication_factor > 1 {
+            self.0
+                .network
+                .local_provider_records(cid)
+                .map_err(|error| PublicationError::Protection(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let probes = provider_records
+            .into_iter()
+            .filter(|record| record.node_id != local_node_id)
+            .map(|record| {
+                let network = self.0.network.clone();
+                async move {
+                    let mut confirmed = false;
+                    for address in &record.addresses {
+                        let Ok(address) = address.parse::<SocketAddr>() else {
+                            continue;
+                        };
+                        if matches!(
+                            time::timeout(
+                                Duration::from_secs(5),
+                                network.block_has(address, &record.cid),
+                            )
+                            .await,
+                            Ok(Ok(true))
+                        ) {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    confirmed.then_some(record)
+                }
+            });
+        let mut probes = stream::iter(probes).buffer_unordered(8);
+        let mut providers = vec![local_provider];
+        while let Some(provider) = probes.next().await {
+            if let Some(provider) = provider {
+                providers.push(provider);
+                if providers.len() >= replication_factor {
+                    break;
+                }
+            }
+        }
+        providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        providers.dedup_by(|left, right| left.node_id == right.node_id);
+        if providers.len() >= replication_factor {
+            return Ok(DurabilityReceipt {
+                cid: cid.clone(),
+                codec: cid.codec,
+                size: payload.len() as u64,
+                replicas_accepted: providers.len(),
+                replica_nodes: providers
+                    .iter()
+                    .map(|provider| provider.node_id.clone())
+                    .collect(),
+                status: "durable".to_string(),
+                providers,
+            });
+        }
+
         let attempted = time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(12),
             put_replicated_block_with_factor(
                 &self.0,
                 cid.codec,
@@ -70,7 +143,7 @@ impl DurabilityBackend for AgentDurabilityBackend {
                     continue;
                 };
                 let Ok(Ok(ack)) = time::timeout(
-                    Duration::from_secs(2),
+                    Duration::from_secs(12),
                     self.0
                         .network
                         .block_put_replica(address, cid.codec, payload.clone()),
@@ -231,6 +304,7 @@ impl ProtectionBackend for AgentProtectionBackend {
             .into_iter()
             .find(|pin| {
                 pin.pin_id.starts_with(&prefix)
+                    && pin.owner == self.node_id
                     && pin.status == "active"
                     && pin.expires_at_unix_seconds == expires_at_unix_seconds
             })
@@ -238,12 +312,16 @@ impl ProtectionBackend for AgentProtectionBackend {
             self.schedule_broadcast(existing);
             return Ok(());
         }
+        // Every namespace replica reconciles the same durable intent. Keep the
+        // deterministic pin identity owner-scoped so independently created,
+        // signed records never collide in a peer's metadata store.
         let mut pin = PinRecord {
             pin_id: format!(
-                "{}-{}",
+                "{}-{}-{}",
                 prefix,
                 expires_at_unix_seconds
-                    .map_or_else(|| "permanent".to_string(), |value| value.to_string())
+                    .map_or_else(|| "permanent".to_string(), |value| value.to_string()),
+                self.node_id
             ),
             root_cid: cid.clone(),
             owner: self.node_id.clone(),
@@ -275,7 +353,11 @@ impl ProtectionBackend for AgentProtectionBackend {
             .all()
             .map_err(|error| PublicationError::Protection(error.to_string()))?
             .into_iter()
-            .filter(|pin| pin.pin_id.starts_with(&prefix) && pin.status == "active")
+            .filter(|pin| {
+                pin.pin_id.starts_with(&prefix)
+                    && pin.owner == self.node_id
+                    && pin.status == "active"
+            })
             .collect::<Vec<_>>();
         for pin in &mut pins {
             pin.status = "deleted".to_string();

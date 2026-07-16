@@ -66,6 +66,8 @@ pub(super) async fn fs_create(
             kind: NamespaceKind::Filesystem,
             alias: request.alias,
             request_id: None,
+            retention_keep_last: None,
+            retention_max_age_seconds: None,
         }),
     )
     .await

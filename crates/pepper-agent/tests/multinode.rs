@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use hmac::{Hmac, Mac};
 use pepper_types::{
     Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, GcReport, NodeStatus,
     PinStatusResponse,
 };
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs,
@@ -258,6 +260,193 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(invalid_pin.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn s3_multipart_upload_http_contract() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_s3_config(temp.path(), "s3-multipart-1", p2p1, api, &[])?;
+    let config2 = write_s3_config(
+        temp.path(),
+        "s3-multipart-2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_s3_config(
+        temp.path(),
+        "s3-multipart-3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let _node1 = spawn_agent(agent, &config1)?;
+    let _node2 = spawn_agent(agent, &config2)?;
+    let _node3 = spawn_agent(agent, &config3)?;
+    for port in [api, api2, api3] {
+        wait_health(port).await?;
+    }
+    for port in [api, api2, api3] {
+        wait_for_peer_count(port, 2).await?;
+    }
+    let client = reqwest::Client::builder()
+        // Completion verifies the composed object's full DAG and may cross several
+        // Raft groups. GitHub's two-core runner can take more than 60 seconds while
+        // the three child agents are concurrently replicating and applying state.
+        .timeout(Duration::from_secs(180))
+        .build()?;
+
+    signed_s3_success_with_retry(&client, api, Method::PUT, "/multipart-test", Vec::new()).await?;
+    assert!(
+        signed_s3_success_with_retry(&client, api2, Method::HEAD, "/multipart-test", Vec::new(),)
+            .await?
+            .status()
+            .is_success()
+    );
+    let buckets = signed_s3_success_with_retry(&client, api3, Method::GET, "/", Vec::new())
+        .await?
+        .text()
+        .await?;
+    assert!(buckets.contains("<Name>multipart-test</Name>"));
+    let initiated = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::POST,
+        "/multipart-test/large.bin?uploads=",
+        Vec::new(),
+    )
+    .await?
+    .text()
+    .await?;
+    let upload_id = xml_value(&initiated, "UploadId")?;
+    let empty_objects = signed_s3_success_with_retry(
+        &client,
+        api,
+        Method::GET,
+        "/multipart-test?list-type=2",
+        Vec::new(),
+    )
+    .await?
+    .text()
+    .await?;
+    assert!(!empty_objects.contains("<Contents>"));
+
+    let first = vec![b'a'; 5 * 1024 * 1024];
+    let first_response = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::PUT,
+        &format!("/multipart-test/large.bin?partNumber=1&uploadId={upload_id}"),
+        first.clone(),
+    )
+    .await?;
+    let first_etag = first_response
+        .headers()
+        .get("etag")
+        .ok_or("UploadPart response omitted ETag")?
+        .to_str()?
+        .to_string();
+
+    let second = b"pepper multipart tail".to_vec();
+    let second_response = signed_s3_success_with_retry(
+        &client,
+        api3,
+        Method::PUT,
+        &format!("/multipart-test/large.bin?partNumber=2&uploadId={upload_id}"),
+        second.clone(),
+    )
+    .await?;
+    let second_etag = second_response
+        .headers()
+        .get("etag")
+        .ok_or("UploadPart response omitted ETag")?
+        .to_str()?
+        .to_string();
+
+    let listed = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::GET,
+        &format!("/multipart-test/large.bin?uploadId={upload_id}"),
+        Vec::new(),
+    )
+    .await?
+    .text()
+    .await?;
+    assert!(listed.contains("<PartNumber>1</PartNumber>"));
+    assert!(listed.contains("<PartNumber>2</PartNumber>"));
+
+    let complete = format!(
+        "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Part><PartNumber>1</PartNumber><ETag>{first_etag}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{second_etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    signed_s3_success_with_retry(
+        &client,
+        api3,
+        Method::POST,
+        &format!("/multipart-test/large.bin?uploadId={upload_id}"),
+        complete.into_bytes(),
+    )
+    .await?;
+
+    let downloaded = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::GET,
+        "/multipart-test/large.bin",
+        Vec::new(),
+    )
+    .await?
+    .bytes()
+    .await?;
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(downloaded.as_ref(), expected.as_slice());
+
+    let abandoned = signed_s3_success_with_retry(
+        &client,
+        api3,
+        Method::POST,
+        "/multipart-test/aborted.bin?uploads=",
+        Vec::new(),
+    )
+    .await?
+    .text()
+    .await?;
+    let abandoned_id = xml_value(&abandoned, "UploadId")?;
+    assert_eq!(
+        signed_s3_success_with_retry(
+            &client,
+            api2,
+            Method::DELETE,
+            &format!("/multipart-test/aborted.bin?uploadId={abandoned_id}"),
+            Vec::new(),
+        )
+        .await?
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let uploads = signed_s3_success_with_retry(
+        &client,
+        api3,
+        Method::GET,
+        "/multipart-test?uploads=",
+        Vec::new(),
+    )
+    .await?
+    .text()
+    .await?;
+    assert!(!uploads.contains("<Upload>"));
     Ok(())
 }
 
@@ -1473,6 +1662,161 @@ async fn two_node_replicated_write_and_remote_read() -> TestResult<()> {
         .await?;
     assert_eq!(status.name, "node1");
     Ok(())
+}
+
+async fn signed_s3_request(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+) -> TestResult<reqwest::Response> {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, ""), |(path, query)| (path, query));
+    let host = format!("127.0.0.1:{api_port}");
+    let now = time::OffsetDateTime::now_utc();
+    let amz_date = now.format(time::macros::format_description!(
+        "[year][month][day]T[hour][minute][second]Z"
+    ))?;
+    let date = &amz_date[..8];
+    let payload_hash = hex::encode(Sha256::digest(&body));
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    let canonical_request = format!(
+        "{}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        method.as_str()
+    );
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let mut root_key = b"AWS4".to_vec();
+    root_key.extend_from_slice(b"pepper-test-s3-secret-key-1234");
+    let date_key = test_hmac(&root_key, date.as_bytes());
+    let region_key = test_hmac(&date_key, b"us-east-1");
+    let service_key = test_hmac(&region_key, b"s3");
+    let signing_key = test_hmac(&service_key, b"aws4_request");
+    let signature = hex::encode(test_hmac(&signing_key, string_to_sign.as_bytes()));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=pepper-test/{scope},SignedHeaders={signed_headers},Signature={signature}"
+    );
+    Ok(client
+        .request(method, format!("http://{host}{path_and_query}"))
+        .header("x-amz-date", amz_date)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("authorization", authorization)
+        .body(body)
+        .send()
+        .await?)
+}
+
+fn test_hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
+    mac.update(value);
+    mac.finalize().into_bytes().to_vec()
+}
+
+async fn s3_success(response: reqwest::Response) -> TestResult<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.text().await?;
+    Err(format!("S3 request failed: {status} {body}").into())
+}
+
+async fn signed_s3_success_with_retry(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+) -> TestResult<reqwest::Response> {
+    s3_success(signed_s3_response_with_retry(client, api_port, method, path_and_query, body).await?)
+        .await
+}
+
+async fn signed_s3_response_with_retry(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+) -> TestResult<reqwest::Response> {
+    let mut last_error = String::new();
+    for _ in 0..40 {
+        let response = signed_s3_request(
+            client,
+            api_port,
+            method.clone(),
+            path_and_query,
+            body.clone(),
+        )
+        .await?;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE
+            && response.status() != StatusCode::CONFLICT
+        {
+            return Ok(response);
+        }
+        let status = response.status();
+        last_error = format!("{status}: {}", response.text().await?);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(format!(
+        "S3 request {method} {path_and_query} did not succeed before the retry deadline: {last_error}"
+    )
+    .into())
+}
+
+fn xml_value(xml: &str, element: &str) -> TestResult<String> {
+    let start_tag = format!("<{element}>");
+    let end_tag = format!("</{element}>");
+    let start = xml.find(&start_tag).ok_or("missing XML start tag")? + start_tag.len();
+    let end = xml[start..]
+        .find(&end_tag)
+        .map(|offset| start + offset)
+        .ok_or("missing XML end tag")?;
+    Ok(xml[start..end].to_string())
+}
+
+fn write_s3_config(
+    root: &Path,
+    name: &str,
+    p2p_port: u16,
+    api_port: u16,
+    bootstrap: &[String],
+) -> TestResult<PathBuf> {
+    let config = write_config_with_options(TestConfigOptions {
+        root,
+        name,
+        p2p_port,
+        api_port,
+        bootstrap,
+        api_token: None,
+        max_block_bytes: None,
+        replication_factor: 3,
+    })?;
+    let secret_path = root.join(name).join("s3.secret");
+    fs::write(&secret_path, b"pepper-test-s3-secret-key-1234")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))?;
+    }
+    let mut contents = fs::read_to_string(&config)?;
+    contents = contents.replace(
+        "consensus_enabled = true",
+        "consensus_enabled = true\nheartbeat_interval_ms = 500\nelection_timeout_min_ms = 3000\nelection_timeout_max_ms = 6000",
+    );
+    contents.push_str(&format!(
+        "\n[s3]\nenabled = true\nregion = \"us-east-1\"\naccess_key_id = \"pepper-test\"\nsecret_access_key_path = \"{}\"\n",
+        secret_path.display()
+    ));
+    fs::write(&config, contents)?;
+    Ok(config)
 }
 
 fn free_port() -> TestResult<u16> {

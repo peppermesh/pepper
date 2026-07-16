@@ -296,7 +296,7 @@ impl Scenario for NamespaceTransactionScenario {
             committed["root_cid"].as_str().unwrap(),
         )?;
         for (key, expected) in &model.values {
-            let (status, got) = json_request(
+            let got = json_success_eventually(
                 &client,
                 &nodes[0],
                 "POST",
@@ -305,8 +305,7 @@ impl Scenario for NamespaceTransactionScenario {
             )
             .await?;
             ensure!(
-                status == 200
-                    && got["value"]["cid"].as_str() == Some(expected.cid.as_str())
+                got["value"]["cid"].as_str() == Some(expected.cid.as_str())
                     && got["value"]["generation"].as_u64() == Some(expected.generation)
             );
         }

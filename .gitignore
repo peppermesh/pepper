@@ -1,6 +1,7 @@
 /target/
 /dev/*-data/
 /dev/*-storage/
+/dev/*.secret
 *.log
 **/fuzz/target/
 **/fuzz/artifacts/

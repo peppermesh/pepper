@@ -13,6 +13,7 @@ mod objects;
 mod pins;
 mod publication;
 mod repair;
+mod s3_api;
 
 use api_error::ApiError;
 use bucket_api::*;
@@ -25,6 +26,7 @@ use objects::*;
 use pins::*;
 use publication::*;
 use repair::*;
+use s3_api::*;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -41,7 +43,7 @@ use axum::{
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -61,7 +63,7 @@ use pepper_namespace::{
 };
 use pepper_network::{
     NetworkBlockService, NetworkComputeService, NetworkConfig, NetworkError, NetworkHandle,
-    NetworkPinService, PeerStatus, proto,
+    NetworkNamespaceAliasService, NetworkPinService, PeerStatus, proto,
 };
 use pepper_placement::{PlacementNode, select_replicas};
 use pepper_publication::{PublicationLimits, PublicationRepository};
@@ -105,6 +107,7 @@ const STORAGE_HARD_PRESSURE_PERCENT: u64 = 95;
 const DEFAULT_MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ERASURE_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
+const S3_INTERNAL_KEY_PREFIX: &[u8] = b"\xffs3/";
 
 #[derive(Debug, Parser)]
 #[command(name = "pepper-agent", about = "Pepper node agent")]
@@ -178,6 +181,7 @@ struct AppState {
     firecracker_cgroup_base: PathBuf,
     identity: NodeIdentity,
     api_bearer_token: Option<String>,
+    s3: Option<Arc<S3RuntimeConfig>>,
     max_block_bytes: Option<u64>,
     max_object_bytes: Option<u64>,
     max_compute_timeout_seconds: Option<u64>,
@@ -289,6 +293,35 @@ fn load_cluster_secret(path: Option<&PathBuf>) -> Result<Option<Vec<u8>>> {
         }
         None => Ok(None),
     }
+}
+
+fn load_s3_secret(path: &PathBuf) -> Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat S3 secret at {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "S3 secret permissions must be 0600 or stricter"
+        );
+    }
+    let mut secret = std::fs::read(path)
+        .with_context(|| format!("failed to read S3 secret at {}", path.display()))?;
+    while secret
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        secret.pop();
+    }
+    anyhow::ensure!(
+        secret.len() >= 16,
+        "S3 secret must contain at least 16 bytes"
+    );
+    Ok(secret)
 }
 
 fn init_tracing(format: &str) {
@@ -581,6 +614,29 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         operation_lock: operation_lock.clone(),
     });
     let cluster_secret = load_cluster_secret(loaded.config.auth.cluster_secret_path.as_ref())?;
+    let s3 = if loaded.config.s3.enabled {
+        let path = loaded
+            .config
+            .s3
+            .secret_access_key_path
+            .as_ref()
+            .context("s3.secret_access_key_path is required when S3 is enabled")?;
+        Some(Arc::new(S3RuntimeConfig {
+            region: loaded.config.s3.region.clone(),
+            access_key_id: loaded
+                .config
+                .s3
+                .access_key_id
+                .clone()
+                .context("s3.access_key_id is required when S3 is enabled")?,
+            secret_access_key: load_s3_secret(path)?,
+            max_clock_skew_seconds: loaded.config.s3.max_clock_skew_seconds,
+            bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }))
+    } else {
+        None
+    };
     let p2p_addr: SocketAddr = loaded
         .config
         .node
@@ -781,6 +837,7 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         firecracker_cgroup_base: loaded.config.compute.firecracker_cgroup_base.clone(),
         identity: identity.clone(),
         api_bearer_token: loaded.config.auth.api_bearer_token.clone(),
+        s3,
         max_block_bytes: Some(
             loaded
                 .config
@@ -826,10 +883,17 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
             state: state.clone(),
         }))
         .await;
+    state
+        .network
+        .set_namespace_alias_service(Arc::new(AgentNamespaceAliasService {
+            state: state.clone(),
+        }))
+        .await;
 
     recover_compute_jobs(&state).map_err(|error| anyhow::anyhow!(error.message))?;
     spawn_repair_loop(state.clone());
     spawn_publication_reconciler(state.clone());
+    spawn_s3_lifecycle_reconciler(state.clone());
 
     let shutdown_state = state.clone();
     let app = http::router(state);
@@ -2219,7 +2283,12 @@ async fn require_http_auth_and_rate_limit(
                 "HTTP concurrency limit exceeded",
             )
         })?;
-    if let Some(token) = &state.api_bearer_token {
+    let s3_request = state.s3.is_some()
+        && !request.uri().path().starts_with("/v1/")
+        && !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
+    if let Some(token) = &state.api_bearer_token
+        && !s3_request
+    {
         let expected = format!("Bearer {token}");
         let authorized = request
             .headers()

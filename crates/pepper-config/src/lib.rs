@@ -60,6 +60,8 @@ pub struct PepperConfig {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub s3: S3Config,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -234,6 +236,32 @@ pub struct AuthConfig {
     pub api_bearer_token: Option<String>,
 }
 
+/// Opt-in S3-compatible gateway configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Config {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key_path: Option<PathBuf>,
+    #[serde(default = "default_s3_clock_skew_seconds")]
+    pub max_clock_skew_seconds: u64,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            region: default_s3_region(),
+            access_key_id: None,
+            secret_access_key_path: None,
+            max_clock_skew_seconds: default_s3_clock_skew_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -379,6 +407,14 @@ fn default_listen_addr() -> String {
 
 fn default_api_bind_addr() -> String {
     "127.0.0.1:9080".to_string()
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_s3_clock_skew_seconds() -> u64 {
+    900
 }
 
 fn default_data_path() -> PathBuf {
@@ -709,6 +745,45 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
             "auth.api_bearer_token must not be empty when configured".to_string(),
         ));
     }
+    if config.s3.enabled {
+        if !config.namespace.enabled || !config.namespace.consensus_enabled {
+            return Err(ConfigError::Invalid(
+                "s3.enabled requires namespace.enabled and namespace.consensus_enabled".to_string(),
+            ));
+        }
+        let access_key = config.s3.access_key_id.as_deref().unwrap_or_default();
+        if access_key.is_empty()
+            || access_key.len() > 128
+            || !access_key.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(ConfigError::Invalid(
+                "s3.access_key_id must contain 1 to 128 visible ASCII bytes when S3 is enabled"
+                    .to_string(),
+            ));
+        }
+        if config.s3.secret_access_key_path.is_none() {
+            return Err(ConfigError::Invalid(
+                "s3.secret_access_key_path is required when S3 is enabled".to_string(),
+            ));
+        }
+        if config.s3.region.is_empty()
+            || config.s3.region.len() > 64
+            || !config
+                .s3
+                .region
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ConfigError::Invalid(
+                "s3.region must contain 1 to 64 ASCII letters, digits, or hyphens".to_string(),
+            ));
+        }
+        if config.s3.max_clock_skew_seconds == 0 || config.s3.max_clock_skew_seconds > 3600 {
+            return Err(ConfigError::Invalid(
+                "s3.max_clock_skew_seconds must be between 1 and 3600".to_string(),
+            ));
+        }
+    }
     if config
         .limits
         .max_block_bytes
@@ -899,9 +974,47 @@ mod tests {
         assert_eq!(cfg.api.bind_addr, "127.0.0.1:9080");
         assert_eq!(cfg.replication.default_factor, 3);
         assert!(!cfg.namespace.enabled);
+        assert!(!cfg.s3.enabled);
+        assert_eq!(cfg.s3.region, "us-east-1");
         assert!(!cfg.erasure.enabled);
         assert_eq!(cfg.erasure.data_shards, 6);
         assert_eq!(cfg.erasure.parity_shards, 3);
+    }
+
+    #[test]
+    fn validates_s3_gateway_configuration() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [namespace]
+            enabled = true
+            consensus_enabled = true
+            [s3]
+            enabled = true
+            region = "us-west-2"
+            access_key_id = "pepper-test"
+            secret_access_key_path = "/tmp/pepper-s3.secret"
+            max_clock_skew_seconds = 300
+            [[storage.locations]]
+            path = "/tmp/pepper-config-s3-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+
+        let invalid: PepperConfig = toml::from_str(
+            r#"
+            [s3]
+            enabled = true
+            access_key_id = "pepper-test"
+            secret_access_key_path = "/tmp/pepper-s3.secret"
+            [[storage.locations]]
+            path = "/tmp/pepper-config-invalid-s3-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        assert!(validate(&invalid).is_err());
     }
 
     #[test]

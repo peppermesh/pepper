@@ -7,7 +7,8 @@
 use super::*;
 
 pub(super) fn router(state: AppState) -> Router {
-    Router::new()
+    let s3_enabled = state.s3.is_some();
+    let mut router = Router::new()
         .route("/v1/node/status", get(node_status))
         .route("/v1/node/peers", get(node_peers))
         .route("/v1/blocks", post(put_block))
@@ -121,7 +122,13 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/compute/jobs/{job_id}/cancel", post(cancel_compute_job))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics));
+    if s3_enabled {
+        router = router
+            .route("/", any(s3_dispatch))
+            .route("/{*s3_path}", any(s3_dispatch));
+    }
+    router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_http_auth_and_rate_limit,

@@ -57,6 +57,13 @@ firecracker_vcpu_count = 1
 # cluster_secret_path = "./dev/cluster.secret"
 # api_bearer_token = "dev-token"
 
+[s3]
+enabled = true
+region = "us-east-1"
+access_key_id = "pepper-dev"
+secret_access_key_path = "./dev/s3.secret"
+max_clock_skew_seconds = 900
+
 [limits]
 max_block_bytes = 67108864
 max_object_bytes = 1073741824

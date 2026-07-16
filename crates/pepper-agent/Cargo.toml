@@ -15,12 +15,18 @@ description = "PepperMesh distributed storage and Firecracker compute node agent
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+crc32c = { workspace = true }
+crc32fast = { workspace = true }
 fs2 = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
+md5 = { workspace = true }
+multer = { workspace = true }
 pepper-bucket = { version = "0.2.0", path = "../pepper-bucket" }
 pepper-compute = { version = "0.2.0", path = "../pepper-compute" }
 pepper-config = { version = "0.2.0", path = "../pepper-config" }
@@ -36,10 +42,13 @@ pepper-placement = { version = "0.2.0", path = "../pepper-placement" }
 pepper-publication = { version = "0.2.0", path = "../pepper-publication" }
 pepper-storage = { version = "0.2.0", path = "../pepper-storage" }
 pepper-types = { version = "0.2.0", path = "../pepper-types" }
+quick-xml = { workspace = true }
 redb = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 tikv-jemallocator = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }

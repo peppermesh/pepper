@@ -15,50 +15,50 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketCreateRequest {
-    alias: Option<String>,
+    pub(super) alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketPutRequest {
-    bucket: String,
-    key_hex: String,
-    content_cid: Cid,
-    logical_size: u64,
+    pub(super) bucket: String,
+    pub(super) key_hex: String,
+    pub(super) content_cid: Cid,
+    pub(super) logical_size: u64,
     #[serde(default = "default_content_type")]
-    content_type: String,
+    pub(super) content_type: String,
     #[serde(default)]
-    metadata: BTreeMap<String, String>,
-    if_generation: Option<u64>,
-    if_cid: Option<Cid>,
-    request_id: String,
+    pub(super) metadata: BTreeMap<String, String>,
+    pub(super) if_generation: Option<u64>,
+    pub(super) if_cid: Option<Cid>,
+    pub(super) request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketKeyRequest {
-    bucket: String,
-    key_hex: String,
-    revision: Option<u64>,
+    pub(super) bucket: String,
+    pub(super) key_hex: String,
+    pub(super) revision: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketDeleteRequest {
-    bucket: String,
-    key_hex: String,
-    if_generation: Option<u64>,
-    if_cid: Option<Cid>,
-    request_id: String,
+    pub(super) bucket: String,
+    pub(super) key_hex: String,
+    pub(super) if_generation: Option<u64>,
+    pub(super) if_cid: Option<Cid>,
+    pub(super) request_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketListRequest {
-    bucket: String,
-    prefix_hex: Option<String>,
+    pub(super) bucket: String,
+    pub(super) prefix_hex: Option<String>,
     #[serde(default = "default_limit")]
-    limit: usize,
-    cursor: Option<String>,
-    revision: Option<u64>,
+    pub(super) limit: usize,
+    pub(super) cursor: Option<String>,
+    pub(super) revision: Option<u64>,
     #[serde(default)]
-    include_tombstones: bool,
+    pub(super) include_tombstones: bool,
 }
 
 fn default_content_type() -> String {
@@ -78,6 +78,8 @@ pub(super) async fn bucket_create(
             kind: NamespaceKind::Bucket,
             alias: request.alias,
             request_id: None,
+            retention_keep_last: None,
+            retention_max_age_seconds: None,
         }),
     )
     .await
@@ -87,6 +89,7 @@ pub(super) async fn bucket_put(
     State(state): State<AppState>,
     Json(request): Json<BucketPutRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let current = current_value(&state, &namespace_id, &request.key_hex).await?;
     let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
@@ -149,6 +152,7 @@ pub(super) async fn bucket_get(
     State(state): State<AppState>,
     Json(request): Json<BucketKeyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let namespace_state = namespace_manager(&state)?
         .linearizable_namespace_state(&namespace_id)
@@ -195,6 +199,7 @@ pub(super) async fn bucket_delete(
     State(state): State<AppState>,
     Json(request): Json<BucketDeleteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let current = current_value(&state, &namespace_id, &request.key_hex).await?;
     let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
@@ -270,6 +275,14 @@ pub(super) async fn bucket_list(
         .map(hex::decode)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if prefix
+        .as_deref()
+        .is_some_and(|prefix| prefix.starts_with(S3_INTERNAL_KEY_PREFIX))
+    {
+        return Err(ApiError::bad_request(
+            "bucket key prefix is reserved for internal S3 state",
+        ));
+    }
     let page = pepper_merkle::scan(
         &state.namespace_data_store,
         &root,
@@ -295,6 +308,9 @@ pub(super) async fn bucket_list(
     })?;
     let mut objects = Vec::new();
     for entry in page.entries {
+        if entry.key.starts_with(S3_INTERNAL_KEY_PREFIX) {
+            continue;
+        }
         let descriptor = get_descriptor(
             &state.namespace_data_store,
             &entry.value.cid,
@@ -325,6 +341,7 @@ pub(super) async fn bucket_versions(
     State(state): State<AppState>,
     Json(request): Json<BucketKeyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let current = current_value(&state, &namespace_id, &request.key_hex)
         .await?
@@ -344,6 +361,16 @@ pub(super) async fn bucket_versions(
         "key_hex": request.key_hex,
         "versions": history
     })))
+}
+
+fn reject_reserved_s3_key_hex(key_hex: &str) -> Result<(), ApiError> {
+    let key = hex::decode(key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if key.starts_with(S3_INTERNAL_KEY_PREFIX) {
+        return Err(ApiError::bad_request(
+            "bucket key is reserved for internal S3 state",
+        ));
+    }
+    Ok(())
 }
 
 fn bucket_error(error: pepper_bucket::BucketError) -> ApiError {

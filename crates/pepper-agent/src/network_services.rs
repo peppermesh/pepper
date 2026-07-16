@@ -39,6 +39,36 @@ pub(super) struct AgentPinService {
     pub(super) state: AppState,
 }
 
+pub(super) struct AgentNamespaceAliasService {
+    pub(super) state: AppState,
+}
+
+#[async_trait]
+impl NetworkNamespaceAliasService for AgentNamespaceAliasService {
+    async fn resolve(
+        &self,
+        _authenticated_node: &str,
+        alias: String,
+    ) -> Result<Option<String>, NetworkError> {
+        local_s3_bucket_namespace(&self.state, &alias)
+            .await
+            .map(|namespace| namespace.map(|namespace| namespace.to_string()))
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+
+    async fn list(&self, _authenticated_node: &str) -> Result<Vec<(String, String)>, NetworkError> {
+        local_s3_bucket_aliases(&self.state)
+            .await
+            .map(|aliases| {
+                aliases
+                    .into_iter()
+                    .map(|(alias, namespace)| (alias, namespace.to_string()))
+                    .collect()
+            })
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+}
+
 #[async_trait]
 impl NetworkPinService for AgentPinService {
     async fn apply(
