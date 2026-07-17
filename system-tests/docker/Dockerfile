@@ -21,7 +21,8 @@ RUN apt-get update \
     && chown -R pepper:pepper /control /var/lib/pepper
 COPY --from=builder /src/target/release/pepper-agent /usr/local/bin/pepper-agent
 COPY --from=builder /src/target/release/pepper /usr/local/bin/pepper
-COPY --chmod=755 dev/s3-contract/node-entrypoint.sh /usr/local/bin/s3-contract-node
+COPY dev/s3-contract/node-entrypoint.sh /usr/local/bin/s3-contract-node
+RUN chmod 755 /usr/local/bin/s3-contract-node
 ENTRYPOINT ["/usr/bin/tini", "--"]
 USER 65532:65532
 CMD ["pepper-agent", "--help"]

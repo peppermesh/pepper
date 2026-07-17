@@ -32,7 +32,7 @@ fn maintenance_paths(
 ) -> (String, String) {
     if cluster.backend.metadata().name == "docker" {
         (
-            "/etc/pepper/config.toml".into(),
+            "/var/lib/pepper/identity/config.toml".into(),
             "/var/lib/pepper/compute/namespace-backup.redb".into(),
         )
     } else {

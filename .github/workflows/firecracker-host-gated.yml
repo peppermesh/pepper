@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-name: firecracker-host-gated
+name: firecracker-host-gated-optional
 
 on:
   workflow_dispatch:

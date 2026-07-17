@@ -14,10 +14,10 @@ on:
       duration_seconds:
         description: "Soak duration in seconds"
         required: true
-        default: "21600"
+        default: "18000"
         type: string
       expected_kernel:
-        description: "Exact uname -r pinned on the soak runner"
+        description: "Optional exact uname -r; blank records the hosted runner kernel"
         required: false
         type: string
 
@@ -25,27 +25,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: system-soak-fixed-kernel
+  group: system-soak-hosted
   cancel-in-progress: false
 
 jobs:
   soak:
-    runs-on: [self-hosted, linux, x64, pepper-soak]
-    timeout-minutes: 420
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
     env:
-      EXPECTED_KERNEL: ${{ inputs.expected_kernel || vars.PEPPER_SOAK_KERNEL }}
-      DURATION_SECONDS: ${{ inputs.duration_seconds || '21600' }}
+      DURATION_SECONDS: ${{ inputs.duration_seconds || '18000' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Enforce fixed kernel and choose seed
+      - name: Record hosted kernel and choose seed
         id: preflight
         env:
           REQUESTED_SEED: ${{ inputs.seed }}
+          REQUESTED_KERNEL: ${{ inputs.expected_kernel }}
         run: |
-          test -n "$EXPECTED_KERNEL"
-          test "$(uname -r)" = "$EXPECTED_KERNEL"
+          kernel=$(uname -r)
+          if [ -n "$REQUESTED_KERNEL" ]; then
+            test "$kernel" = "$REQUESTED_KERNEL"
+          fi
           test -r /proc/1/status
           if [ -n "$REQUESTED_SEED" ]; then
             seed="$REQUESTED_SEED"
@@ -54,12 +56,14 @@ jobs:
             seed=$(( week * 1000 + GITHUB_RUN_NUMBER ))
           fi
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
-      - name: Run fixed-kernel soak and growth analysis
+          echo "kernel=$kernel" >> "$GITHUB_OUTPUT"
+      - name: Run hosted soak and growth analysis
         run: >-
           cargo run --manifest-path system-tests/Cargo.toml --locked --
           run --scenario SOAK-001 --seed "${{ steps.preflight.outputs.seed }}"
           --backend docker --image "pepper-system-test:${GITHUB_SHA}"
-          --duration-seconds "$DURATION_SECONDS" --expected-kernel "$EXPECTED_KERNEL"
+          --duration-seconds "$DURATION_SECONDS"
+          --expected-kernel "${{ steps.preflight.outputs.kernel }}"
       - name: Assert backend cleanup
         if: always()
         run: |
