@@ -100,81 +100,86 @@ impl DurabilityBackend for AgentDurabilityBackend {
             });
         }
 
-        let attempted = time::timeout(
-            Duration::from_secs(12),
-            put_replicated_block_with_factor(
-                &self.0,
-                cid.codec,
-                payload.clone(),
-                replication_factor,
-            ),
-        )
-        .await;
-        let mut receipt = match attempted {
-            Ok(Ok(receipt)) => receipt,
-            Ok(Err(error)) => return Err(PublicationError::Protection(error.message)),
-            Err(_) => {
-                let provider = self.0.network.local_provider_record(cid);
-                self.0
-                    .network
-                    .persist_provider_record(&provider)
-                    .map_err(|error| PublicationError::Protection(error.to_string()))?;
-                DurabilityReceipt {
-                    cid: cid.clone(),
-                    codec: cid.codec,
-                    size: payload.len() as u64,
-                    replicas_accepted: 1,
-                    replica_nodes: vec![self.0.status.node_id.clone()],
-                    status: "degraded".to_string(),
-                    providers: vec![provider],
+        // A failed node must not delay every CID in a namespace publication.
+        // Send missing replicas concurrently and stop as soon as the durability
+        // threshold is met; dropping the remaining futures cancels transfers to
+        // unavailable peers.
+        let confirmed_nodes = providers
+            .iter()
+            .map(|provider| provider.node_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let transfers = self
+            .0
+            .network
+            .peers()
+            .await
+            .into_iter()
+            .filter(|peer| !confirmed_nodes.contains(&peer.node_id))
+            .map(|peer| {
+                let state = self.0.clone();
+                let cid = cid.clone();
+                let payload = payload.clone();
+                async move {
+                    let transfer = async {
+                        for address in &peer.addresses {
+                            let Ok(address) = address.parse::<SocketAddr>() else {
+                                continue;
+                            };
+                            let Ok(ack) = state
+                                .network
+                                .block_put_replica(address, cid.codec, payload.clone())
+                                .await
+                            else {
+                                continue;
+                            };
+                            if let Ok(provider) = validate_replica_ack(
+                                &state,
+                                &peer.node_id,
+                                &cid,
+                                cid.codec,
+                                payload.len() as u64,
+                                &ack,
+                            ) {
+                                return Some(provider);
+                            }
+                        }
+                        None
+                    };
+                    time::timeout(Duration::from_secs(12), transfer)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            });
+        let mut transfers = stream::iter(transfers).buffer_unordered(8);
+        while let Some(provider) = transfers.next().await {
+            if let Some(provider) = provider {
+                providers.push(provider);
+                providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+                providers.dedup_by(|left, right| left.node_id == right.node_id);
+                if providers.len() >= replication_factor {
+                    break;
                 }
             }
-        };
-        if receipt.replicas_accepted < replication_factor {
-            for peer in self.0.network.peers().await {
-                if receipt.replica_nodes.contains(&peer.node_id) {
-                    continue;
-                }
-                let Some(address) = peer
-                    .addresses
-                    .iter()
-                    .find_map(|address| address.parse::<SocketAddr>().ok())
-                else {
-                    continue;
-                };
-                let Ok(Ok(ack)) = time::timeout(
-                    Duration::from_secs(12),
-                    self.0
-                        .network
-                        .block_put_replica(address, cid.codec, payload.clone()),
-                )
-                .await
-                else {
-                    continue;
-                };
-                if let Ok(provider) = validate_replica_ack(
-                    &self.0,
-                    &peer.node_id,
-                    cid,
-                    cid.codec,
-                    payload.len() as u64,
-                    &ack,
-                ) {
-                    receipt.replica_nodes.push(peer.node_id);
-                    receipt.providers.push(provider);
-                }
-            }
-            receipt.replica_nodes.sort();
-            receipt.replica_nodes.dedup();
-            receipt.replicas_accepted = receipt.replica_nodes.len();
-            receipt.status = if receipt.replicas_accepted >= replication_factor {
+        }
+        let replicas_accepted = providers.len();
+        Ok(DurabilityReceipt {
+            cid: cid.clone(),
+            codec: cid.codec,
+            size: payload.len() as u64,
+            replicas_accepted,
+            replica_nodes: providers
+                .iter()
+                .map(|provider| provider.node_id.clone())
+                .collect(),
+            status: if replicas_accepted >= replication_factor {
                 "durable"
             } else {
                 "degraded"
             }
-            .to_string();
-        }
-        Ok(receipt)
+            .to_string(),
+            providers,
+        })
     }
 }
 
