@@ -44,7 +44,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -2298,54 +2298,112 @@ impl NamespaceGroupManager {
         let network = self.network.as_ref().ok_or_else(|| {
             ConsensusError::Raft("networked namespace routing is disabled".to_string())
         })?;
-        let mut candidates = self
-            .discovery_records(&namespace_id.to_string())
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
-        for peer in network.peers().await {
-            for address in peer.addresses {
-                let Ok(address) = address.parse::<SocketAddr>() else {
-                    continue;
-                };
-                if let Ok(records) = network
-                    .namespace_discover(address, namespace_id.to_string())
-                    .await
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(group) = self.group(namespace_id).await {
+                let metrics = group.raft.metrics().borrow().clone();
+                if metrics.current_leader == Some(self.node_id)
+                    && group.raft.ensure_linearizable().await.is_ok()
                 {
+                    return Ok(group.namespace_state().await);
+                }
+            }
+
+            let peers = network.peers().await;
+            let mut discoveries = tokio::task::JoinSet::new();
+            for peer in &peers {
+                for address in &peer.addresses {
+                    let Ok(address) = address.parse::<SocketAddr>() else {
+                        continue;
+                    };
+                    let network = network.clone();
+                    let namespace_id = namespace_id.to_string();
+                    discoveries.spawn(async move {
+                        tokio::time::timeout(
+                            Duration::from_secs(1),
+                            network.namespace_discover(address, namespace_id),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    });
+                }
+            }
+
+            let mut candidates = self
+                .discovery_records(&namespace_id.to_string())
+                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+            while let Some(result) = discoveries.join_next().await {
+                if let Ok(Some(records)) = result {
                     for record in records {
                         let _ = self.persist_discovery_record(record.clone());
                         candidates.push(record);
                     }
                 }
             }
-        }
-        candidates.sort_by(|left, right| {
-            right
-                .membership_epoch
-                .cmp(&left.membership_epoch)
-                .then_with(|| right.leader_term.cmp(&left.leader_term))
-        });
-        candidates.dedup_by(|left, right| {
-            left.membership_epoch == right.membership_epoch
-                && left.leader_node_id == right.leader_node_id
-        });
-        for record in candidates.into_iter().take(3) {
-            let Some(peer) = network.peer_address(&record.leader_node_id).await else {
-                continue;
-            };
-            let request = proto::NamespaceStateRequest {
-                context: Some(proto::NamespaceRpcContext {
-                    namespace_id: namespace_id.to_string(),
-                    namespace_protocol_version: 1,
-                    membership_epoch: record.membership_epoch,
-                    term: record.leader_term,
-                    sender_identity: self.node_identity.clone(),
-                    request_id: String::new(),
-                }),
-            };
-            if let Ok(response) = network.namespace_state(peer, request).await
-                && let Ok(state) = serde_json::from_slice(&response.state_json)
-            {
-                return Ok(state);
+            candidates.sort_by(|left, right| {
+                right
+                    .membership_epoch
+                    .cmp(&left.membership_epoch)
+                    .then_with(|| right.leader_term.cmp(&left.leader_term))
+            });
+            candidates.dedup_by(|left, right| {
+                left.membership_epoch == right.membership_epoch
+                    && left.leader_node_id == right.leader_node_id
+            });
+
+            // An election may complete while discovery is in flight. Check the
+            // local group again before routing to remote candidates.
+            if let Ok(group) = self.group(namespace_id).await {
+                let metrics = group.raft.metrics().borrow().clone();
+                if metrics.current_leader == Some(self.node_id)
+                    && group.raft.ensure_linearizable().await.is_ok()
+                {
+                    return Ok(group.namespace_state().await);
+                }
             }
+
+            let mut reads = tokio::task::JoinSet::new();
+            for record in candidates.into_iter().take(3) {
+                if record.leader_node_id == self.node_identity {
+                    continue;
+                }
+                let Some(peer) = network.peer_address(&record.leader_node_id).await else {
+                    continue;
+                };
+                let network = network.clone();
+                let request = proto::NamespaceStateRequest {
+                    context: Some(proto::NamespaceRpcContext {
+                        namespace_id: namespace_id.to_string(),
+                        namespace_protocol_version: 1,
+                        membership_epoch: record.membership_epoch,
+                        term: record.leader_term,
+                        sender_identity: self.node_identity.clone(),
+                        request_id: String::new(),
+                    }),
+                };
+                reads.spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        network.namespace_state(peer, request),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                });
+            }
+            while let Some(result) = reads.join_next().await {
+                if let Ok(Some(response)) = result
+                    && let Ok(state) = serde_json::from_slice(&response.state_json)
+                {
+                    return Ok(state);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline || peers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(ConsensusError::Raft(
             "namespace leader unavailable after bounded rediscovery".into(),
