@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+
+x-pepper-node: &pepper-node
+  image: pepper-s3-contract:local
+  build:
+    context: ../..
+    dockerfile: system-tests/docker/Dockerfile
+  environment: &pepper-environment
+    PEPPER_TEST_CLUSTER_SECRET: pepper-contract-cluster-secret-v1
+    PEPPER_TEST_S3_SECRET: pepper-contract-s3-secret-v1
+  stop_grace_period: 20s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9080/readyz"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+    start_period: 3s
+  networks:
+    s3-contract:
+
+services:
+  node1:
+    <<: *pepper-node
+    hostname: node1
+    environment:
+      <<: *pepper-environment
+      PEPPER_TEST_NODE_NAME: node1
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    volumes:
+      - ./node1.toml:/etc/pepper/node.toml:ro
+      - node1-data:/var/lib/pepper
+      - control:/control
+    networks:
+      s3-contract:
+        ipv4_address: 172.29.42.11
+
+  node2:
+    <<: *pepper-node
+    hostname: node2
+    environment:
+      <<: *pepper-environment
+      PEPPER_TEST_NODE_NAME: node2
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      node1:
+        condition: service_healthy
+    volumes:
+      - ./node2.toml:/etc/pepper/node.toml:ro
+      - node2-data:/var/lib/pepper
+      - control:/control
+    networks:
+      s3-contract:
+        ipv4_address: 172.29.42.12
+
+  node3:
+    <<: *pepper-node
+    hostname: node3
+    environment:
+      <<: *pepper-environment
+      PEPPER_TEST_NODE_NAME: node3
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    volumes:
+      - ./node3.toml:/etc/pepper/node.toml:ro
+      - node3-data:/var/lib/pepper
+      - control:/control
+    networks:
+      s3-contract:
+        ipv4_address: 172.29.42.13
+
+  s3-tests:
+    image: public.ecr.aws/aws-cli/aws-cli:2.27.49
+    entrypoint: ["/bin/sh", "/test/run-contract.sh"]
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: pepper-contract
+      AWS_SECRET_ACCESS_KEY: pepper-contract-s3-secret-v1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_PAGER: ""
+      PEPPER_S3_NODE1: http://node1:19080
+      PEPPER_S3_NODE2: http://node2:19080
+      PEPPER_S3_NODE3: http://node3:19080
+    volumes:
+      - ./run-contract.sh:/test/run-contract.sh:ro
+      - control:/control
+    networks:
+      s3-contract:
+
+volumes:
+  control:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  s3-contract:
+    ipam:
+      config:
+        - subnet: 172.29.42.0/24

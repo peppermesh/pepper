@@ -231,6 +231,26 @@ message NamespaceAnnounceResponse {
   bool accepted = 1;
 }
 
+message NamespaceAliasResolveRequest {
+  string alias = 1;
+}
+
+message NamespaceAliasResolveResponse {
+  bool found = 1;
+  string namespace_id = 2;
+}
+
+message NamespaceAliasListRequest {}
+
+message NamespaceAliasRecord {
+  string alias = 1;
+  string namespace_id = 2;
+}
+
+message NamespaceAliasListResponse {
+  repeated NamespaceAliasRecord aliases = 1;
+}
+
 message NamespaceRaftRequest {
   NamespaceRpcContext context = 1;
   bytes request_json = 2;

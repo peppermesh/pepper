@@ -205,6 +205,16 @@ pub trait NetworkPinService: Send + Sync + 'static {
 }
 
 #[async_trait]
+pub trait NetworkNamespaceAliasService: Send + Sync + 'static {
+    async fn resolve(
+        &self,
+        authenticated_node: &str,
+        alias: String,
+    ) -> Result<Option<String>, NetworkError>;
+    async fn list(&self, authenticated_node: &str) -> Result<Vec<(String, String)>, NetworkError>;
+}
+
+#[async_trait]
 pub trait NetworkNamespaceService: Send + Sync + 'static {
     async fn discover(
         &self,
@@ -270,6 +280,7 @@ pub struct NetworkHandle {
     peers: Arc<RwLock<HashMap<String, PeerStatus>>>,
     compute_service: Arc<RwLock<Option<Arc<dyn NetworkComputeService>>>>,
     pin_service: Arc<RwLock<Option<Arc<dyn NetworkPinService>>>>,
+    namespace_alias_service: Arc<RwLock<Option<Arc<dyn NetworkNamespaceAliasService>>>>,
     namespace_service: Arc<RwLock<Option<Arc<dyn NetworkNamespaceService>>>>,
     cluster_secret: Option<Arc<[u8]>>,
     requests_per_minute: Option<u64>,
@@ -307,6 +318,7 @@ impl NetworkHandle {
             peers,
             compute_service: Arc::new(RwLock::new(None)),
             pin_service: Arc::new(RwLock::new(None)),
+            namespace_alias_service: Arc::new(RwLock::new(None)),
             namespace_service: Arc::new(RwLock::new(None)),
             cluster_secret: config.cluster_secret.map(Arc::from),
             requests_per_minute: config.requests_per_minute,
@@ -344,6 +356,13 @@ impl NetworkHandle {
 
     pub async fn set_pin_service(&self, service: Arc<dyn NetworkPinService>) {
         *self.pin_service.write().await = Some(service);
+    }
+
+    pub async fn set_namespace_alias_service(
+        &self,
+        service: Arc<dyn NetworkNamespaceAliasService>,
+    ) {
+        *self.namespace_alias_service.write().await = Some(service);
     }
 
     pub async fn set_namespace_service(&self, service: Arc<dyn NetworkNamespaceService>) {
@@ -1194,6 +1213,31 @@ impl NetworkHandle {
         self.rpc(peer, "/namespace/bootstrap", request).await
     }
 
+    pub async fn namespace_alias_resolve(
+        &self,
+        peer: SocketAddr,
+        alias: String,
+    ) -> Result<proto::NamespaceAliasResolveResponse, NetworkError> {
+        self.rpc(
+            peer,
+            "/namespace/alias/resolve",
+            proto::NamespaceAliasResolveRequest { alias },
+        )
+        .await
+    }
+
+    pub async fn namespace_alias_list(
+        &self,
+        peer: SocketAddr,
+    ) -> Result<proto::NamespaceAliasListResponse, NetworkError> {
+        self.rpc(
+            peer,
+            "/namespace/alias/list",
+            proto::NamespaceAliasListRequest {},
+        )
+        .await
+    }
+
     pub async fn peer_address(&self, node_id: &str) -> Option<SocketAddr> {
         self.peers()
             .await
@@ -1620,6 +1664,55 @@ impl NetworkHandle {
                 })?;
                 service.announce(&request.node_id, record).await?;
                 encode_payload(proto::NamespaceAnnounceResponse { accepted: true })
+            }
+            "/namespace/alias/resolve" => {
+                let alias_request =
+                    proto::NamespaceAliasResolveRequest::decode(request.payload.as_slice())?;
+                if alias_request.alias.is_empty() || alias_request.alias.len() > 256 {
+                    return Err(NetworkError::BlockService(
+                        "invalid namespace alias lookup".to_string(),
+                    ));
+                }
+                let service = self
+                    .namespace_alias_service
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or_else(|| {
+                        NetworkError::BlockService(
+                            "namespace alias service is disabled".to_string(),
+                        )
+                    })?;
+                let namespace_id = service
+                    .resolve(&request.node_id, alias_request.alias)
+                    .await?;
+                encode_payload(proto::NamespaceAliasResolveResponse {
+                    found: namespace_id.is_some(),
+                    namespace_id: namespace_id.unwrap_or_default(),
+                })
+            }
+            "/namespace/alias/list" => {
+                let _ = proto::NamespaceAliasListRequest::decode(request.payload.as_slice())?;
+                let service = self
+                    .namespace_alias_service
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or_else(|| {
+                        NetworkError::BlockService(
+                            "namespace alias service is disabled".to_string(),
+                        )
+                    })?;
+                let aliases = service
+                    .list(&request.node_id)
+                    .await?
+                    .into_iter()
+                    .map(|(alias, namespace_id)| proto::NamespaceAliasRecord {
+                        alias,
+                        namespace_id,
+                    })
+                    .collect();
+                encode_payload(proto::NamespaceAliasListResponse { aliases })
             }
             "/namespace/raft/vote"
             | "/namespace/raft/append"

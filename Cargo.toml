@@ -35,13 +35,18 @@ homepage = "https://peppermesh.org"
 anyhow = "1.0"
 axum = "0.8"
 blake3 = "1.8"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = "3.0"
 getrandom = "0.3"
 hex = "0.4"
+hmac = "0.12"
+crc32c = "0.6"
+crc32fast = "1.5"
 openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }
 prost = "0.14"
 quinn = "0.11"
+quick-xml = { version = "0.41", features = ["serialize"] }
 rcgen = "0.14"
 redb = "2.6"
 reed-solomon-erasure = "6.0"
@@ -49,6 +54,10 @@ rustls = "0.23"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+sha1 = "0.10"
+md5 = { package = "md-5", version = "0.10" }
+multer = "3.1"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

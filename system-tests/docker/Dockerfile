@@ -13,14 +13,15 @@ LABEL org.opencontainers.image.source="https://github.com/peppermesh/pepper" \
       org.opencontainers.image.title="Pepper system-test runtime"
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl iproute2 jq nftables procps tini \
+       ca-certificates curl iproute2 jq nftables procps socat tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 pepper \
     && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin pepper \
-    && mkdir -p /var/lib/pepper/identity /var/lib/pepper/metadata /var/lib/pepper/storage /var/lib/pepper/compute \
-    && chown -R pepper:pepper /var/lib/pepper
+    && mkdir -p /control /var/lib/pepper/identity /var/lib/pepper/metadata /var/lib/pepper/storage /var/lib/pepper/compute \
+    && chown -R pepper:pepper /control /var/lib/pepper
 COPY --from=builder /src/target/release/pepper-agent /usr/local/bin/pepper-agent
 COPY --from=builder /src/target/release/pepper /usr/local/bin/pepper
+COPY --chmod=755 dev/s3-contract/node-entrypoint.sh /usr/local/bin/s3-contract-node
 ENTRYPOINT ["/usr/bin/tini", "--"]
 USER 65532:65532
 CMD ["pepper-agent", "--help"]

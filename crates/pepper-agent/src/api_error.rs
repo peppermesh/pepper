@@ -13,8 +13,8 @@ use pepper_types::{ErrorCode, ErrorResponse};
 
 #[derive(Debug)]
 pub(super) struct ApiError {
-    status: StatusCode,
-    code: ErrorCode,
+    pub(super) status: StatusCode,
+    pub(super) code: ErrorCode,
     pub(super) message: String,
 }
 
