@@ -2,7 +2,7 @@
 
 use super::{
     bootstrap_three_nodes, json_request, json_success_eventually,
-    namespace_suite::wait_namespace_converged,
+    namespace_suite::{find_leader, wait_namespace_converged},
 };
 use crate::{
     harness::{
@@ -297,14 +297,21 @@ impl Scenario for BucketDurabilityScenario {
         )
         .await?;
         wait_namespace_converged(&client, cluster, &bucket, 1, commit["root_cid"].as_str()).await?;
+        let failed_leader_id = find_leader(&client, cluster, &bucket).await?;
+        let failed_leader = cluster.node(&failed_leader_id)?.clone();
         let fault = cluster
             .backend
             .clone()
             .apply_fault(Fault::Kill {
-                node: nodes[0].id.clone(),
+                node: failed_leader_id.clone(),
             })
             .await?;
-        for node in &nodes[1..] {
+        let survivors = nodes
+            .iter()
+            .filter(|node| node.id != failed_leader_id)
+            .collect::<Vec<_>>();
+        ensure!(survivors.len() == 2);
+        for node in &survivors {
             let (status, got) = json_request(
                 &client,
                 node,
@@ -313,11 +320,17 @@ impl Scenario for BucketDurabilityScenario {
                 json!({"bucket":bucket,"key_hex":hex::encode("durable")}),
             )
             .await?;
-            ensure!(status == 200 && got["object"]["content_cid"] == content.cid.to_string());
+            ensure!(
+                status == 200 && got["object"]["content_cid"] == content.cid.to_string(),
+                "{} failed post-leader-loss bucket read with HTTP {status}: {got}",
+                node.id
+            );
             ensure!(client.get_block(node, &content.cid).await? == bytes);
         }
+        let new_leader_id = find_leader(&client, cluster, &bucket).await?;
+        ensure!(new_leader_id != failed_leader_id);
         fault.heal().await?;
-        context.run.events.record("invariant", json!({"invariant_id":"CONV-APP-001","invariant_result":"pass","details":{"bucket":bucket,"revision":1,"failed_node":nodes[0].node_identity,"surviving_reads":2}}))?;
+        context.run.events.record("invariant", json!({"invariant_id":"CONV-APP-001","invariant_result":"pass","details":{"bucket":bucket,"revision":1,"failed_node":failed_leader.node_identity,"surviving_reads":survivors.len()}}))?;
         Ok(())
     }
 }
