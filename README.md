@@ -6,13 +6,16 @@
 
 Pepper is a private peer-to-peer fabric for content-addressed storage and data-local Firecracker compute.
 
-> **Development target:** The `main` branch targets Pepper 0.2.0. The latest released version, Pepper 0.1.0, is intended for evaluation and controlled deployments, not untrusted public networks or production multi-tenant workloads.
+> **Current release:** Pepper 0.2.0 is a developer-preview release intended for evaluation and controlled private-cluster deployments, not untrusted public networks or production multi-tenant workloads.
 
 ## Features
 
 - Immutable blocks, chunked objects, and directory snapshots
 - Replication and Reed-Solomon erasure coding
 - Signed pins, garbage collection, repair, and corruption recovery
+- Transactional namespaces and a linearizable key-value API backed by three-node Raft groups
+- Versioned buckets and immutable snapshot-based filesystem trees
+- An opt-in S3-compatible gateway with Signature Version 4 and durable multipart uploads
 - Authenticated QUIC networking and a loopback-only HTTP API
 - Firecracker-only compute with CID inputs, bounded outputs, cancellation, and signed receipts
 
