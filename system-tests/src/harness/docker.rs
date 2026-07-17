@@ -42,6 +42,7 @@ const CONTAINER_API_PORT: u16 = 8080;
 const TEST_UID: u64 = 65_532;
 const TEST_GID: u64 = 65_532;
 const MAX_EXEC_OUTPUT: usize = 64 * 1024 * 1024;
+const CONTAINER_CONFIG_PATH: &str = "/var/lib/pepper/identity/config.toml";
 
 #[derive(Debug, Clone)]
 struct DockerNode {
@@ -181,6 +182,7 @@ impl DockerBackend {
         node: &NodeId,
         volumes: &BTreeMap<String, String>,
         identity_path: &Path,
+        config_path: &Path,
         identity_seed: u64,
     ) -> Result<()> {
         let helper_name = format!("{}-volume-init", docker_name(run_id, node));
@@ -248,7 +250,7 @@ impl DockerBackend {
                 },
             )
             .await?;
-        let archive = identity_archive(identity_path, identity_seed)?;
+        let archive = identity_archive(identity_path, config_path, identity_seed)?;
         self.docker
             .upload_to_container(
                 &upload.id,
@@ -273,12 +275,10 @@ impl DockerBackend {
         &self,
         run_id: &str,
         node: &NodeId,
-        config_path: &Path,
         volumes: &BTreeMap<String, String>,
     ) -> Result<()> {
         let name = format!("{}-agent-init", docker_name(run_id, node));
-        let mut mounts = volume_mounts(volumes);
-        mounts.push(config_mount(config_path));
+        let mounts = volume_mounts(volumes);
         let container = self
             .docker
             .create_container(
@@ -288,7 +288,7 @@ impl DockerBackend {
                     cmd: Some(vec![
                         "pepper-agent".to_string(),
                         "--config".to_string(),
-                        "/etc/pepper/config.toml".to_string(),
+                        CONTAINER_CONFIG_PATH.to_string(),
                         "init".to_string(),
                     ]),
                     host_config: Some(HostConfig {
@@ -335,8 +335,7 @@ impl DockerBackend {
         net_admin: bool,
     ) -> Result<(String, String)> {
         let name = docker_name(run_id, &node_spec.id);
-        let mut mounts = volume_mounts(volumes);
-        mounts.push(config_mount(&runtime.config_path));
+        let mounts = volume_mounts(volumes);
         let mut endpoints = HashMap::new();
         endpoints.insert(
             network_name.to_string(),
@@ -358,7 +357,7 @@ impl DockerBackend {
                     cmd: Some(vec![
                         "pepper-agent".to_string(),
                         "--config".to_string(),
-                        "/etc/pepper/config.toml".to_string(),
+                        CONTAINER_CONFIG_PATH.to_string(),
                     ]),
                     env: Some(vec![format!(
                         "TOKIO_WORKER_THREADS={}",
@@ -799,10 +798,11 @@ impl ClusterBackend for DockerBackend {
                 &node_spec.id,
                 &volumes,
                 &identity_path,
+                &runtime.config_path,
                 identity_seed,
             )
             .await?;
-            self.initialize_node(&run.run_id, &node_spec.id, &runtime.config_path, &volumes)
+            self.initialize_node(&run.run_id, &node_spec.id, &volumes)
                 .await?;
             let (container_id, _container_name) = self
                 .create_agent_container(
@@ -913,8 +913,7 @@ impl ClusterBackend for DockerBackend {
             "offline Docker exec does not accept stdin"
         );
         let node_state = self.node(node)?;
-        let mut mounts = volume_mounts(&node_state.volumes);
-        mounts.push(config_mount(&node_state.runtime.config_path));
+        let mounts = volume_mounts(&node_state.volumes);
         let run_id = self
             .state
             .lock()
@@ -1891,8 +1890,8 @@ fn compose_yaml(
     for node in &spec.nodes {
         let runtime = &runtimes[&node.id];
         output.push_str(&format!(
-            "  {}:\n    image: {}\n    command: [pepper-agent, --config, /etc/pepper/config.toml]\n    user: \"65532:65532\"\n    read_only: true\n    networks:\n      pepper:\n        ipv4_address: {}\n    volumes:\n      - ./configs/{}.toml:/etc/pepper/config.toml:ro\n      - {}-identity:/var/lib/pepper/identity\n      - {}-metadata:/var/lib/pepper/metadata\n      - {}-storage:/var/lib/pepper/storage\n      - {}-compute:/var/lib/pepper/compute\n",
-            short_node_slug(&node.id), image, runtime.address, node.id,
+            "  {}:\n    image: {}\n    command: [pepper-agent, --config, /var/lib/pepper/identity/config.toml]\n    user: \"65532:65532\"\n    read_only: true\n    networks:\n      pepper:\n        ipv4_address: {}\n    volumes:\n      - {}-identity:/var/lib/pepper/identity\n      - {}-metadata:/var/lib/pepper/metadata\n      - {}-storage:/var/lib/pepper/storage\n      - {}-compute:/var/lib/pepper/compute\n",
+            short_node_slug(&node.id), image, runtime.address,
             short_node_slug(&node.id), short_node_slug(&node.id), short_node_slug(&node.id), short_node_slug(&node.id)
         ));
     }
@@ -1921,16 +1920,6 @@ fn volume_mount(volume: &str, target: &str) -> Mount {
         source: Some(volume.to_string()),
         typ: Some(MountTypeEnum::VOLUME),
         read_only: Some(false),
-        ..Default::default()
-    }
-}
-
-fn config_mount(path: &Path) -> Mount {
-    Mount {
-        target: Some("/etc/pepper/config.toml".to_string()),
-        source: Some(path.display().to_string()),
-        typ: Some(MountTypeEnum::BIND),
-        read_only: Some(true),
         ..Default::default()
     }
 }
@@ -1978,8 +1967,9 @@ async fn container_logs(docker: &Docker, container: &str) -> Result<String> {
     Ok(logs.into_iter().map(|line| line.to_string()).collect())
 }
 
-fn identity_archive(identity_path: &Path, seed: u64) -> Result<Vec<u8>> {
+fn identity_archive(identity_path: &Path, config_path: &Path, seed: u64) -> Result<Vec<u8>> {
     let identity = fs::read(identity_path)?;
+    let config = fs::read(config_path)?;
     let mut secret_hasher = blake3::Hasher::new();
     secret_hasher.update(b"pepper-system-test-cluster-secret-v1");
     secret_hasher.update(&seed.to_be_bytes());
@@ -1989,17 +1979,7 @@ fn identity_archive(identity_path: &Path, seed: u64) -> Result<Vec<u8>> {
         let mut archive = tar::Builder::new(&mut output);
         append_bytes(&mut archive, &identity, "identity.ed25519", 0o600)?;
         append_bytes(&mut archive, secret.as_bytes(), "cluster.secret", 0o600)?;
-        archive.finish()?;
-    }
-    Ok(output)
-}
-
-#[cfg(test)]
-fn bytes_tar(bytes: &[u8], name: &str, mode: u32) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    {
-        let mut archive = tar::Builder::new(&mut output);
-        append_bytes(&mut archive, bytes, name, mode)?;
+        append_bytes(&mut archive, &config, "config.toml", 0o600)?;
         archive.finish()?;
     }
     Ok(output)
@@ -2102,11 +2082,27 @@ mod tests {
     }
 
     #[test]
-    fn archive_preserves_bounded_identity_permissions() {
-        let bytes = bytes_tar(b"fixture", "identity.ed25519", 0o600).unwrap();
+    fn identity_archive_contains_private_bootstrap_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let identity = fixture.path().join("identity.ed25519");
+        let config = fixture.path().join("config.toml");
+        fs::write(&identity, b"identity fixture").unwrap();
+        fs::write(&config, b"config fixture").unwrap();
+        let bytes = identity_archive(&identity, &config, 42).unwrap();
         let mut archive = tar::Archive::new(bytes.as_slice());
-        let entry = archive.entries().unwrap().next().unwrap().unwrap();
-        assert_eq!(entry.header().mode().unwrap(), 0o600);
-        assert_eq!(entry.header().uid().unwrap(), TEST_UID);
+        let mut names = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.path().unwrap().into_owned());
+            assert_eq!(entry.header().mode().unwrap(), 0o600);
+            assert_eq!(entry.header().uid().unwrap(), TEST_UID);
+            assert_eq!(entry.header().gid().unwrap(), TEST_GID);
+        }
+        assert_eq!(
+            names,
+            ["identity.ed25519", "cluster.secret", "config.toml"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
     }
 }

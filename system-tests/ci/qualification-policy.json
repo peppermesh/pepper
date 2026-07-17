@@ -348,45 +348,6 @@
           "require_image_digest": true
         }
       ]
-    },
-    {
-      "name": "wan",
-      "requirements": [
-        {
-          "scenario": "WAN-001",
-          "backend": "wan",
-          "minimum_passes": 1,
-          "required_files": [
-            "observations/wan-report.json"
-          ],
-          "require_image_digest": false,
-          "required_capability": "tailscale"
-        },
-        {
-          "scenario": "WAN-001",
-          "backend": "wan",
-          "minimum_passes": 1,
-          "required_files": [
-            "observations/wan-report.json"
-          ],
-          "require_image_digest": false,
-          "required_capability": "direct"
-        }
-      ]
-    },
-    {
-      "name": "host-gated",
-      "requirements": [
-        {
-          "scenario": "KVM-001",
-          "backend": "kvm",
-          "minimum_passes": 1,
-          "required_files": [
-            "observations/kvm-report.json"
-          ],
-          "require_image_digest": false
-        }
-      ]
     }
   ]
 }

@@ -20,12 +20,6 @@ on:
       soak_run_id:
         description: "Successful system-soak workflow run ID"
         required: true
-      wan_run_id:
-        description: "Successful system-wan workflow run ID"
-        required: true
-      kvm_run_id:
-        description: "Successful firecracker-host-gated workflow run ID"
-        required: true
 
 permissions:
   contents: read
@@ -48,7 +42,6 @@ jobs:
           RUN_IDS: >-
             ${{ inputs.smoke_run_id }} ${{ inputs.functional_run_id }}
             ${{ inputs.chaos_run_id }} ${{ inputs.soak_run_id }}
-            ${{ inputs.wan_run_id }} ${{ inputs.kvm_run_id }}
         run: |
           set -euo pipefail
           mkdir -p qualification-input
@@ -66,9 +59,7 @@ jobs:
             --arg functional "${{ inputs.functional_run_id }}" \
             --arg chaos "${{ inputs.chaos_run_id }}" \
             --arg soak "${{ inputs.soak_run_id }}" \
-            --arg wan "${{ inputs.wan_run_id }}" \
-            --arg kvm "${{ inputs.kvm_run_id }}" \
-            '{schema_version:1, release_commit:$release_commit, workflow_runs:{smoke:$smoke,functional:$functional,chaos:$chaos,soak:$soak,wan:$wan,kvm:$kvm}}' \
+            '{schema_version:1, release_commit:$release_commit, workflow_runs:{smoke:$smoke,functional:$functional,chaos:$chaos,soak:$soak}}' \
             > qualification-report/source-runs.json
       - name: Generate and enforce release qualification report
         run: >-

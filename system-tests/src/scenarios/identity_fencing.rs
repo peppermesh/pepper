@@ -32,7 +32,7 @@ impl Scenario for IdentityFencingScenario {
         let cluster = context.cluster.as_ref().expect("cluster exists");
         let node = cluster.node(&cluster.spec.nodes[0].id)?.clone();
         let config = if cluster.backend.metadata().name == "docker" {
-            "/etc/pepper/config.toml".to_string()
+            "/var/lib/pepper/identity/config.toml".to_string()
         } else {
             node.config_path.display().to_string()
         };

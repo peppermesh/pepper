@@ -21,7 +21,6 @@ These controls cannot be enforced solely by files in this repository. A reposito
 - Require one approval, dismiss stale approvals, require approval of the latest push, and require conversation resolution.
 - Block force pushes and deletion of `main`; apply rules to administrators where practical.
 - Protect the `release` environment and require an approved successful `release-qualification` run for the exact candidate commit before publishing a tag or release artifact.
-- Restrict `pepper-soak`, `pepper-wan-*`, `kvm`, and `firecracker` self-hosted runner groups to their named workflows; keep WAN topology paths in repository variables and credentials out of topology artifacts.
 
 ## Merge policy
 

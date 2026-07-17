@@ -20,7 +20,7 @@ fn qualification_policy_references_registered_scenarios_and_all_release_tiers() 
         .collect::<BTreeSet<_>>();
     assert_eq!(
         tier_names,
-        BTreeSet::from(["smoke", "functional", "chaos", "soak", "wan", "host-gated"])
+        BTreeSet::from(["smoke", "functional", "chaos", "soak"])
     );
     let mut requirements = BTreeSet::new();
     for requirement in tiers
@@ -33,45 +33,45 @@ fn qualification_policy_references_registered_scenarios_and_all_release_tiers() 
             registry.contains(scenario),
             "unknown qualification scenario {scenario}"
         );
-        assert!(matches!(backend, "process" | "docker" | "wan" | "kvm"));
+        assert!(matches!(backend, "process" | "docker"));
         assert!(requirement["minimum_passes"].as_u64().unwrap() >= 1);
         requirements.insert((scenario, backend));
     }
     assert!(requirements.contains(&("SOAK-001", "docker")));
-    assert_eq!(
-        policy["tiers"][4]["requirements"][0]["required_capability"],
-        "tailscale"
-    );
-    assert_eq!(
-        policy["tiers"][4]["requirements"][1]["required_capability"],
-        "direct"
-    );
-    assert!(requirements.contains(&("WAN-001", "wan")));
-    assert!(requirements.contains(&("KVM-001", "kvm")));
+    assert!(!requirements.contains(&("WAN-001", "wan")));
+    assert!(!requirements.contains(&("KVM-001", "kvm")));
 }
 
 #[test]
-fn phase_nine_workflows_archive_reports_and_are_host_isolated() {
+fn release_gate_is_hosted_and_specialized_scenarios_are_optional() {
     let soak = include_str!("../../.github/workflows/system-soak.yml");
     let wan = include_str!("../../.github/workflows/system-wan.yml");
     let kvm = include_str!("../../.github/workflows/firecracker-host-gated.yml");
     let qualification = include_str!("../../.github/workflows/release-qualification.yml");
     assert!(
         soak.contains("SOAK-001")
-            && soak.contains("pepper-soak")
+            && soak.contains("runs-on: ubuntu-latest")
+            && !soak.contains("self-hosted")
             && soak.contains("retention-days: 60")
     );
     assert!(
         wan.contains("WAN-001")
+            && wan.contains("name: system-wan-optional")
+            && !wan.contains("schedule:")
             && wan.contains("tailscale")
             && wan.contains("direct")
             && wan.contains("retention-days: 60")
     );
     assert!(
-        kvm.contains("KVM-001") && kvm.contains("/dev/kvm") && kvm.contains("retention-days: 60")
+        kvm.contains("KVM-001")
+            && kvm.contains("name: firecracker-host-gated-optional")
+            && kvm.contains("/dev/kvm")
+            && kvm.contains("retention-days: 60")
     );
     assert!(
         qualification.contains("qualification-policy.json")
             && qualification.contains("retention-days: 90")
+            && !qualification.contains("wan_run_id")
+            && !qualification.contains("kvm_run_id")
     );
 }
