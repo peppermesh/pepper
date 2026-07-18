@@ -9,10 +9,10 @@ description = "Versioned object bucket descriptors for Pepper namespaces"
 
 [dependencies]
 async-trait = { workspace = true }
-pepper-dag = { version = "0.2.0", path = "../pepper-dag" }
-pepper-merkle = { version = "0.2.0", path = "../pepper-merkle" }
-pepper-namespace = { version = "0.2.0", path = "../pepper-namespace" }
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-dag = { version = "0.3.0", path = "../pepper-dag" }
+pepper-merkle = { version = "0.3.0", path = "../pepper-merkle" }
+pepper-namespace = { version = "0.3.0", path = "../pepper-namespace" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -15,9 +15,9 @@ description = "Content-addressed block storage for PepperMesh"
 blake3 = { workspace = true }
 fs2 = { workspace = true }
 hex = { workspace = true }
-pepper-config = { version = "0.2.0", path = "../pepper-config" }
-pepper-metadata = { version = "0.2.0", path = "../pepper-metadata" }
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-config = { version = "0.3.0", path = "../pepper-config" }
+pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

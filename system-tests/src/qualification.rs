@@ -459,7 +459,7 @@ mod tests {
         fs::write(
             &policy,
             serde_json::to_vec(&serde_json::json!({
-                "schema_version":1,"release":"0.2.0","tiers":[{"name":"soak","requirements":[{
+                "schema_version":1,"release":"0.3.0","tiers":[{"name":"soak","requirements":[{
                     "scenario":"SOAK-001","backend":"docker","minimum_passes":1,
                     "required_files":["observations/proof.json"],"require_image_digest":true
                 }]}]

@@ -12,7 +12,7 @@ homepage = { workspace = true }
 description = "Embedded metadata storage for PepperMesh"
 
 [dependencies]
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 redb = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

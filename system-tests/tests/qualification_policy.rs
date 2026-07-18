@@ -8,7 +8,7 @@ fn qualification_policy_references_registered_scenarios_and_all_release_tiers() 
     let policy: serde_json::Value =
         serde_json::from_str(include_str!("../ci/qualification-policy.json")).unwrap();
     assert_eq!(policy["schema_version"], 1);
-    assert_eq!(policy["release"], "0.2.0");
+    assert_eq!(policy["release"], "0.3.0");
     let registry = scenario_names()
         .iter()
         .map(|(id, _)| *id)

@@ -12,7 +12,7 @@ homepage = { workspace = true }
 description = "Compute job validation for PepperMesh"
 
 [dependencies]
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

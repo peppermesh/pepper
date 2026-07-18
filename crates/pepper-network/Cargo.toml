@@ -17,9 +17,9 @@ async-trait = { workspace = true }
 blake3 = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
-pepper-crypto = { version = "0.2.0", path = "../pepper-crypto" }
-pepper-metadata = { version = "0.2.0", path = "../pepper-metadata" }
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-crypto = { version = "0.3.0", path = "../pepper-crypto" }
+pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 prost = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }

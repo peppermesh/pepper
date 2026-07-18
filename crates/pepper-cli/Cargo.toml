@@ -19,9 +19,9 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
-pepper-filesystem = { version = "0.2.0", path = "../pepper-filesystem" }
-pepper-network = { version = "0.2.0", path = "../pepper-network" }
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-filesystem = { version = "0.3.0", path = "../pepper-filesystem" }
+pepper-network = { version = "0.3.0", path = "../pepper-network" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tikv-jemallocator = { workspace = true }
