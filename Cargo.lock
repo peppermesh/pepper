@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-bucket"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "pepper-dag",
@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-compute"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pepper-types",
  "serde",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pepper-types",
  "serde",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-consensus"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-crypto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-dag"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "pepper-config",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-filesystem"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "pepper-dag",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-guest-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-merkle"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-metadata"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pepper-types",
  "redb",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-namespace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-network"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-placement"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "pepper-types",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-publication"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "fs2",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "pepper-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "hex",

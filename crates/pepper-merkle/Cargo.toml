@@ -14,14 +14,14 @@ description = "Persistent ordered Merkle radix map for PepperMesh"
 [dependencies]
 async-trait = { workspace = true }
 hex = { workspace = true }
-pepper-dag = { version = "0.2.0", path = "../pepper-dag" }
-pepper-types = { version = "0.2.0", path = "../pepper-types" }
+pepper-dag = { version = "0.3.0", path = "../pepper-dag" }
+pepper-types = { version = "0.3.0", path = "../pepper-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 [dev-dependencies]
-pepper-config = { version = "0.2.0", path = "../pepper-config" }
-pepper-metadata = { version = "0.2.0", path = "../pepper-metadata" }
-pepper-storage = { version = "0.2.0", path = "../pepper-storage" }
+pepper-config = { version = "0.3.0", path = "../pepper-config" }
+pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
+pepper-storage = { version = "0.3.0", path = "../pepper-storage" }
 tempfile = "3.23"
 tokio = { workspace = true }
