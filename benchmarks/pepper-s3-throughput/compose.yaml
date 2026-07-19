@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: Apache-2.0
+
+x-pepper: &pepper
+  image: pepper-s3-throughput:local
+  build:
+    context: ../..
+    dockerfile: system-tests/docker/Dockerfile
+  environment: &environment
+    PEPPER_TEST_CLUSTER_SECRET: pepper-benchmark-cluster-secret-v1
+    PEPPER_TEST_S3_SECRET: pepper-benchmark-secret-v1
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9080/readyz"]
+    interval: 2s
+    timeout: 2s
+    retries: 60
+  networks:
+    benchmark:
+
+services:
+  single:
+    <<: *pepper
+    profiles: ["single"]
+    hostname: single
+    ports: ["127.0.0.1:29080:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: single
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    volumes:
+      - ./config/single.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT:?set PEPPER_BENCH_ROOT}/single:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.10
+
+  single2:
+    <<: *pepper
+    profiles: ["single"]
+    hostname: single2
+    ports: ["127.0.0.1:29081:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: single2
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      single: {condition: service_healthy}
+    volumes:
+      - ./config/single2.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/single2:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.14
+
+  single3:
+    <<: *pepper
+    profiles: ["single"]
+    hostname: single3
+    ports: ["127.0.0.1:29082:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: single3
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      single: {condition: service_healthy}
+      single2: {condition: service_healthy}
+    volumes:
+      - ./config/single3.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/single3:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.15
+
+  node1:
+    <<: *pepper
+    profiles: ["three"]
+    hostname: node1
+    ports: ["127.0.0.1:29180:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: node1
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    volumes:
+      - ./config/node1.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/node1:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.11
+
+  node2:
+    <<: *pepper
+    profiles: ["three"]
+    hostname: node2
+    ports: ["127.0.0.1:29181:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: node2
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      node1: {condition: service_healthy}
+    volumes:
+      - ./config/node2.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/node2:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.12
+
+  node3:
+    <<: *pepper
+    profiles: ["three"]
+    hostname: node3
+    ports: ["127.0.0.1:29182:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: node3
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      node1: {condition: service_healthy}
+      node2: {condition: service_healthy}
+    volumes:
+      - ./config/node3.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/node3:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.13
+
+  fio:
+    profiles: ["fio"]
+    build:
+      context: .
+      dockerfile: Dockerfile.fio
+    image: pepper-s3-throughput-fio:local
+    volumes:
+      - ${PEPPER_BENCH_ROOT}:/bench
+
+networks:
+  benchmark:
+    ipam:
+      config:
+        - subnet: 172.30.43.0/24

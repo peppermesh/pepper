@@ -1936,6 +1936,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-s3-throughput"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures-util",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "pepper-storage"
 version = "0.3.0"
 dependencies = [

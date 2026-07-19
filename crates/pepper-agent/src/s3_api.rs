@@ -2225,18 +2225,10 @@ async fn object_response(
     let mut response = match requested_range {
         Some(_) if head_only => StatusCode::PARTIAL_CONTENT.into_response(),
         Some(range) => {
-            let bytes = object_bytes(&state, &content_cid)
+            let body = object_range_body(state.clone(), &content_cid, range)
                 .await
                 .map_err(|error| map_api_error(error, uri.path()))?;
-            let start = usize::try_from(range.start)
-                .map_err(|_| S3Error::invalid("range start is too large", uri.path()))?;
-            let end = usize::try_from(range.end)
-                .map_err(|_| S3Error::invalid("range end is too large", uri.path()))?;
-            (
-                StatusCode::PARTIAL_CONTENT,
-                Body::from(bytes[start..=end].to_vec()),
-            )
-                .into_response()
+            (StatusCode::PARTIAL_CONTENT, body).into_response()
         }
         None if head_only => StatusCode::OK.into_response(),
         None => get_object(State(state.clone()), Path(content_cid.to_string()))
@@ -2312,6 +2304,84 @@ impl S3ByteRange {
     fn len(self) -> u64 {
         self.end - self.start + 1
     }
+}
+
+#[derive(Debug)]
+struct ObjectRangeChunk {
+    chunk: ObjectChunk,
+    start: usize,
+    end: usize,
+}
+
+fn object_manifest_range_chunks(
+    manifest: &ObjectManifest,
+    range: S3ByteRange,
+) -> Result<Vec<ObjectRangeChunk>, ApiError> {
+    let range_end = range
+        .end
+        .checked_add(1)
+        .ok_or_else(|| ApiError::bad_request("object range end overflow"))?;
+    manifest
+        .chunks
+        .iter()
+        .filter_map(|chunk| {
+            let chunk_end = chunk.offset.checked_add(chunk.size)?;
+            let overlap_start = chunk.offset.max(range.start);
+            let overlap_end = chunk_end.min(range_end);
+            (overlap_start < overlap_end).then_some((chunk, overlap_start, overlap_end))
+        })
+        .map(|(chunk, overlap_start, overlap_end)| {
+            Ok(ObjectRangeChunk {
+                chunk: chunk.clone(),
+                start: usize::try_from(overlap_start - chunk.offset)
+                    .map_err(|_| ApiError::bad_request("object range start is too large"))?,
+                end: usize::try_from(overlap_end - chunk.offset)
+                    .map_err(|_| ApiError::bad_request("object range end is too large"))?,
+            })
+        })
+        .collect()
+}
+
+async fn object_range_body(
+    state: AppState,
+    cid: &Cid,
+    range: S3ByteRange,
+) -> Result<Body, ApiError> {
+    let guard = Arc::new(state.operation_lock.clone().read_owned().await);
+    if cid.codec == CODEC_ERASURE_MANIFEST {
+        let bytes = erasure_object_bytes(&state, cid).await?;
+        let start = usize::try_from(range.start)
+            .map_err(|_| ApiError::bad_request("object range start is too large"))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| ApiError::bad_request("object range end is too large"))?;
+        return Ok(Body::from(bytes[start..=end].to_vec()));
+    }
+    if cid.codec != CODEC_OBJECT_MANIFEST {
+        return Err(ApiError::bad_request("CID is not an object manifest"));
+    }
+    let manifest_block = get_block_resolved(&state, cid).await?;
+    let manifest: ObjectManifest =
+        serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
+    validate_object_resource_limits(&state, &manifest)?;
+    let chunks = object_manifest_range_chunks(&manifest, range)?;
+    let body_stream = stream::iter(chunks.into_iter().map(move |selected| {
+        let state = state.clone();
+        let guard = guard.clone();
+        async move {
+            let _guard = guard;
+            let block = get_block_resolved(&state, &selected.chunk.cid)
+                .await
+                .map_err(|error| std::io::Error::other(error.message))?;
+            if block.payload.len() as u64 != selected.chunk.size {
+                return Err(std::io::Error::other("object chunk size mismatch"));
+            }
+            Ok::<Bytes, std::io::Error>(
+                Bytes::from(block.payload).slice(selected.start..selected.end),
+            )
+        }
+    }))
+    .buffered(16);
+    Ok(Body::from_stream(body_stream))
 }
 
 fn parse_byte_range(value: &str, size: u64, resource: &str) -> Result<S3ByteRange, S3Error> {
@@ -6804,6 +6874,30 @@ mod tests {
             parse_byte_range("bytes=10-", 10, "/").unwrap_err().code,
             "InvalidRange"
         );
+    }
+
+    #[test]
+    fn object_range_selects_only_overlapping_manifest_chunks() {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let chunks = (0..800u64)
+            .map(|index| ObjectChunk {
+                offset: index * CHUNK_SIZE,
+                size: CHUNK_SIZE,
+                cid: Cid::new(CODEC_RAW, &index.to_le_bytes()),
+            })
+            .collect::<Vec<_>>();
+        let manifest = ObjectManifest::new(800 * CHUNK_SIZE, CHUNK_SIZE, chunks);
+        let range = S3ByteRange {
+            start: manifest.size - 256 * 1024,
+            end: manifest.size - 1,
+        };
+
+        let selected = object_manifest_range_chunks(&manifest, range).unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].chunk.offset, 799 * CHUNK_SIZE);
+        assert_eq!(selected[0].start, (CHUNK_SIZE - 256 * 1024) as usize);
+        assert_eq!(selected[0].end, CHUNK_SIZE as usize);
     }
 
     #[test]

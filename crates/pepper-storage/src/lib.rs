@@ -14,7 +14,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
@@ -28,6 +31,21 @@ const STORAGE_LOCATIONS_BY_PATH: TableDefinition<&str, &str> =
     TableDefinition::new("storage_locations_by_path");
 const SOFT_PRESSURE_PERCENT: u64 = 85;
 const HARD_PRESSURE_PERCENT: u64 = 95;
+static PROCESS_BLOCK_READS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_BLOCK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageIoStats {
+    pub block_reads: u64,
+    pub block_read_bytes: u64,
+}
+
+pub fn process_io_stats() -> StorageIoStats {
+    StorageIoStats {
+        block_reads: PROCESS_BLOCK_READS.load(Ordering::Relaxed),
+        block_read_bytes: PROCESS_BLOCK_READ_BYTES.load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteIntent {
@@ -330,6 +348,8 @@ impl BlockStore {
             return Err(StorageError::HashMismatch(cid.clone()));
         }
         self.update_last_accessed(cid)?;
+        PROCESS_BLOCK_READS.fetch_add(1, Ordering::Relaxed);
+        PROCESS_BLOCK_READ_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
         Ok(Block {
             cid: cid.clone(),
             codec: meta.codec,

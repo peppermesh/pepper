@@ -19,9 +19,70 @@ use pepper_namespace::{
 use pepper_types::{Cid, DurabilityReceipt};
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+
+static DURABILITY_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_MICROS: AtomicU64 = AtomicU64::new(0);
+static MERKLE_UPDATE_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static MERKLE_UPDATE_MICROS: AtomicU64 = AtomicU64::new(0);
+static RAFT_PUBLICATION_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static RAFT_PUBLICATION_MICROS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublicationPhaseStats {
+    pub durability_observations: u64,
+    pub durability_micros: u64,
+    pub merkle_update_observations: u64,
+    pub merkle_update_micros: u64,
+    pub raft_publication_observations: u64,
+    pub raft_publication_micros: u64,
+}
+
+pub fn process_phase_stats() -> PublicationPhaseStats {
+    PublicationPhaseStats {
+        durability_observations: DURABILITY_OBSERVATIONS.load(Ordering::Relaxed),
+        durability_micros: DURABILITY_MICROS.load(Ordering::Relaxed),
+        merkle_update_observations: MERKLE_UPDATE_OBSERVATIONS.load(Ordering::Relaxed),
+        merkle_update_micros: MERKLE_UPDATE_MICROS.load(Ordering::Relaxed),
+        raft_publication_observations: RAFT_PUBLICATION_OBSERVATIONS.load(Ordering::Relaxed),
+        raft_publication_micros: RAFT_PUBLICATION_MICROS.load(Ordering::Relaxed),
+    }
+}
+
+struct PhaseTimer {
+    observations: &'static AtomicU64,
+    total_micros: &'static AtomicU64,
+    started: Instant,
+}
+
+impl PhaseTimer {
+    fn start(observations: &'static AtomicU64, total_micros: &'static AtomicU64) -> Self {
+        Self {
+            observations,
+            total_micros,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        self.observations.fetch_add(1, Ordering::Relaxed);
+        self.total_micros.fetch_add(
+            self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PublicationLimits {
@@ -581,10 +642,13 @@ where
         self.fault(PublicationFaultPoint::LeaderValidation)?;
         let mut preview = NamespaceStateMachine::new(self.data_store.clone(), initial.clone())
             .map_err(|error| PublicationError::Namespace(error.to_string()))?;
-        preview
-            .apply(request.command.clone())
-            .await
-            .map_err(|error| PublicationError::Conflict(error.to_string()))?;
+        {
+            let _timer = PhaseTimer::start(&MERKLE_UPDATE_OBSERVATIONS, &MERKLE_UPDATE_MICROS);
+            preview
+                .apply(request.command.clone())
+                .await
+                .map_err(|error| PublicationError::Conflict(error.to_string()))?;
+        }
         self.fault(PublicationFaultPoint::CandidateRoot)?;
 
         let mut durable_cids = command_value_cids(&request.command);
@@ -621,25 +685,29 @@ where
         self.repository.update_staging(lease)?;
 
         let required = initial.descriptor.durability.replicas as usize;
-        let mut receipts = Vec::new();
-        for cid in durable_cids {
-            let receipt =
-                if let Some(receipt) = self.repository.durable_receipt(&cid, required, now)? {
-                    receipt
-                } else {
-                    self.durability.ensure_durable(&cid, required).await?
-                };
-            if receipt.replicas_accepted < required || receipt.status != "durable" {
-                return Err(PublicationError::DurabilityNotMet(cid));
+        let receipts = {
+            let _timer = PhaseTimer::start(&DURABILITY_OBSERVATIONS, &DURABILITY_MICROS);
+            let mut receipts = Vec::new();
+            for cid in durable_cids {
+                let receipt =
+                    if let Some(receipt) = self.repository.durable_receipt(&cid, required, now)? {
+                        receipt
+                    } else {
+                        self.durability.ensure_durable(&cid, required).await?
+                    };
+                if receipt.replicas_accepted < required || receipt.status != "durable" {
+                    return Err(PublicationError::DurabilityNotMet(cid));
+                }
+                self.repository.put_durability(&StoredDurabilityReceipt {
+                    namespace_id: request.namespace_id.clone(),
+                    request_id: request.command.request_id.clone(),
+                    receipt: receipt.clone(),
+                    verified_at_unix_seconds: now,
+                })?;
+                receipts.push(receipt);
             }
-            self.repository.put_durability(&StoredDurabilityReceipt {
-                namespace_id: request.namespace_id.clone(),
-                request_id: request.command.request_id.clone(),
-                receipt: receipt.clone(),
-                verified_at_unix_seconds: now,
-            })?;
-            receipts.push(receipt);
-        }
+            receipts
+        };
         self.fault(PublicationFaultPoint::ValueDurability)?;
 
         // Only externally supplied DAGs need the pre-commit durability barrier.
@@ -651,11 +719,14 @@ where
         // expensive retry cascade.
         self.fault(PublicationFaultPoint::LocalLogPersistence)?;
         self.fault(PublicationFaultPoint::FollowerLogPersistence)?;
-        let response = self
-            .manager
-            .routed_write(&request.namespace_id, request.command.clone())
-            .await
-            .map_err(|error| PublicationError::Namespace(error.to_string()))?;
+        let response = {
+            let _timer =
+                PhaseTimer::start(&RAFT_PUBLICATION_OBSERVATIONS, &RAFT_PUBLICATION_MICROS);
+            self.manager
+                .routed_write(&request.namespace_id, request.command.clone())
+                .await
+                .map_err(|error| PublicationError::Namespace(error.to_string()))?
+        };
         self.fault(PublicationFaultPoint::QuorumCommit)?;
         self.fault(PublicationFaultPoint::StateMachineApply)?;
         self.fault(PublicationFaultPoint::CheckpointPublication)?;

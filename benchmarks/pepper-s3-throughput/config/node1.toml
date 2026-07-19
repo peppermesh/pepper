@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[node]
+name = "s3-benchmark-node-1"
+listen_addr = "0.0.0.0:9000"
+advertise_addr = "172.30.43.11:9000"
+failure_domain = "rack-a"
+[data]
+path = "/var/lib/pepper/metadata"
+[identity]
+key_path = "/var/lib/pepper/identity/node.key"
+generate_if_missing = true
+[api]
+bind_addr = "127.0.0.1:9080"
+[auth]
+cluster_secret_path = "/var/lib/pepper/identity/cluster.secret"
+[[storage.locations]]
+path = "/var/lib/pepper/storage"
+max_capacity_bytes = 1099511627776
+[network]
+bootstrap_peers = ["172.30.43.12:9000", "172.30.43.13:9000"]
+[namespace]
+enabled = true
+consensus_enabled = true
+heartbeat_interval_ms = 250
+election_timeout_min_ms = 1500
+election_timeout_max_ms = 3000
+[replication]
+default_factor = 3
+repair_interval_seconds = 3600
+[compute]
+enabled = false
+runtime = "firecracker"
+max_concurrent_jobs = 1
+work_dir = "/var/lib/pepper/compute"
+[s3]
+enabled = true
+region = "us-east-1"
+access_key_id = "pepper-benchmark"
+secret_access_key_path = "/var/lib/pepper/identity/s3.secret"
+max_clock_skew_seconds = 900
+[limits]
+max_block_bytes = 67108864
+max_object_bytes = 5368709120
+http_requests_per_minute = 10000000
+rpc_requests_per_minute = 10000000
+[logging]
+format = "json"

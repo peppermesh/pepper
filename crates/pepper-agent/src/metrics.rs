@@ -31,6 +31,20 @@ pub(super) static NAMESPACE_COMMIT_LATENCY_MICROS: AtomicU64 = AtomicU64::new(0)
 pub(super) static NAMESPACE_READS: AtomicU64 = AtomicU64::new(0);
 pub(super) static NAMESPACE_READ_LATENCY_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(super) static NAMESPACE_GROUP_ADMISSION_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_REQUEST_STREAMING_PHASES: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_REQUEST_STREAMING_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_BLOCK_HASH_STORAGE_PHASES: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_BLOCK_HASH_STORAGE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_REPLICA_TRANSFER_PHASES: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_REPLICA_TRANSFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn observe_phase(counter: &AtomicU64, total_micros: &AtomicU64, elapsed: Duration) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    total_micros.fetch_add(
+        elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+}
 
 pub(super) struct NamespaceReadTimer(std::time::Instant);
 impl NamespaceReadTimer {
@@ -144,6 +158,8 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
     let commit_count = NAMESPACE_COMMITS.load(Ordering::Relaxed);
     let read_count = NAMESPACE_READS.load(Ordering::Relaxed);
     let (merkle, merkle_mutations) = pepper_merkle::process_io_stats();
+    let storage = pepper_storage::process_io_stats();
+    let publication_phases = pepper_publication::process_phase_stats();
     let publication = state
         .publication_repository
         .operational_stats(unix_seconds())
@@ -172,7 +188,27 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          # HELP pepper_merkle_nodes_written_total Merkle node writes by this process.\n\
          # TYPE pepper_merkle_nodes_written_total counter\npepper_merkle_nodes_written_total {}\n\
          # HELP pepper_merkle_mutations_total Merkle mutations applied by this process.\n\
-         # TYPE pepper_merkle_mutations_total counter\npepper_merkle_mutations_total {merkle_mutations}\n",
+         # TYPE pepper_merkle_mutations_total counter\npepper_merkle_mutations_total {merkle_mutations}\n\
+         # HELP pepper_storage_block_reads_total Successful block-store reads by this process.\n\
+         # TYPE pepper_storage_block_reads_total counter\npepper_storage_block_reads_total {}\n\
+         # HELP pepper_storage_block_read_bytes_total Bytes returned by successful block-store reads.\n\
+         # TYPE pepper_storage_block_read_bytes_total counter\npepper_storage_block_read_bytes_total {}\n\
+         # HELP pepper_s3_put_phase_duration_microseconds_total Cumulative S3 PUT phase time.\n\
+         # TYPE pepper_s3_put_phase_duration_microseconds_total counter\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"request_streaming\"}} {}\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"block_hash_storage\"}} {}\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"replica_transfer\"}} {}\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"durability_fsync_barrier\"}} {}\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"merkle_update\"}} {}\n\
+         pepper_s3_put_phase_duration_microseconds_total{{phase=\"raft_namespace_publication\"}} {}\n\
+         # HELP pepper_s3_put_phase_observations_total Number of S3 PUT phase observations.\n\
+         # TYPE pepper_s3_put_phase_observations_total counter\n\
+         pepper_s3_put_phase_observations_total{{phase=\"request_streaming\"}} {}\n\
+         pepper_s3_put_phase_observations_total{{phase=\"block_hash_storage\"}} {}\n\
+         pepper_s3_put_phase_observations_total{{phase=\"replica_transfer\"}} {}\n\
+         pepper_s3_put_phase_observations_total{{phase=\"durability_fsync_barrier\"}} {}\n\
+         pepper_s3_put_phase_observations_total{{phase=\"merkle_update\"}} {}\n\
+         pepper_s3_put_phase_observations_total{{phase=\"raft_namespace_publication\"}} {}\n",
         NAMESPACE_COMMIT_FAILURES.load(Ordering::Relaxed),
         NAMESPACE_CONFLICTS.load(Ordering::Relaxed),
         NAMESPACE_DURABILITY_FAILURES.load(Ordering::Relaxed),
@@ -182,6 +218,20 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         NAMESPACE_GROUP_ADMISSION_FAILURES.load(Ordering::Relaxed),
         merkle.nodes_read,
         merkle.nodes_written,
+        storage.block_reads,
+        storage.block_read_bytes,
+        S3_REQUEST_STREAMING_MICROS.load(Ordering::Relaxed),
+        S3_BLOCK_HASH_STORAGE_MICROS.load(Ordering::Relaxed),
+        S3_REPLICA_TRANSFER_MICROS.load(Ordering::Relaxed),
+        publication_phases.durability_micros,
+        publication_phases.merkle_update_micros,
+        publication_phases.raft_publication_micros,
+        S3_REQUEST_STREAMING_PHASES.load(Ordering::Relaxed),
+        S3_BLOCK_HASH_STORAGE_PHASES.load(Ordering::Relaxed),
+        S3_REPLICA_TRANSFER_PHASES.load(Ordering::Relaxed),
+        publication_phases.durability_observations,
+        publication_phases.merkle_update_observations,
+        publication_phases.raft_publication_observations,
     ));
     if let Some(publication) = publication {
         body.push_str(&format!(
@@ -241,13 +291,14 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         for status in statuses {
             let namespace = status.namespace_id.to_string();
             body.push_str(&format!(
-                "pepper_namespace_term{{namespace=\"{namespace}\"}} {}\npepper_namespace_commit_index{{namespace=\"{namespace}\"}} {}\npepper_namespace_applied_index{{namespace=\"{namespace}\"}} {}\npepper_namespace_log_lag{{namespace=\"{namespace}\"}} {}\npepper_namespace_quorum_healthy{{namespace=\"{namespace}\"}} {}\npepper_namespace_checkpoint_index{{namespace=\"{namespace}\"}} {}\n",
+                "pepper_namespace_term{{namespace=\"{namespace}\"}} {}\npepper_namespace_commit_index{{namespace=\"{namespace}\"}} {}\npepper_namespace_applied_index{{namespace=\"{namespace}\"}} {}\npepper_namespace_log_lag{{namespace=\"{namespace}\"}} {}\npepper_namespace_quorum_healthy{{namespace=\"{namespace}\"}} {}\npepper_namespace_checkpoint_index{{namespace=\"{namespace}\"}} {}\npepper_namespace_role{{namespace=\"{namespace}\",role=\"{}\"}} 1\n",
                 status.term,
                 status.last_log_index.unwrap_or(0),
                 status.applied_index.unwrap_or(0),
                 status.log_lag,
                 u8::from(status.quorum_recently_acknowledged),
                 status.snapshot_index.unwrap_or(0),
+                status.role,
             ));
         }
         for metric in manager.command_metrics().await {

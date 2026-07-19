@@ -1134,7 +1134,14 @@ async fn put_replicated_block_with_factor(
             "replication factor must be greater than zero",
         ));
     }
-    let local_put = tokio::task::block_in_place(|| state.block_store.put(codec, &payload))?;
+    let local_put_started = time::Instant::now();
+    let local_put = tokio::task::block_in_place(|| state.block_store.put(codec, &payload));
+    metrics::observe_phase(
+        &metrics::S3_BLOCK_HASH_STORAGE_PHASES,
+        &metrics::S3_BLOCK_HASH_STORAGE_MICROS,
+        local_put_started.elapsed(),
+    );
+    let local_put = local_put?;
     let local_provider = state.network.local_provider_record(&local_put.cid);
     state.network.persist_provider_record(&local_provider)?;
     state
@@ -1182,6 +1189,7 @@ async fn put_replicated_block_with_factor(
             }
         });
     let mut replica_writes = stream::iter(writes).buffered(8);
+    let replica_transfer_started = time::Instant::now();
 
     while let Some((node, result)) = replica_writes.next().await {
         match result {
@@ -1207,6 +1215,11 @@ async fn put_replicated_block_with_factor(
             Err(error) => warn!(%error, node_id = %node.node_id, "replica write failed"),
         }
     }
+    metrics::observe_phase(
+        &metrics::S3_REPLICA_TRANSFER_PHASES,
+        &metrics::S3_REPLICA_TRANSFER_MICROS,
+        replica_transfer_started.elapsed(),
+    );
 
     replica_nodes.sort();
     replica_nodes.dedup();
@@ -2052,7 +2065,17 @@ async fn put_object_stream_receipt(
     let mut chunks = Vec::new();
     let mut total = 0u64;
     let mut all_chunks_durable = true;
-    while let Some(data) = body_stream.next().await {
+    loop {
+        let streaming_started = time::Instant::now();
+        let next = body_stream.next().await;
+        metrics::observe_phase(
+            &metrics::S3_REQUEST_STREAMING_PHASES,
+            &metrics::S3_REQUEST_STREAMING_MICROS,
+            streaming_started.elapsed(),
+        );
+        let Some(data) = next else {
+            break;
+        };
         let data = data.map_err(|error| ApiError::bad_request(error.to_string()))?;
         let projected = total.saturating_add(data.len() as u64);
         enforce_size_limit(state.max_object_bytes, projected, "object")?;
