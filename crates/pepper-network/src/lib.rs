@@ -5,7 +5,10 @@ use pepper_crypto::{NodeIdentity, derive_node_id, verify_signature};
 use pepper_metadata::MetadataStore;
 use pepper_types::{CODEC_RAW, Cid, Codec, ProviderRecord, PutBlockResponse};
 use prost::Message;
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{
+    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
+    VarInt,
+};
 use redb::{ReadableTable, TableDefinition};
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
@@ -60,19 +63,6 @@ fn rpc_class(method: &str) -> RpcClass {
     } else {
         RpcClass::Data
     }
-}
-
-fn invalidates_connection(error: &NetworkError) -> bool {
-    matches!(
-        error,
-        NetworkError::Connection(_)
-            | NetworkError::Connect(_)
-            | NetworkError::Write(_)
-            | NetworkError::ClosedStream(_)
-            | NetworkError::Read(_)
-            | NetworkError::ReadExact(_)
-            | NetworkError::DeadlineExceeded
-    )
 }
 
 #[derive(Debug, Error)]
@@ -1329,25 +1319,12 @@ impl NetworkHandle {
         Req: Message,
         Resp: Message + Default,
     {
-        let class = rpc_class(method);
-        match tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.rpc_inner(peer, method, request, None),
         )
         .await
-        {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => {
-                if invalidates_connection(&error) {
-                    self.invalidate_connection(peer, class).await;
-                }
-                Err(error)
-            }
-            Err(_) => {
-                self.invalidate_connection(peer, class).await;
-                Err(NetworkError::DeadlineExceeded)
-            }
-        }
+        .map_err(|_| NetworkError::DeadlineExceeded)?
     }
 
     async fn rpc_identified<Req, Resp>(
@@ -1361,25 +1338,12 @@ impl NetworkHandle {
         Req: Message,
         Resp: Message + Default,
     {
-        let class = rpc_class(method);
-        match tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.rpc_inner(peer, method, request, Some(request_id)),
         )
         .await
-        {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => {
-                if invalidates_connection(&error) {
-                    self.invalidate_connection(peer, class).await;
-                }
-                Err(error)
-            }
-            Err(_) => {
-                self.invalidate_connection(peer, class).await;
-                Err(NetworkError::DeadlineExceeded)
-            }
-        }
+        .map_err(|_| NetworkError::DeadlineExceeded)?
     }
 
     async fn rpc_inner<Req, Resp>(
@@ -1461,13 +1425,6 @@ impl NetworkHandle {
         }
         connections.insert((peer, class), pooled.clone());
         Ok(pooled)
-    }
-
-    async fn invalidate_connection(&self, peer: SocketAddr, class: RpcClass) {
-        self.outbound_connections
-            .lock()
-            .await
-            .remove(&(peer, class));
     }
 
     async fn open_rpc_stream(
@@ -2674,8 +2631,9 @@ fn server_config() -> Result<(ServerConfig, String), NetworkError> {
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
     let digest = hex::encode(blake3::hash(cert_der.as_ref()).as_bytes());
-    let config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())
+    let mut config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())
         .map_err(|error| NetworkError::TlsConfig(error.to_string()))?;
+    config.transport_config(transport_config()?);
     Ok((config, digest))
 }
 
@@ -2687,7 +2645,21 @@ fn client_config() -> Result<ClientConfig, NetworkError> {
         .with_no_client_auth();
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|error| NetworkError::TlsConfig(error.to_string()))?;
-    Ok(ClientConfig::new(Arc::new(quic_crypto)))
+    let mut config = ClientConfig::new(Arc::new(quic_crypto));
+    config.transport_config(transport_config()?);
+    Ok(config)
+}
+
+fn transport_config() -> Result<Arc<TransportConfig>, NetworkError> {
+    let mut transport = TransportConfig::default();
+    let idle_timeout = std::time::Duration::from_secs(5)
+        .try_into()
+        .map_err(|error: quinn::VarIntBoundsExceeded| NetworkError::TlsConfig(error.to_string()))?;
+    transport
+        .max_concurrent_bidi_streams(VarInt::from_u32(256))
+        .max_idle_timeout(Some(idle_timeout))
+        .keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    Ok(Arc::new(transport))
 }
 
 fn ensure_rustls_provider() {

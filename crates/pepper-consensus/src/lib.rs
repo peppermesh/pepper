@@ -1594,6 +1594,8 @@ pub struct GroupHandle {
     membership_epoch: Arc<AtomicU64>,
     rate: Mutex<RateBucket>,
     initialize_lock: Mutex<()>,
+    linearizable_epoch: AtomicU64,
+    linearizable_lock: Mutex<()>,
 }
 
 impl GroupHandle {
@@ -1603,6 +1605,25 @@ impl GroupHandle {
 
     pub fn membership_epoch(&self) -> u64 {
         self.membership_epoch.load(Ordering::Acquire)
+    }
+
+    /// Confirm leadership once for every overlapping batch of linearizable
+    /// reads. OpenRaft implements this as an empty AppendEntries round to the
+    /// voters. Without single-flight coalescing, concurrent S3 GET/HEAD/PUT
+    /// requests each start their own quorum round and can exhaust the QUIC
+    /// stream budget that Raft heartbeats also need.
+    pub async fn ensure_linearizable(&self) -> Result<(), ConsensusError> {
+        let observed_epoch = self.linearizable_epoch.load(Ordering::Acquire);
+        let _guard = self.linearizable_lock.lock().await;
+        if self.linearizable_epoch.load(Ordering::Acquire) != observed_epoch {
+            return Ok(());
+        }
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        self.linearizable_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     pub async fn voter_identities(&self) -> Vec<String> {
@@ -1896,6 +1917,8 @@ impl NamespaceGroupManager {
                 count: 0,
             }),
             initialize_lock: Mutex::new(()),
+            linearizable_epoch: AtomicU64::new(0),
+            linearizable_lock: Mutex::new(()),
         });
         if restore_started.elapsed().as_millis()
             > u128::from(self.config.checkpoint_restore_target_ms)
@@ -1959,11 +1982,7 @@ impl NamespaceGroupManager {
             ));
         }
         let group = self.group(namespace_id).await?;
-        group
-            .raft
-            .ensure_linearizable()
-            .await
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        group.ensure_linearizable().await?;
         let key = namespace_id.to_string();
         let mut metadata =
             read_json_table::<GroupMetadata>(&self.metadata, NAMESPACE_GROUPS, &key)?
@@ -2307,11 +2326,7 @@ impl NamespaceGroupManager {
         if let Ok(group) = self.group(namespace_id).await {
             let metrics = group.raft.metrics().borrow().clone();
             if metrics.current_leader == Some(self.node_id) {
-                group
-                    .raft
-                    .ensure_linearizable()
-                    .await
-                    .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+                group.ensure_linearizable().await?;
                 return Ok(group.namespace_state().await);
             }
         }
@@ -2323,7 +2338,7 @@ impl NamespaceGroupManager {
             if let Ok(group) = self.group(namespace_id).await {
                 let metrics = group.raft.metrics().borrow().clone();
                 if metrics.current_leader == Some(self.node_id)
-                    && group.raft.ensure_linearizable().await.is_ok()
+                    && group.ensure_linearizable().await.is_ok()
                 {
                     return Ok(group.namespace_state().await);
                 }
@@ -2377,7 +2392,7 @@ impl NamespaceGroupManager {
             if let Ok(group) = self.group(namespace_id).await {
                 let metrics = group.raft.metrics().borrow().clone();
                 if metrics.current_leader == Some(self.node_id)
-                    && group.raft.ensure_linearizable().await.is_ok()
+                    && group.ensure_linearizable().await.is_ok()
                 {
                     return Ok(group.namespace_state().await);
                 }
@@ -3129,7 +3144,6 @@ impl NetworkNamespaceService for NamespaceGroupManager {
             return Err(namespace_network_error("stale namespace leader hint"));
         }
         group
-            .raft
             .ensure_linearizable()
             .await
             .map_err(namespace_network_error)?;

@@ -1216,9 +1216,7 @@ pub(super) async fn admin_namespace_rebalance(
         .group(&id)
         .await
         .map_err(consensus_error)?;
-    group.raft.ensure_linearizable().await.map_err(|error| {
-        consensus_error(pepper_consensus::ConsensusError::Raft(error.to_string()))
-    })?;
+    group.ensure_linearizable().await.map_err(consensus_error)?;
     let reachable = state
         .network
         .peers()
