@@ -91,13 +91,22 @@ pub(super) async fn bucket_put(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
-    let current = current_value(&state, &namespace_id, &request.key_hex).await?;
-    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
-    let previous = current.map(|value| value.cid);
+    let key =
+        hex::decode(&request.key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base = namespace_manager(&state)?
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
+    let current = pepper_merkle::get(
+        &state.namespace_data_store,
+        &base.current_root_cid,
+        &key,
+        MerkleLimits::default(),
+    )
+    .await
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
+    let previous = current.map(|value| value.cid);
     let descriptor = BucketObjectDescriptor::object(
         request.content_cid.clone(),
         request.logical_size,

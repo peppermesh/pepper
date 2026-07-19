@@ -4786,9 +4786,11 @@ pub(super) async fn local_s3_bucket_catalog_namespace(
     match namespace_alias(state, S3_BUCKET_CATALOG_ALIAS) {
         Ok(namespace_id) => {
             let namespace = manager
-                .linearizable_namespace_state(&namespace_id)
+                .group(&namespace_id)
                 .await
-                .map_err(consensus_error)?;
+                .map_err(consensus_error)?
+                .namespace_state()
+                .await;
             if is_s3_catalog_descriptor(&namespace.descriptor) {
                 return Ok(Some(namespace_id));
             }
@@ -4988,6 +4990,31 @@ async fn s3_catalog_lookup(
     bucket: &str,
     resource: &str,
 ) -> Result<Option<NamespaceId>, S3Error> {
+    // Catalog entries are immutable: delete/recreate retains the same bucket
+    // namespace and records deletion inside that namespace. Once the local
+    // Raft replica has applied an entry it is therefore safe to serve that hit
+    // without another quorum round trip. Absence still uses a linearizable read
+    // so concurrent CreateBucket requests cannot claim different namespaces.
+    if let Ok(group) = namespace_manager(state)
+        .map_err(|error| map_api_error(error, resource))?
+        .group(catalog_namespace_id)
+        .await
+    {
+        let namespace = group.namespace_state().await;
+        let value = pepper_merkle::get(
+            &state.namespace_data_store,
+            &namespace.current_root_cid,
+            &s3_catalog_key(bucket),
+            MerkleLimits::default(),
+        )
+        .await
+        .map_err(|error| S3Error::invalid(error.to_string(), resource))?;
+        if let Some(value) = value {
+            return decode_s3_catalog_value(state, &value, resource)
+                .await
+                .map(Some);
+        }
+    }
     let value = current_value(
         state,
         catalog_namespace_id,
@@ -5323,27 +5350,6 @@ async fn resolve_s3_bucket_namespace(
     if let Some(namespace_id) =
         s3_catalog_lookup(state, &catalog_namespace_id, bucket, resource).await?
     {
-        let namespace = namespace_manager(state)
-            .map_err(|error| map_api_error(error, resource))?
-            .linearizable_namespace_state(&namespace_id)
-            .await
-            .map_err(|error| {
-                S3Error::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailable",
-                    error.to_string(),
-                    resource,
-                )
-            })?;
-        if namespace.descriptor.kind != NamespaceKind::Bucket {
-            return Err(S3Error::no_bucket(bucket));
-        }
-        if bucket_deleted(state, &namespace_id)
-            .await
-            .map_err(|error| map_api_error(error, resource))?
-        {
-            return Ok(None);
-        }
         cache_alias(state, bucket, &namespace_id)
             .map_err(|error| map_api_error(error, resource))?;
         return Ok(Some(namespace_id));
@@ -5479,9 +5485,15 @@ async fn bucket_namespace(state: &AppState, bucket: &str) -> Result<NamespaceId,
     if namespace.descriptor.kind != NamespaceKind::Bucket {
         return Err(S3Error::no_bucket(bucket));
     }
-    if bucket_deleted(state, &namespace_id)
-        .await
-        .map_err(|error| map_api_error(error, &format!("/{bucket}")))?
+    if pepper_merkle::get(
+        &state.namespace_data_store,
+        &namespace.current_root_cid,
+        S3_BUCKET_DELETED_KEY,
+        MerkleLimits::default(),
+    )
+    .await
+    .map_err(|error| S3Error::invalid(error.to_string(), format!("/{bucket}")))?
+    .is_some()
     {
         return Err(S3Error::no_bucket(bucket));
     }
