@@ -805,18 +805,6 @@ where
         envelope: CommandEnvelope,
     ) -> Result<ApplyResult, NamespaceError> {
         validate_envelope(&envelope, &self.namespace_limits)?;
-        if self
-            .state
-            .history
-            .get(&self.state.current_revision)
-            .is_some_and(|record| {
-                envelope.timestamp_unix_seconds < record.committed_at_unix_seconds
-            })
-        {
-            return Err(NamespaceError::InvalidCommand(
-                "command timestamp precedes the current revision".to_string(),
-            ));
-        }
         let signing_payload = canonical_signing_payload(&self.state.namespace_id, &envelope)?;
         self.authorizer
             .verify(
@@ -838,15 +826,26 @@ where
             });
         }
 
+        // Concurrent commands can reach the leader in one order and be committed
+        // in another. Preserve the authenticated client timestamp in the
+        // idempotency fingerprint, but derive a monotonic commit timestamp from
+        // consensus order so an otherwise valid command is never rejected merely
+        // because another gateway observed a later wall clock first.
+        let mut applied_envelope = envelope.clone();
+        if let Some(record) = self.state.history.get(&self.state.current_revision) {
+            applied_envelope.timestamp_unix_seconds = applied_envelope
+                .timestamp_unix_seconds
+                .max(record.committed_at_unix_seconds);
+        }
         let before = protected_roots(&self.state);
         let mut next = self.state.clone();
-        let response = match &envelope.command {
+        let response = match &applied_envelope.command {
             NamespaceCommand::ApplyTransaction { transaction } => CommandResponse::Commit(
                 apply_transaction(
                     &self.store,
                     &mut next,
                     transaction,
-                    &envelope,
+                    &applied_envelope,
                     &self.namespace_limits,
                     self.merkle_limits,
                 )
@@ -857,7 +856,7 @@ where
                     &mut next,
                     name,
                     *revision,
-                    envelope.timestamp_unix_seconds,
+                    applied_envelope.timestamp_unix_seconds,
                     &self.namespace_limits,
                 )?)
             }
@@ -870,7 +869,7 @@ where
                     &mut next,
                     *revision,
                     message.clone(),
-                    &envelope,
+                    &applied_envelope,
                     &self.namespace_limits,
                     self.merkle_limits,
                 )
@@ -2072,6 +2071,32 @@ mod tests {
             left.get(None, b"alpha").await.unwrap().unwrap().generation,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn consensus_order_clamps_out_of_order_client_timestamps() {
+        let mut machine = machine().await;
+        let first = put_command(
+            machine.state(),
+            "timestamp-newer",
+            "alpha",
+            "one",
+            KeyPrecondition::Absent,
+            20,
+        );
+        machine.apply(first).await.unwrap();
+        let second = put_command(
+            machine.state(),
+            "timestamp-older",
+            "beta",
+            "two",
+            KeyPrecondition::Absent,
+            10,
+        );
+        machine.apply(second).await.unwrap();
+        assert_eq!(machine.state().current_revision, 2);
+        assert_eq!(machine.state().history[&2].committed_at_unix_seconds, 20);
+        assert!(machine.get(None, b"beta").await.unwrap().is_some());
     }
 
     #[tokio::test]

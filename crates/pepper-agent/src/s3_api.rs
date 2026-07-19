@@ -14,8 +14,8 @@ use md5::Md5;
 use pepper_bucket::{BucketLimits, BucketObjectDescriptor, get_descriptor};
 use pepper_merkle::{MerkleLimits, MerkleValue, ScanQuery};
 use pepper_namespace::{
-    CommandEnvelope, KeyPrecondition, NamespaceCommand, NamespaceKind, NamespaceMutation,
-    TransactionCommand,
+    CommandEnvelope, KeyPrecondition, NamespaceCommand, NamespaceDescriptor, NamespaceKind,
+    NamespaceMutation, TransactionCommand,
 };
 use serde::Deserialize;
 use sha1::Sha1;
@@ -38,6 +38,9 @@ const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 const S3_MAX_MULTIPART_PARTS: u32 = 10_000;
 const S3_MULTIPART_CLEANUP_BATCH: usize = 9_000;
 const S3_MAX_DISCOVERED_BUCKETS: usize = 10_000;
+pub(super) const S3_BUCKET_CATALOG_ALIAS: &str = "__pepper_s3_bucket_catalog_v1";
+const S3_BUCKET_CATALOG_CREATOR: &str = "pepper.s3.bucket.catalog.v1";
+const S3_BUCKET_CATALOG_KEY_PREFIX: &[u8] = b"bucket/";
 
 #[derive(Debug, Clone)]
 pub(super) struct S3RuntimeConfig {
@@ -46,6 +49,7 @@ pub(super) struct S3RuntimeConfig {
     pub(super) secret_access_key: Vec<u8>,
     pub(super) max_clock_skew_seconds: u64,
     pub(super) bucket_create_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) bucket_catalog_lock: Arc<tokio::sync::Mutex<()>>,
     pub(super) multipart_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -804,14 +808,27 @@ pub(super) async fn s3_create_bucket(
         .clone();
     let _create_guard = create_lock.lock().await;
 
-    let existing = match namespace_alias(&state, &bucket) {
-        Ok(namespace_id) => Some(namespace_id),
-        Err(error) if error.code == ErrorCode::NotFound => {
-            resolve_s3_bucket_namespace(&state, &bucket, uri.path()).await?
-        }
-        Err(error) => return Err(map_api_error(error, uri.path())),
+    let catalog_namespace_id = ensure_s3_bucket_catalog(&state, uri.path()).await?;
+    let catalog_existing =
+        s3_catalog_lookup(&state, &catalog_namespace_id, &bucket, uri.path()).await?;
+    let catalog_had_entry = catalog_existing.is_some();
+    let existing = match catalog_existing {
+        Some(namespace_id) => Some(namespace_id),
+        None => legacy_resolve_s3_bucket_namespace(&state, &bucket, uri.path()).await?,
     };
     if let Some(namespace_id) = existing {
+        let namespace_id = if !catalog_had_entry {
+            claim_s3_catalog_entry(
+                &state,
+                &catalog_namespace_id,
+                &bucket,
+                &namespace_id,
+                uri.path(),
+            )
+            .await?
+        } else {
+            namespace_id
+        };
         let namespace = namespace_manager(&state)
             .map_err(|error| map_api_error(error, uri.path()))?
             .linearizable_namespace_state(&namespace_id)
@@ -830,7 +847,7 @@ pub(super) async fn s3_create_bucket(
                 .map_err(|error| map_api_error(error, uri.path()))?
         {
             clear_bucket_deleted(&state, &namespace_id, uri.path()).await?;
-            persist_alias(&state, &bucket, &namespace_id)
+            cache_alias(&state, &bucket, &namespace_id)
                 .map_err(|error| map_api_error(error, uri.path()))?;
             let mut response = StatusCode::OK.into_response();
             response.headers_mut().insert(
@@ -857,28 +874,31 @@ pub(super) async fn s3_create_bucket(
 
     let created = bucket_create(
         State(state.clone()),
-        Json(BucketCreateRequest {
-            alias: Some(bucket.clone()),
-        }),
+        Json(BucketCreateRequest { alias: None }),
     )
     .await
     .map_err(|error| map_api_error(error, uri.path()))?
     .0;
-    if let Err(error) =
-        put_bucket_name_marker(&state, &created.namespace_id, &bucket, uri.path()).await
-    {
-        warn!(
-            bucket,
-            namespace_id = %created.namespace_id,
-            error = %error.message,
-            "bucket was created but its distributed S3 name marker needs reconciliation"
-        );
-        spawn_bucket_name_marker_reconciliation(
-            state.clone(),
-            created.namespace_id.clone(),
-            bucket.clone(),
-        );
+    put_bucket_name_marker(&state, &created.namespace_id, &bucket, uri.path()).await?;
+    let winner = claim_s3_catalog_entry(
+        &state,
+        &catalog_namespace_id,
+        &bucket,
+        &created.namespace_id,
+        uri.path(),
+    )
+    .await?;
+    if winner != created.namespace_id {
+        let _ = mark_bucket_deleted(&state, &created.namespace_id, uri.path()).await;
+        return Err(S3Error::new(
+            StatusCode::CONFLICT,
+            "BucketAlreadyExists",
+            "The requested bucket name is not available",
+            uri.path(),
+        ));
     }
+    cache_alias(&state, &bucket, &created.namespace_id)
+        .map_err(|error| map_api_error(error, uri.path()))?;
 
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().insert(
@@ -1730,23 +1750,58 @@ pub(super) async fn s3_put_object(
         .to_string();
     let metadata = user_metadata(&headers, uri.path())?;
     let (receipt, logical_size) = upload_s3_body(&state, body, &headers, &auth, uri.path()).await?;
-    let published = bucket_put(
-        State(state.clone()),
-        Json(BucketPutRequest {
-            bucket: namespace_id.to_string(),
-            key_hex: hex::encode(key.as_bytes()),
-            content_cid: receipt.cid.clone(),
-            logical_size,
-            content_type,
-            metadata,
-            if_generation: None,
-            if_cid,
-            request_id: request_id(),
-        }),
-    )
-    .await
-    .map_err(|error| map_api_error(error, uri.path()))?
-    .0;
+    let conditional = if_cid.is_some();
+    let mut published = None;
+    let mut last_conflict = None;
+    for attempt in 0..64u64 {
+        match bucket_put(
+            State(state.clone()),
+            Json(BucketPutRequest {
+                bucket: namespace_id.to_string(),
+                key_hex: hex::encode(key.as_bytes()),
+                content_cid: receipt.cid.clone(),
+                logical_size,
+                content_type: content_type.clone(),
+                metadata: metadata.clone(),
+                if_generation: None,
+                if_cid: if_cid.clone(),
+                request_id: request_id(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => {
+                published = Some(response.0);
+                break;
+            }
+            Err(error)
+                if !conditional
+                    && matches!(
+                        error.code,
+                        ErrorCode::GenerationConflict | ErrorCode::Conflict
+                    ) =>
+            {
+                last_conflict = Some(error);
+                time::sleep(Duration::from_millis(
+                    (attempt.saturating_add(1) * 5).min(100),
+                ))
+                .await;
+            }
+            Err(error) => return Err(map_api_error(error, uri.path())),
+        }
+    }
+    let published = published.ok_or_else(|| {
+        map_api_error(
+            last_conflict.unwrap_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    ErrorCode::Conflict,
+                    "S3 object publication did not converge",
+                )
+            }),
+            uri.path(),
+        )
+    })?;
 
     let descriptor_cid = published["object_descriptor_cid"].as_str().ok_or_else(|| {
         S3Error::new(
@@ -4209,29 +4264,6 @@ async fn ensure_bucket_empty(
     Ok(())
 }
 
-fn spawn_bucket_name_marker_reconciliation(
-    state: AppState,
-    namespace_id: NamespaceId,
-    bucket: String,
-) {
-    tokio::spawn(async move {
-        for _ in 0..10 {
-            if put_bucket_name_marker(&state, &namespace_id, &bucket, &format!("/{bucket}"))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        warn!(
-            bucket,
-            namespace_id = %namespace_id,
-            "failed to reconcile distributed S3 bucket-name marker"
-        );
-    });
-}
-
 async fn ensure_multipart_control_namespace(
     state: &AppState,
     bucket_namespace_id: &NamespaceId,
@@ -4740,6 +4772,319 @@ fn has_query_parameter(query: Option<&str>, parameter: &str) -> bool {
     })
 }
 
+fn is_s3_catalog_descriptor(descriptor: &NamespaceDescriptor) -> bool {
+    descriptor.kind == NamespaceKind::Kv
+        && descriptor.creator_identity == S3_BUCKET_CATALOG_CREATOR
+        && descriptor.creator_signature_hex == "00"
+        && descriptor.created_at_unix_seconds == 0
+}
+
+pub(super) async fn local_s3_bucket_catalog_namespace(
+    state: &AppState,
+) -> Result<Option<NamespaceId>, ApiError> {
+    let manager = namespace_manager(state)?;
+    match namespace_alias(state, S3_BUCKET_CATALOG_ALIAS) {
+        Ok(namespace_id) => {
+            let namespace = manager
+                .linearizable_namespace_state(&namespace_id)
+                .await
+                .map_err(consensus_error)?;
+            if is_s3_catalog_descriptor(&namespace.descriptor) {
+                return Ok(Some(namespace_id));
+            }
+            return Err(ApiError::internal(
+                "reserved S3 bucket catalog alias has an invalid descriptor",
+            ));
+        }
+        Err(error) if error.code == ErrorCode::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for status in manager.operational_statuses().await {
+        let namespace_id = status.namespace_id;
+        let Ok(group) = manager.group(&namespace_id).await else {
+            continue;
+        };
+        if is_s3_catalog_descriptor(&group.namespace_state().await.descriptor) {
+            cache_alias(state, S3_BUCKET_CATALOG_ALIAS, &namespace_id)?;
+            return Ok(Some(namespace_id));
+        }
+    }
+    Ok(None)
+}
+
+async fn ensure_s3_bucket_catalog(
+    state: &AppState,
+    resource: &str,
+) -> Result<NamespaceId, S3Error> {
+    let catalog_lock = state
+        .s3
+        .as_ref()
+        .ok_or_else(|| S3Error::no_bucket(""))?
+        .bucket_catalog_lock
+        .clone();
+    let _catalog_guard = catalog_lock.lock().await;
+    if let Some(namespace_id) = local_s3_bucket_catalog_namespace(state)
+        .await
+        .map_err(|error| map_api_error(error, resource))?
+    {
+        return Ok(namespace_id);
+    }
+    for peer in state.network.peers().await {
+        for address in peer.addresses {
+            let Ok(address) = address.parse() else {
+                continue;
+            };
+            let Ok(response) = state
+                .network
+                .namespace_alias_resolve(address, S3_BUCKET_CATALOG_ALIAS.to_string())
+                .await
+            else {
+                continue;
+            };
+            if !response.found {
+                continue;
+            }
+            let cid = response.namespace_id.parse::<Cid>().map_err(|_| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "peer returned an invalid S3 bucket catalog namespace ID",
+                    resource,
+                )
+            })?;
+            let namespace_id = NamespaceId::new(cid).map_err(|_| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "peer returned a non-namespace S3 bucket catalog ID",
+                    resource,
+                )
+            })?;
+            let namespace = namespace_manager(state)
+                .map_err(|error| map_api_error(error, resource))?
+                .linearizable_namespace_state(&namespace_id)
+                .await
+                .map_err(|error| {
+                    S3Error::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ServiceUnavailable",
+                        error.to_string(),
+                        resource,
+                    )
+                })?;
+            if !is_s3_catalog_descriptor(&namespace.descriptor) {
+                return Err(S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "peer returned an invalid S3 bucket catalog namespace",
+                    resource,
+                ));
+            }
+            cache_alias(state, S3_BUCKET_CATALOG_ALIAS, &namespace_id)
+                .map_err(|error| map_api_error(error, resource))?;
+            return Ok(namespace_id);
+        }
+    }
+
+    let manager = namespace_manager(state).map_err(|error| map_api_error(error, resource))?;
+    let seed = Cid::new(CODEC_RAW, S3_BUCKET_CATALOG_CREATOR.as_bytes());
+    let replicas = manager
+        .select_replica_set(&seed, state.namespace_log_bytes)
+        .await
+        .map_err(|error| {
+            S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                error.to_string(),
+                resource,
+            )
+        })?;
+    let descriptor = NamespaceDescriptor::new(
+        NamespaceKind::Kv,
+        replicas,
+        S3_BUCKET_CATALOG_CREATOR,
+        "00",
+        0,
+    );
+    let created = bootstrap_namespace_group(state, descriptor)
+        .await
+        .map_err(|error| map_api_error(error, resource))?;
+    cache_alias(state, S3_BUCKET_CATALOG_ALIAS, &created.namespace_id)
+        .map_err(|error| map_api_error(error, resource))?;
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if manager
+            .linearizable_namespace_state(&created.namespace_id)
+            .await
+            .is_ok()
+        {
+            return Ok(created.namespace_id);
+        }
+        if time::Instant::now() >= deadline {
+            return Err(S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "S3 bucket catalog did not establish quorum before the deadline",
+                resource,
+            ));
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn s3_catalog_key(bucket: &str) -> Vec<u8> {
+    let mut key = S3_BUCKET_CATALOG_KEY_PREFIX.to_vec();
+    key.extend_from_slice(bucket.as_bytes());
+    key
+}
+
+async fn decode_s3_catalog_value(
+    state: &AppState,
+    value: &MerkleValue,
+    resource: &str,
+) -> Result<NamespaceId, S3Error> {
+    let block = get_block_resolved(state, &value.cid)
+        .await
+        .map_err(|error| map_api_error(error, resource))?;
+    if block.codec != CODEC_RAW {
+        return Err(S3Error::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "S3 bucket catalog value is not a raw block",
+            resource,
+        ));
+    }
+    let namespace_id = String::from_utf8(block.payload)
+        .map_err(|_| {
+            S3Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "S3 bucket catalog value is not UTF-8",
+                resource,
+            )
+        })?
+        .parse::<Cid>()
+        .map_err(|_| {
+            S3Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "S3 bucket catalog value is not a namespace ID",
+                resource,
+            )
+        })?;
+    NamespaceId::new(namespace_id).map_err(|_| {
+        S3Error::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "S3 bucket catalog value is not a bucket namespace ID",
+            resource,
+        )
+    })
+}
+
+async fn s3_catalog_lookup(
+    state: &AppState,
+    catalog_namespace_id: &NamespaceId,
+    bucket: &str,
+    resource: &str,
+) -> Result<Option<NamespaceId>, S3Error> {
+    let value = current_value(
+        state,
+        catalog_namespace_id,
+        &hex::encode(s3_catalog_key(bucket)),
+    )
+    .await
+    .map_err(|error| map_api_error(error, resource))?;
+    match value {
+        Some(value) => decode_s3_catalog_value(state, &value, resource)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn claim_s3_catalog_entry(
+    state: &AppState,
+    catalog_namespace_id: &NamespaceId,
+    bucket: &str,
+    bucket_namespace_id: &NamespaceId,
+    resource: &str,
+) -> Result<NamespaceId, S3Error> {
+    if let Some(existing) = s3_catalog_lookup(state, catalog_namespace_id, bucket, resource).await?
+    {
+        return Ok(existing);
+    }
+    let receipt = put_replicated_block(
+        state,
+        CODEC_RAW,
+        bucket_namespace_id.to_string().into_bytes(),
+    )
+    .await
+    .map_err(|error| map_api_error(error, resource))?;
+    let result = apply_multipart_transaction(
+        state,
+        catalog_namespace_id,
+        vec![NamespaceMutation::Put {
+            key_hex: hex::encode(s3_catalog_key(bucket)),
+            value_cid: receipt.cid.clone(),
+            value_kind: "s3_bucket_catalog_entry".to_string(),
+            metadata: BTreeMap::new(),
+            precondition: KeyPrecondition::Absent,
+        }],
+        vec![receipt.cid],
+        0,
+        resource,
+    )
+    .await;
+    if result.is_ok() {
+        return Ok(bucket_namespace_id.clone());
+    }
+    if let Some(existing) = s3_catalog_lookup(state, catalog_namespace_id, bucket, resource).await?
+    {
+        return Ok(existing);
+    }
+    result.map(|_| bucket_namespace_id.clone())
+}
+
+async fn s3_catalog_aliases(
+    state: &AppState,
+    catalog_namespace_id: &NamespaceId,
+    resource: &str,
+) -> Result<Vec<(String, NamespaceId)>, S3Error> {
+    let entries = scan_namespace_prefix(
+        state,
+        catalog_namespace_id,
+        S3_BUCKET_CATALOG_KEY_PREFIX.to_vec(),
+        resource,
+    )
+    .await?;
+    if entries.len() > S3_MAX_DISCOVERED_BUCKETS {
+        return Err(S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "S3 bucket catalog exceeded its bounded size",
+            resource,
+        ));
+    }
+    let mut aliases = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let bucket = std::str::from_utf8(&key[S3_BUCKET_CATALOG_KEY_PREFIX.len()..])
+            .map_err(|_| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "S3 bucket catalog contains an invalid name",
+                    resource,
+                )
+            })?
+            .to_string();
+        validate_bucket_name(&bucket)?;
+        let namespace_id = decode_s3_catalog_value(state, &value, resource).await?;
+        aliases.push((bucket, namespace_id));
+    }
+    Ok(aliases)
+}
+
 async fn bucket_name_marker(
     state: &AppState,
     namespace_id: &NamespaceId,
@@ -4768,6 +5113,9 @@ pub(super) async fn local_s3_bucket_aliases(
     let manager = namespace_manager(state)?;
     let mut aliases = BTreeMap::<String, NamespaceId>::new();
     for (alias, namespace_id) in namespace_aliases(state)? {
+        if alias == S3_BUCKET_CATALOG_ALIAS {
+            continue;
+        }
         let namespace = manager
             .linearizable_namespace_state(&namespace_id)
             .await
@@ -4844,6 +5192,56 @@ async fn distributed_s3_bucket_aliases(
     state: &AppState,
     resource: &str,
 ) -> Result<Vec<(String, NamespaceId)>, S3Error> {
+    let catalog_namespace_id = ensure_s3_bucket_catalog(state, resource).await?;
+    for (alias, namespace_id) in legacy_distributed_s3_bucket_aliases(state, resource).await? {
+        let winner = claim_s3_catalog_entry(
+            state,
+            &catalog_namespace_id,
+            &alias,
+            &namespace_id,
+            resource,
+        )
+        .await?;
+        if winner != namespace_id {
+            warn!(
+                bucket = alias,
+                catalog_namespace = %winner,
+                legacy_namespace = %namespace_id,
+                "ignored conflicting legacy S3 bucket alias during catalog reconciliation"
+            );
+        }
+    }
+    let mut aliases = Vec::new();
+    for (alias, namespace_id) in s3_catalog_aliases(state, &catalog_namespace_id, resource).await? {
+        let namespace = namespace_manager(state)
+            .map_err(|error| map_api_error(error, resource))?
+            .linearizable_namespace_state(&namespace_id)
+            .await
+            .map_err(|error| {
+                S3Error::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    error.to_string(),
+                    resource,
+                )
+            })?;
+        if namespace.descriptor.kind == NamespaceKind::Bucket
+            && !bucket_deleted(state, &namespace_id)
+                .await
+                .map_err(|error| map_api_error(error, resource))?
+        {
+            cache_alias(state, &alias, &namespace_id)
+                .map_err(|error| map_api_error(error, resource))?;
+            aliases.push((alias, namespace_id));
+        }
+    }
+    Ok(aliases)
+}
+
+async fn legacy_distributed_s3_bucket_aliases(
+    state: &AppState,
+    resource: &str,
+) -> Result<Vec<(String, NamespaceId)>, S3Error> {
     let mut aliases = local_s3_bucket_aliases(state)
         .await
         .map_err(|error| map_api_error(error, resource))?
@@ -4911,13 +5309,71 @@ async fn distributed_s3_bucket_aliases(
         }
     }
     for (alias, namespace_id) in &aliases {
-        persist_alias(state, alias, namespace_id)
-            .map_err(|error| map_api_error(error, resource))?;
+        cache_alias(state, alias, namespace_id).map_err(|error| map_api_error(error, resource))?;
     }
     Ok(aliases.into_iter().collect())
 }
 
 async fn resolve_s3_bucket_namespace(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+) -> Result<Option<NamespaceId>, S3Error> {
+    let catalog_namespace_id = ensure_s3_bucket_catalog(state, resource).await?;
+    if let Some(namespace_id) =
+        s3_catalog_lookup(state, &catalog_namespace_id, bucket, resource).await?
+    {
+        let namespace = namespace_manager(state)
+            .map_err(|error| map_api_error(error, resource))?
+            .linearizable_namespace_state(&namespace_id)
+            .await
+            .map_err(|error| {
+                S3Error::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    error.to_string(),
+                    resource,
+                )
+            })?;
+        if namespace.descriptor.kind != NamespaceKind::Bucket {
+            return Err(S3Error::no_bucket(bucket));
+        }
+        if bucket_deleted(state, &namespace_id)
+            .await
+            .map_err(|error| map_api_error(error, resource))?
+        {
+            return Ok(None);
+        }
+        cache_alias(state, bucket, &namespace_id)
+            .map_err(|error| map_api_error(error, resource))?;
+        return Ok(Some(namespace_id));
+    }
+    let Some(legacy_namespace_id) =
+        legacy_resolve_s3_bucket_namespace(state, bucket, resource).await?
+    else {
+        return Ok(None);
+    };
+    let winner = claim_s3_catalog_entry(
+        state,
+        &catalog_namespace_id,
+        bucket,
+        &legacy_namespace_id,
+        resource,
+    )
+    .await?;
+    if winner != legacy_namespace_id {
+        warn!(
+            bucket,
+            catalog_namespace = %winner,
+            legacy_namespace = %legacy_namespace_id,
+            "S3 bucket catalog overrode a conflicting legacy alias"
+        );
+    }
+    cache_alias(state, bucket, &winner).map_err(|error| map_api_error(error, resource))?;
+    Ok(Some(winner))
+}
+
+async fn legacy_resolve_s3_bucket_namespace(
     state: &AppState,
     bucket: &str,
     resource: &str,
@@ -4998,8 +5454,7 @@ async fn resolve_s3_bucket_namespace(
         {
             return Ok(None);
         }
-        persist_alias(state, bucket, namespace_id)
-            .map_err(|error| map_api_error(error, resource))?;
+        cache_alias(state, bucket, namespace_id).map_err(|error| map_api_error(error, resource))?;
     }
     Ok(found)
 }
@@ -6423,6 +6878,7 @@ mod tests {
             secret_access_key: b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_vec(),
             max_clock_skew_seconds: 900,
             bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bucket_catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let uri = Uri::from_static("/test.txt");
@@ -6465,6 +6921,7 @@ mod tests {
             secret_access_key: b"pepper-secret".to_vec(),
             max_clock_skew_seconds: 900,
             bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bucket_catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let unsigned_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=pepper-test%2F20260101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260101T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host";

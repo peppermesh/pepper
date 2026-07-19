@@ -23,7 +23,7 @@ use std::{
     },
 };
 use thiserror::Error;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 pub mod proto {
@@ -40,6 +40,40 @@ const KADEMLIA_ALPHA: usize = 3;
 const KADEMLIA_LOOKUP_LIMIT: usize = 128;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RUSTLS_PROVIDER: Once = Once::new();
+
+fn is_raft_method(method: &str) -> bool {
+    matches!(
+        method,
+        "/namespace/raft/vote" | "/namespace/raft/append" | "/namespace/raft/install_snapshot"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RpcClass {
+    Raft,
+    Data,
+}
+
+fn rpc_class(method: &str) -> RpcClass {
+    if is_raft_method(method) {
+        RpcClass::Raft
+    } else {
+        RpcClass::Data
+    }
+}
+
+fn invalidates_connection(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::Connection(_)
+            | NetworkError::Connect(_)
+            | NetworkError::Write(_)
+            | NetworkError::ClosedStream(_)
+            | NetworkError::Read(_)
+            | NetworkError::ReadExact(_)
+            | NetworkError::DeadlineExceeded
+    )
+}
 
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -287,7 +321,14 @@ pub struct NetworkHandle {
     rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
     seen_requests: Arc<Mutex<HashMap<String, i64>>>,
     inbound_connections: Arc<Semaphore>,
+    outbound_connections: Arc<AsyncMutex<HashMap<(SocketAddr, RpcClass), PooledConnection>>>,
     rpc_metrics: Arc<Mutex<RpcMetricMap>>,
+}
+
+#[derive(Clone)]
+struct PooledConnection {
+    connection: Connection,
+    peer_node_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +366,7 @@ impl NetworkHandle {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             seen_requests: Arc::new(Mutex::new(HashMap::new())),
             inbound_connections: Arc::new(Semaphore::new(256)),
+            outbound_connections: Arc::new(AsyncMutex::new(HashMap::new())),
             rpc_metrics: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
@@ -614,8 +656,10 @@ impl NetworkHandle {
         peers
     }
 
-    pub async fn remove_peer(&self, node_id: &str) {
-        self.peers.write().await.remove(node_id);
+    pub async fn mark_peer_disconnected(&self, node_id: &str) {
+        if let Some(peer) = self.peers.write().await.get_mut(node_id) {
+            peer.connected = false;
+        }
     }
 
     async fn load_persisted_peers(&self) -> Result<(), NetworkError> {
@@ -1285,12 +1329,25 @@ impl NetworkHandle {
         Req: Message,
         Resp: Message + Default,
     {
-        tokio::time::timeout(
+        let class = rpc_class(method);
+        match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.rpc_inner(peer, method, request, None),
         )
         .await
-        .map_err(|_| NetworkError::DeadlineExceeded)?
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                if invalidates_connection(&error) {
+                    self.invalidate_connection(peer, class).await;
+                }
+                Err(error)
+            }
+            Err(_) => {
+                self.invalidate_connection(peer, class).await;
+                Err(NetworkError::DeadlineExceeded)
+            }
+        }
     }
 
     async fn rpc_identified<Req, Resp>(
@@ -1304,12 +1361,25 @@ impl NetworkHandle {
         Req: Message,
         Resp: Message + Default,
     {
-        tokio::time::timeout(
+        let class = rpc_class(method);
+        match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.rpc_inner(peer, method, request, Some(request_id)),
         )
         .await
-        .map_err(|_| NetworkError::DeadlineExceeded)?
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                if invalidates_connection(&error) {
+                    self.invalidate_connection(peer, class).await;
+                }
+                Err(error)
+            }
+            Err(_) => {
+                self.invalidate_connection(peer, class).await;
+                Err(NetworkError::DeadlineExceeded)
+            }
+        }
     }
 
     async fn rpc_inner<Req, Resp>(
@@ -1323,9 +1393,7 @@ impl NetworkHandle {
         Req: Message,
         Resp: Message + Default,
     {
-        let connection = self.endpoint.connect(peer, "pepper.local")?.await?;
-        let peer_node_id = self.handshake_connection(&connection).await?;
-        let (mut send, mut recv) = connection.open_bi().await?;
+        let (pooled, mut send, mut recv) = self.open_rpc_stream(peer, rpc_class(method)).await?;
         let mut payload = Vec::new();
         request.encode(&mut payload)?;
         let request_id = request_id.unwrap_or_else(next_request_id);
@@ -1334,9 +1402,9 @@ impl NetworkHandle {
         write_frame(&mut send, &envelope).await?;
         let response = read_frame::<proto::ResponseEnvelope>(&mut recv).await?;
         verify_response_envelope(&response, &request_id)?;
-        if response.node_id != peer_node_id {
+        if response.node_id != pooled.peer_node_id {
             self.record_rpc(
-                &peer_node_id,
+                &pooled.peer_node_id,
                 method,
                 "outbound",
                 request_wire_bytes,
@@ -1346,7 +1414,7 @@ impl NetworkHandle {
             return Err(NetworkError::Unauthenticated);
         }
         self.record_rpc(
-            &peer_node_id,
+            &pooled.peer_node_id,
             method,
             "outbound",
             request_wire_bytes,
@@ -1360,6 +1428,71 @@ impl NetworkHandle {
             });
         }
         Resp::decode(response.payload.as_slice()).map_err(NetworkError::from)
+    }
+
+    async fn pooled_connection(
+        &self,
+        peer: SocketAddr,
+        class: RpcClass,
+    ) -> Result<PooledConnection, NetworkError> {
+        {
+            let mut connections = self.outbound_connections.lock().await;
+            if let Some(connection) = connections.get(&(peer, class))
+                && connection.connection.close_reason().is_none()
+            {
+                return Ok(connection.clone());
+            }
+            connections.remove(&(peer, class));
+        }
+        // Dial and authenticate without holding the global pool lock. A slow or
+        // unreachable data peer must never prevent Raft from opening its
+        // independent heartbeat connection to another peer.
+        let connection = self.endpoint.connect(peer, "pepper.local")?.await?;
+        let peer_node_id = self.handshake_connection(&connection).await?;
+        let pooled = PooledConnection {
+            connection,
+            peer_node_id,
+        };
+        let mut connections = self.outbound_connections.lock().await;
+        if let Some(existing) = connections.get(&(peer, class))
+            && existing.connection.close_reason().is_none()
+        {
+            return Ok(existing.clone());
+        }
+        connections.insert((peer, class), pooled.clone());
+        Ok(pooled)
+    }
+
+    async fn invalidate_connection(&self, peer: SocketAddr, class: RpcClass) {
+        self.outbound_connections
+            .lock()
+            .await
+            .remove(&(peer, class));
+    }
+
+    async fn open_rpc_stream(
+        &self,
+        peer: SocketAddr,
+        class: RpcClass,
+    ) -> Result<(PooledConnection, SendStream, RecvStream), NetworkError> {
+        for _ in 0..2 {
+            let pooled = self.pooled_connection(peer, class).await?;
+            match pooled.connection.open_bi().await {
+                Ok((send, recv)) => return Ok((pooled, send, recv)),
+                Err(error) => {
+                    let mut connections = self.outbound_connections.lock().await;
+                    if connections.get(&(peer, class)).is_some_and(|current| {
+                        current.connection.stable_id() == pooled.connection.stable_id()
+                    }) {
+                        connections.remove(&(peer, class));
+                    }
+                    if pooled.connection.close_reason().is_none() {
+                        return Err(NetworkError::Connection(error));
+                    }
+                }
+            }
+        }
+        Err(NetworkError::DeadlineExceeded)
     }
 
     async fn handshake_connection(&self, connection: &Connection) -> Result<String, NetworkError> {
@@ -1446,15 +1579,9 @@ impl NetworkHandle {
                         continue;
                     }
                 };
-                match this.endpoint.connect(addr, "pepper.local") {
-                    Ok(connecting) => match connecting.await {
-                        Ok(connection) => match this.handshake_connection(&connection).await {
-                            Ok(_) => info!(%addr, "bootstrap peer connected"),
-                            Err(error) => warn!(%addr, %error, "bootstrap handshake failed"),
-                        },
-                        Err(error) => warn!(%addr, %error, "bootstrap connection failed"),
-                    },
-                    Err(error) => warn!(%addr, %error, "bootstrap dial failed"),
+                match this.pooled_connection(addr, RpcClass::Data).await {
+                    Ok(_) => info!(%addr, "bootstrap peer connected"),
+                    Err(error) => warn!(%addr, %error, "bootstrap connection failed"),
                 }
             }
         });
@@ -1477,24 +1604,28 @@ impl NetworkHandle {
         block_service: Arc<dyn NetworkBlockService>,
     ) -> Result<(), NetworkError> {
         let authenticated_node = Arc::new(RwLock::new(None::<String>));
-        let stream_slots = Arc::new(Semaphore::new(64));
+        let data_stream_slots = Arc::new(Semaphore::new(48));
+        let raft_stream_slots = Arc::new(Semaphore::new(32));
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(15), connection.accept_bi())
                 .await
             {
                 Ok(Ok((send, recv))) => {
-                    let stream_permit = stream_slots
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| NetworkError::RateLimited)?;
                     let this = self.clone();
                     let block_service = block_service.clone();
                     let authenticated_node = authenticated_node.clone();
+                    let data_stream_slots = data_stream_slots.clone();
+                    let raft_stream_slots = raft_stream_slots.clone();
                     tokio::spawn(async move {
-                        let _stream_permit = stream_permit;
                         if let Err(error) = this
-                            .handle_stream(send, recv, block_service, authenticated_node)
+                            .handle_stream(
+                                send,
+                                recv,
+                                block_service,
+                                authenticated_node,
+                                data_stream_slots,
+                                raft_stream_slots,
+                            )
                             .await
                         {
                             warn!(%error, "stream handler failed");
@@ -1518,6 +1649,8 @@ impl NetworkHandle {
         mut recv: RecvStream,
         block_service: Arc<dyn NetworkBlockService>,
         authenticated_node: Arc<RwLock<Option<String>>>,
+        data_stream_slots: Arc<Semaphore>,
+        raft_stream_slots: Arc<Semaphore>,
     ) -> Result<(), NetworkError> {
         let request = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1525,6 +1658,12 @@ impl NetworkHandle {
         )
         .await
         .map_err(|_| NetworkError::DeadlineExceeded)??;
+        let _stream_permit = if is_raft_method(&request.method) {
+            raft_stream_slots.acquire_owned().await
+        } else {
+            data_stream_slots.acquire_owned().await
+        }
+        .map_err(|_| NetworkError::RateLimited)?;
         let request_wire_bytes = request.encoded_len();
         let mut response = match self
             .process_request(&request, block_service, &authenticated_node)
@@ -1579,7 +1718,9 @@ impl NetworkHandle {
         }
         self.verify_request_auth(request)?;
         self.check_replay(request)?;
-        self.check_rate_limit(&request.node_id)?;
+        if !is_raft_method(&request.method) {
+            self.check_rate_limit(&request.node_id)?;
+        }
         let method_payload_limit = if request.method == "/block/put_replica" {
             65 * 1024 * 1024
         } else {

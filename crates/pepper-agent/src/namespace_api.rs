@@ -5,9 +5,9 @@
 use super::*;
 use pepper_merkle::{MerkleLimits, ScanQuery};
 use pepper_namespace::{
-    CommandEnvelope, CommandResponse, KeyPrecondition, NamespaceCommand, NamespaceDescriptor,
-    NamespaceId, NamespaceKind, NamespaceLimits, NamespaceMutation, NamespaceState,
-    TransactionCommand, create_namespace, load_checkpoint,
+    CommandEnvelope, CommandResponse, CreatedNamespace, KeyPrecondition, NamespaceCommand,
+    NamespaceDescriptor, NamespaceId, NamespaceKind, NamespaceLimits, NamespaceMutation,
+    NamespaceState, TransactionCommand, create_namespace, load_checkpoint,
 };
 use pepper_publication::{
     DurabilityBackend, PublicationCoordinator, PublicationError, PublicationRequest, ReadLease,
@@ -287,44 +287,42 @@ pub(super) fn persist_alias(
     write.commit().map_err(ApiError::redb_commit)
 }
 
-pub(super) async fn namespace_create(
-    State(state): State<AppState>,
-    Json(request): Json<CreateNamespaceRequest>,
-) -> Result<Json<CreateNamespaceResponse>, ApiError> {
-    let manager = namespace_manager(&state)?;
-    let seed = Cid::new(
-        CODEC_RAW,
-        format!(
-            "{}:{}:{}",
-            state.status.node_id,
-            request.request_id.as_deref().unwrap_or("create"),
-            unix_seconds()
-        )
-        .as_bytes(),
-    );
-    let replicas = manager
-        .select_replica_set(&seed, state.namespace_log_bytes)
-        .await
-        .map_err(consensus_error)?;
+pub(super) fn cache_alias(
+    state: &AppState,
+    alias: &str,
+    namespace_id: &NamespaceId,
+) -> Result<(), ApiError> {
+    if alias.is_empty() || alias.len() > 256 {
+        return Err(ApiError::bad_request("alias must contain 1 to 256 bytes"));
+    }
+    let write = state
+        .metadata
+        .database()
+        .begin_write()
+        .map_err(ApiError::redb_transaction)?;
+    {
+        let mut table = write
+            .open_table(NAMESPACE_ALIASES)
+            .map_err(ApiError::redb_table)?;
+        table
+            .insert(alias, namespace_id.to_string().as_str())
+            .map_err(ApiError::redb_storage)?;
+    }
+    write.commit().map_err(ApiError::redb_commit)
+}
+
+pub(super) async fn bootstrap_namespace_group(
+    state: &AppState,
+    descriptor: NamespaceDescriptor,
+) -> Result<CreatedNamespace, ApiError> {
+    let manager = namespace_manager(state)?;
+    let replicas = descriptor.initial_replica_set.clone();
     if replicas.len() != 3 {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::NamespaceUnavailable,
             "exactly three consensus replicas are required",
         ));
-    }
-    let mut descriptor = NamespaceDescriptor::new(
-        request.kind,
-        replicas.clone(),
-        state.status.node_id.clone(),
-        "00",
-        unix_seconds(),
-    );
-    if let Some(keep_last) = request.retention_keep_last {
-        descriptor.retention.keep_last = keep_last;
-    }
-    if request.retention_max_age_seconds.is_some() {
-        descriptor.retention.max_age_seconds = request.retention_max_age_seconds;
     }
     let created = create_namespace(
         &state.namespace_data_store,
@@ -377,10 +375,12 @@ pub(super) async fn namespace_create(
 
     for replica in &replicas {
         if replica == &state.status.node_id {
-            manager
-                .start_group(created.state.clone(), state.namespace_data_store.clone())
-                .await
-                .map_err(consensus_error)?;
+            if manager.group(&created.namespace_id).await.is_err() {
+                manager
+                    .start_group(created.state.clone(), state.namespace_data_store.clone())
+                    .await
+                    .map_err(consensus_error)?;
+            }
         } else {
             let address = state.network.peer_address(replica).await.ok_or_else(|| {
                 ApiError::new(
@@ -447,6 +447,49 @@ pub(super) async fn namespace_create(
             .await
             .map_err(ApiError::network)?;
     }
+    Ok(created)
+}
+
+pub(super) async fn namespace_create(
+    State(state): State<AppState>,
+    Json(request): Json<CreateNamespaceRequest>,
+) -> Result<Json<CreateNamespaceResponse>, ApiError> {
+    let manager = namespace_manager(&state)?;
+    let seed = Cid::new(
+        CODEC_RAW,
+        format!(
+            "{}:{}:{}",
+            state.status.node_id,
+            request.request_id.as_deref().unwrap_or("create"),
+            unix_seconds()
+        )
+        .as_bytes(),
+    );
+    let replicas = manager
+        .select_replica_set(&seed, state.namespace_log_bytes)
+        .await
+        .map_err(consensus_error)?;
+    if replicas.len() != 3 {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::NamespaceUnavailable,
+            "exactly three consensus replicas are required",
+        ));
+    }
+    let mut descriptor = NamespaceDescriptor::new(
+        request.kind,
+        replicas.clone(),
+        state.status.node_id.clone(),
+        "00",
+        unix_seconds(),
+    );
+    if let Some(keep_last) = request.retention_keep_last {
+        descriptor.retention.keep_last = keep_last;
+    }
+    if request.retention_max_age_seconds.is_some() {
+        descriptor.retention.max_age_seconds = request.retention_max_age_seconds;
+    }
+    let created = bootstrap_namespace_group(&state, descriptor).await?;
     if let Some(alias) = &request.alias {
         persist_alias(&state, alias, &created.namespace_id)?;
     }

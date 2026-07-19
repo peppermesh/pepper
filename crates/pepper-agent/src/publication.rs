@@ -9,9 +9,6 @@ use pepper_publication::{
     reconcile_pin_intents,
 };
 
-static PIN_BROADCAST_LIMIT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
-
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(super) struct AgentDurabilityBackend(pub(super) AppState);
@@ -186,7 +183,6 @@ impl DurabilityBackend for AgentDurabilityBackend {
 #[derive(Clone)]
 pub(super) struct AgentProtectionBackend {
     metadata: Arc<MetadataStore>,
-    network: NetworkHandle,
     identity: NodeIdentity,
     node_id: String,
     replication_factor: u16,
@@ -196,7 +192,6 @@ impl AgentProtectionBackend {
     pub(super) fn from_state(state: &AppState) -> Self {
         Self {
             metadata: state.metadata.clone(),
-            network: state.network.clone(),
             identity: state.identity.clone(),
             node_id: state.status.node_id.clone(),
             replication_factor: state.replication_factor as u16,
@@ -225,70 +220,6 @@ impl AgentProtectionBackend {
         pin.signature_hex = hex::encode(self.identity.sign(&payload));
         Ok(())
     }
-
-    fn schedule_broadcast(&self, pin: PinRecord) {
-        let Ok(permit) = PIN_BROADCAST_LIMIT.clone().try_acquire_owned() else {
-            warn!(pin_id = %pin.pin_id, "namespace pin broadcast concurrency limit reached; periodic repair will retry");
-            return;
-        };
-        let backend = self.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = backend.broadcast(&pin).await {
-                warn!(pin_id = %pin.pin_id, %error, "namespace pin broadcast failed; reconciliation will retry");
-            }
-        });
-    }
-
-    async fn broadcast(&self, pin: &PinRecord) -> Result<(), PublicationError> {
-        let json = serde_json::to_string(pin)
-            .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        let peers = self
-            .network
-            .peers()
-            .await
-            .into_iter()
-            // Gossip may teach a node its own signed descriptor. Local pin
-            // persistence already happened before broadcast, so never dial
-            // ourselves as a synchronization target.
-            .filter(|peer| peer.node_id != self.node_id)
-            .collect::<Vec<_>>();
-        let failed = stream::iter(peers)
-            .map(|peer| {
-                let network = self.network.clone();
-                let json = json.clone();
-                async move {
-                    for address in peer.addresses {
-                        let Ok(address) = address.parse() else {
-                            continue;
-                        };
-                        if matches!(
-                            time::timeout(
-                                Duration::from_millis(500),
-                                network.apply_pin(address, json.clone())
-                            )
-                            .await,
-                            Ok(Ok(()))
-                        ) {
-                            return None;
-                        }
-                    }
-                    Some(peer.node_id)
-                }
-            })
-            .buffer_unordered(8)
-            .filter_map(|node| async move { node })
-            .collect::<Vec<_>>()
-            .await;
-        if !failed.is_empty() {
-            warn!(
-                pin_id = %pin.pin_id,
-                failed_nodes = %failed.join(","),
-                "namespace pin synchronization is incomplete; reconciliation will retry"
-            );
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -301,20 +232,19 @@ impl ProtectionBackend for AgentProtectionBackend {
         expires_at_unix_seconds: Option<i64>,
     ) -> Result<(), PublicationError> {
         let prefix = self.pin_prefix(namespace_id, cid, reason);
-        if let Some(existing) = self
+        if self
             .metadata
             .pins()
             .all()
             .map_err(|error| PublicationError::Protection(error.to_string()))?
             .into_iter()
-            .find(|pin| {
+            .any(|pin| {
                 pin.pin_id.starts_with(&prefix)
                     && pin.owner == self.node_id
                     && pin.status == "active"
                     && pin.expires_at_unix_seconds == expires_at_unix_seconds
             })
         {
-            self.schedule_broadcast(existing);
             return Ok(());
         }
         // Every namespace replica reconciles the same durable intent. Keep the
@@ -341,7 +271,6 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .put(&pin)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        self.schedule_broadcast(pin);
         Ok(())
     }
 
@@ -372,9 +301,6 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .replace(&pins)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        for pin in pins {
-            self.schedule_broadcast(pin);
-        }
         Ok(())
     }
 }

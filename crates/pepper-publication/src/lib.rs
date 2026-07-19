@@ -13,14 +13,15 @@ use pepper_metadata::{
     NAMESPACE_READ_LEASES, NAMESPACE_STAGING_LEASES,
 };
 use pepper_namespace::{
-    ApplyResult, CommandEnvelope, CommandResponse, NamespaceCommand, NamespaceId,
-    NamespaceMutation, NamespaceStateMachine, PinAction,
+    ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation,
+    NamespaceStateMachine, PinAction,
 };
 use pepper_types::{Cid, DurabilityReceipt};
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PublicationLimits {
@@ -220,6 +221,7 @@ pub trait ProtectionBackend: Send + Sync + 'static {
 pub struct PublicationRepository {
     metadata: Arc<MetadataStore>,
     limits: PublicationLimits,
+    reconciliation_lock: Arc<AsyncMutex<()>>,
 }
 
 impl PublicationRepository {
@@ -230,6 +232,7 @@ impl PublicationRepository {
         Ok(Self {
             metadata,
             limits: limits.validate()?,
+            reconciliation_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -578,20 +581,14 @@ where
         self.fault(PublicationFaultPoint::LeaderValidation)?;
         let mut preview = NamespaceStateMachine::new(self.data_store.clone(), initial.clone())
             .map_err(|error| PublicationError::Namespace(error.to_string()))?;
-        let preview_result = preview
+        preview
             .apply(request.command.clone())
             .await
             .map_err(|error| PublicationError::Conflict(error.to_string()))?;
         self.fault(PublicationFaultPoint::CandidateRoot)?;
 
         let mut durable_cids = command_value_cids(&request.command);
-        match &preview_result.response {
-            CommandResponse::Commit(commit) => {
-                durable_cids.push(commit.root_cid.clone());
-                durable_cids.push(commit.commit_cid.clone());
-            }
-            CommandResponse::Snapshot(snapshot) => durable_cids.push(snapshot.root_cid.clone()),
-        }
+        durable_cids.extend(request.uploaded_roots.iter().cloned());
         let roots_to_walk = durable_cids.clone();
         for root in roots_to_walk {
             let traversal = traverse(
@@ -645,18 +642,13 @@ where
         }
         self.fault(PublicationFaultPoint::ValueDurability)?;
 
-        let current = self
-            .manager
-            .linearizable_namespace_state(&request.namespace_id)
-            .await
-            .map_err(|error| PublicationError::Namespace(error.to_string()))?;
-        if current.current_revision != initial.current_revision
-            || current.current_root_cid != initial.current_root_cid
-        {
-            return Err(PublicationError::Conflict(
-                "leader state changed during durability barrier".to_string(),
-            ));
-        }
+        // Only externally supplied DAGs need the pre-commit durability barrier.
+        // Merkle and commit blocks are derived deterministically while every
+        // Raft replica applies the command, so a quorum commit itself makes
+        // those derived blocks durable. Let the state machine rebase disjoint
+        // stale transactions and enforce per-key preconditions at log order;
+        // rejecting every revision advance here turns parallel PUTs into an
+        // expensive retry cascade.
         self.fault(PublicationFaultPoint::LocalLogPersistence)?;
         self.fault(PublicationFaultPoint::FollowerLogPersistence)?;
         let response = self
@@ -766,6 +758,10 @@ pub async fn reconcile_pin_intents<P: ProtectionBackend + ?Sized>(
     repository: &PublicationRepository,
     protection: &P,
 ) -> Result<usize, PublicationError> {
+    // Publication requests and the periodic reconciler share a repository.
+    // Without one owner for the scan, concurrent commits can all observe and
+    // apply the same pending set, multiplying protection work quadratically.
+    let _guard = repository.reconciliation_lock.lock().await;
     let intents = repository.pending_intents()?;
     let mut applied = 0;
     for intent in intents {
@@ -884,7 +880,7 @@ mod tests {
     use pepper_consensus::{InProcessRouter, MemoryDataBackend, raft_members};
     use pepper_merkle::{MerkleLimits, MerkleNodeCodecHandler, MerkleWriteStore};
     use pepper_namespace::{
-        KeyPrecondition, NamespaceCommitCodecHandler, NamespaceDescriptor,
+        CommandResponse, KeyPrecondition, NamespaceCommitCodecHandler, NamespaceDescriptor,
         NamespaceDescriptorCodecHandler, NamespaceKind, NamespaceLimits, NamespaceMutation,
         TransactionCommand, create_namespace,
     };

@@ -451,6 +451,167 @@ async fn s3_multipart_upload_http_contract() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_s3_config(temp.path(), "s3-load-1", p2p1, api1, &[])?;
+    let config2 = write_s3_config(
+        temp.path(),
+        "s3-load-2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_s3_config(
+        temp.path(),
+        "s3-load-3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let mut node1 = spawn_agent(agent, &config1)?;
+    let _node2 = spawn_agent(agent, &config2)?;
+    let _node3 = spawn_agent(agent, &config3)?;
+    for api in [api1, api2, api3] {
+        wait_health(api).await?;
+        wait_for_peer_count(api, 2).await?;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    signed_s3_success_with_retry(&client, api1, Method::PUT, "/catalog-warmup", Vec::new()).await?;
+    let (left, right) = tokio::join!(
+        signed_s3_request(&client, api1, Method::PUT, "/catalog-race", Vec::new()),
+        signed_s3_request(&client, api2, Method::PUT, "/catalog-race", Vec::new())
+    );
+    let statuses = [left?.status(), right?.status()];
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1,
+        "exactly one concurrent CreateBucket must win: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "the losing CreateBucket must receive a stable conflict: {statuses:?}"
+    );
+
+    signed_s3_success_with_retry(&client, api1, Method::PUT, "/load-test", Vec::new()).await?;
+    signed_s3_success_with_retry(
+        &client,
+        api1,
+        Method::PUT,
+        "/load-test/read-target",
+        b"stable concurrent read target".to_vec(),
+    )
+    .await?;
+    let initial_term = stable_namespace_term(&client, api1, "load-test").await?;
+    let ports = [api1, api2, api3];
+    let mut writes = tokio::task::JoinSet::new();
+    for index in 0..32usize {
+        let client = client.clone();
+        let api = ports[index % ports.len()];
+        let body = vec![index as u8; 4 * 1024];
+        writes.spawn(async move {
+            signed_s3_success_with_retry(
+                &client,
+                api,
+                Method::PUT,
+                &format!("/load-test/object-{index:02}"),
+                body,
+            )
+            .await
+            .map(|response| response.status())
+        });
+    }
+    let mut reads = tokio::task::JoinSet::new();
+    for request in 0..64usize {
+        let client = client.clone();
+        let api = ports[request % ports.len()];
+        reads.spawn(async move {
+            let response = signed_s3_success_with_retry(
+                &client,
+                api,
+                if request % 2 == 0 {
+                    Method::GET
+                } else {
+                    Method::HEAD
+                },
+                "/load-test/read-target",
+                Vec::new(),
+            )
+            .await?;
+            if request % 2 == 0 {
+                let bytes = response.bytes().await?;
+                if bytes.as_ref() != b"stable concurrent read target" {
+                    return Err("concurrent S3 GET returned incorrect bytes".into());
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+    }
+    while let Some(result) = writes.join_next().await {
+        assert!(result??.is_success());
+    }
+    while let Some(result) = reads.join_next().await {
+        result??;
+    }
+    let final_term = stable_namespace_term(&client, api2, "load-test").await?;
+    assert_eq!(
+        final_term, initial_term,
+        "healthy concurrent S3 traffic must not churn the bucket Raft term"
+    );
+
+    signed_s3_success_with_retry(
+        &client,
+        api1,
+        Method::PUT,
+        "/load-test/gateway-loss",
+        b"catalog remains quorum-readable".to_vec(),
+    )
+    .await?;
+    node1.kill_and_wait();
+    for api in [api2, api3] {
+        let buckets = signed_s3_success_with_retry(&client, api, Method::GET, "/", Vec::new())
+            .await?
+            .text()
+            .await?;
+        assert!(buckets.contains("<Name>load-test</Name>"));
+        assert!(
+            signed_s3_success_with_retry(&client, api, Method::HEAD, "/load-test", Vec::new())
+                .await?
+                .status()
+                .is_success()
+        );
+        let bytes = signed_s3_success_with_retry(
+            &client,
+            api,
+            Method::GET,
+            "/load-test/gateway-loss",
+            Vec::new(),
+        )
+        .await?
+        .bytes()
+        .await?;
+        assert_eq!(bytes.as_ref(), b"catalog remains quorum-readable");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn dag_inspection_uses_shared_traversal() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let p2p = free_port()?;
@@ -1984,9 +2145,8 @@ fn spawn_agent_with_env(
         // host CPU for every spawned agent. CI executes several agents and
         // consensus runtimes concurrently; two workers are sufficient for the
         // loopback transport while avoiding scheduler starvation.
-        .env("TOKIO_WORKER_THREADS", "2")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("TOKIO_WORKER_THREADS", "2");
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2220,6 +2380,49 @@ async fn wait_for_namespace_quorum(api_ports: &[u16], namespace: &str) -> TestRe
         errors.join("; ")
     )
     .into())
+}
+
+async fn stable_namespace_term(
+    client: &reqwest::Client,
+    api_port: u16,
+    namespace: &str,
+) -> TestResult<u64> {
+    let url = format!("http://127.0.0.1:{api_port}/v1/namespaces/{namespace}/status");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut previous = None;
+    let mut stable = 0usize;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                let status: serde_json::Value = response.json().await?;
+                let term = status["term"]
+                    .as_u64()
+                    .ok_or("namespace status has no term")?;
+                if !status["quorum_available"].as_bool().unwrap_or(false) {
+                    stable = 0;
+                } else if previous == Some(term) {
+                    stable += 1;
+                    if stable >= 3 {
+                        return Ok(term);
+                    }
+                } else {
+                    previous = Some(term);
+                    stable = 1;
+                }
+            }
+            Ok(response) => {
+                last = format!("HTTP {}: {}", response.status(), response.text().await?);
+                stable = 0;
+            }
+            Err(error) => {
+                last = error.to_string();
+                stable = 0;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("namespace {namespace} did not reach a stable term: {last}").into())
 }
 
 async fn wait_compute_finished(api_port: u16, job_id: &str) -> TestResult<ComputeJobStatus> {

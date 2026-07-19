@@ -632,6 +632,7 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
             secret_access_key: load_s3_secret(path)?,
             max_clock_skew_seconds: loaded.config.s3.max_clock_skew_seconds,
             bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bucket_catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     } else {

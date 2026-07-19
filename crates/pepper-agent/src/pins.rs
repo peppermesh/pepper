@@ -239,6 +239,12 @@ pub(super) fn active_pins(state: &AppState) -> Result<Vec<PinRecord>, ApiError> 
         .into_iter()
         .filter(|pin| {
             pin.status == "active"
+                // Namespace protection is replicated by the namespace consensus
+                // log and reconciled independently on every replica. Remote
+                // mirrors created by older gossiping nodes are not authoritative
+                // and may otherwise retain stale roots indefinitely.
+                && (!pin.pin_id.starts_with("namespace-")
+                    || pin.owner == state.status.node_id)
                 && pin
                     .expires_at_unix_seconds
                     .is_none_or(|expiry| expiry > now)

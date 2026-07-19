@@ -101,13 +101,17 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
             }
         }
         if !healthy {
-            state.network.remove_peer(&peer.node_id).await;
+            // A short foreground-traffic delay is not proof that the node has
+            // disappeared. Retain its signed, persisted addresses so Raft can
+            // reconnect after a transient miss; a later handshake marks it
+            // connected again.
+            state.network.mark_peer_disconnected(&peer.node_id).await;
         }
     }
 
     for pin in all_pin_records(state)?
         .into_iter()
-        .filter(|pin| pin.owner == state.status.node_id)
+        .filter(|pin| pin.owner == state.status.node_id && !pin.pin_id.starts_with("namespace-"))
     {
         if let Err(error) = broadcast_pin(state, &pin).await {
             warn!(pin_id = %pin.pin_id, error = %error.message, "failed to resynchronize pin record");
