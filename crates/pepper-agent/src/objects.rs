@@ -60,8 +60,25 @@ pub(super) async fn get_object(
         validate_erasure_resource_limits(&state, &manifest)?;
         let data_shards = manifest.data_shards;
         let parity_shards = manifest.parity_shards;
-        let stripes = manifest.stripes;
-        let body_stream = stream::iter(stripes.into_iter().map(move |stripe| {
+        let mut stripes = manifest.stripes.into_iter();
+        let Some(first_stripe) = stripes.next() else {
+            return Ok((
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                Body::empty(),
+            )
+                .into_response());
+        };
+        let first_frames = erasure_stripe_frames(&state, data_shards, parity_shards, &first_stripe)
+            .await
+            .map_err(|error| {
+                warn!(
+                    ?error,
+                    offset = first_stripe.offset,
+                    "erasure GET first stripe failed"
+                );
+                error
+            })?;
+        let remaining_stream = stream::iter(stripes.map(move |stripe| {
             let state = state.clone();
             let guard = guard.clone();
             async move {
@@ -77,7 +94,8 @@ pub(super) async fn get_object(
         .buffered(4)
         .map_ok(|frames| stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>)))
         .try_flatten();
-        Body::from_stream(body_stream)
+        let first_stream = stream::iter(first_frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+        Body::from_stream(first_stream.chain(remaining_stream))
     } else {
         let manifest_block = get_block_resolved(&state, &cid).await?;
         let manifest: ObjectManifest =

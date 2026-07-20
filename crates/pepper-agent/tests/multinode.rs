@@ -814,6 +814,20 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
     assert_eq!(erasure["manifests"], 1);
     assert_eq!(erasure["missing_shards"], 0);
     assert_eq!(erasure["unrecoverable_manifests"], 0);
+
+    for shard in manifest.stripes[0].shards.iter().take(3) {
+        fs::remove_file(block_file_path(temp.path(), "ec-node", &shard.cid))?;
+    }
+    let unavailable = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/objects/{}",
+            encode_path_segment(&put.cid.to_string())
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable.status().as_u16(), 500);
+    let error: serde_json::Value = unavailable.json().await?;
+    assert_eq!(error["code"], "internal");
     Ok(())
 }
 
