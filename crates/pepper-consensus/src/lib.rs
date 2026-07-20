@@ -44,10 +44,15 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+
+const PROPOSAL_BATCH_MAX_COMMANDS: usize = 32;
+const PROPOSAL_BATCH_MAX_DELAY: Duration = Duration::from_micros(250);
+const PROPOSAL_BATCH_CHANNEL_CAPACITY: usize = 256;
+const INITIAL_MEMBERSHIP_EPOCH: u64 = 1;
 
 const NAMESPACE_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("namespace_groups");
 const NAMESPACE_RAFT_VOTE: TableDefinition<&str, &[u8]> =
@@ -58,6 +63,84 @@ const NAMESPACE_RAFT_MEMBERSHIP: TableDefinition<&str, &[u8]> =
 const NAMESPACE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("namespace_state");
 const NAMESPACE_CHECKPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("namespace_checkpoints");
+
+static LOG_APPEND_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static LOG_APPEND_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static LOG_APPEND_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
+static LOG_APPEND_EXECUTION_MICROS: AtomicU64 = AtomicU64::new(0);
+static STATE_APPLY_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static STATE_APPLY_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static STATE_APPLY_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
+static STATE_APPLY_EXECUTION_MICROS: AtomicU64 = AtomicU64::new(0);
+static PROPOSAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static PROPOSAL_BATCHES: AtomicU64 = AtomicU64::new(0);
+static PROPOSAL_BATCH_SIZE_MAX: AtomicU64 = AtomicU64::new(0);
+static PROPOSAL_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
+static PROPOSAL_EXECUTION_MICROS: AtomicU64 = AtomicU64::new(0);
+static LINEARIZABLE_READ_LEASE_HITS: AtomicU64 = AtomicU64::new(0);
+static LINEARIZABLE_READ_PROOFS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConsensusIoStats {
+    pub log_append_observations: u64,
+    pub log_append_entries: u64,
+    pub log_append_queue_micros: u64,
+    pub log_append_execution_micros: u64,
+    pub state_apply_observations: u64,
+    pub state_apply_entries: u64,
+    pub state_apply_queue_micros: u64,
+    pub state_apply_execution_micros: u64,
+    pub proposal_requests: u64,
+    pub proposal_batches: u64,
+    pub proposal_batch_size_max: u64,
+    pub proposal_queue_micros: u64,
+    pub proposal_execution_micros: u64,
+    pub linearizable_read_lease_hits: u64,
+    pub linearizable_read_proofs: u64,
+}
+
+pub fn process_io_stats() -> ConsensusIoStats {
+    ConsensusIoStats {
+        log_append_observations: LOG_APPEND_OBSERVATIONS.load(Ordering::Relaxed),
+        log_append_entries: LOG_APPEND_ENTRIES.load(Ordering::Relaxed),
+        log_append_queue_micros: LOG_APPEND_QUEUE_MICROS.load(Ordering::Relaxed),
+        log_append_execution_micros: LOG_APPEND_EXECUTION_MICROS.load(Ordering::Relaxed),
+        state_apply_observations: STATE_APPLY_OBSERVATIONS.load(Ordering::Relaxed),
+        state_apply_entries: STATE_APPLY_ENTRIES.load(Ordering::Relaxed),
+        state_apply_queue_micros: STATE_APPLY_QUEUE_MICROS.load(Ordering::Relaxed),
+        state_apply_execution_micros: STATE_APPLY_EXECUTION_MICROS.load(Ordering::Relaxed),
+        proposal_requests: PROPOSAL_REQUESTS.load(Ordering::Relaxed),
+        proposal_batches: PROPOSAL_BATCHES.load(Ordering::Relaxed),
+        proposal_batch_size_max: PROPOSAL_BATCH_SIZE_MAX.load(Ordering::Relaxed),
+        proposal_queue_micros: PROPOSAL_QUEUE_MICROS.load(Ordering::Relaxed),
+        proposal_execution_micros: PROPOSAL_EXECUTION_MICROS.load(Ordering::Relaxed),
+        linearizable_read_lease_hits: LINEARIZABLE_READ_LEASE_HITS.load(Ordering::Relaxed),
+        linearizable_read_proofs: LINEARIZABLE_READ_PROOFS.load(Ordering::Relaxed),
+    }
+}
+
+struct ProcessTimer {
+    started: Instant,
+    total_micros: &'static AtomicU64,
+}
+
+impl ProcessTimer {
+    fn start(total_micros: &'static AtomicU64) -> Self {
+        Self {
+            started: Instant::now(),
+            total_micros,
+        }
+    }
+}
+
+impl Drop for ProcessTimer {
+    fn drop(&mut self) {
+        self.total_micros.fetch_add(
+            self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
 
 pub type NodeId = u64;
 
@@ -81,13 +164,19 @@ pub fn raft_members(identities: &[String]) -> Result<BTreeMap<NodeId, BasicNode>
 
 openraft::declare_raft_types!(
     pub TypeConfig:
-        D = CommandEnvelope,
-        R = ConsensusResponse,
+        D = ConsensusCommandBatch,
+        R = ConsensusBatchResponse,
         NodeId = NodeId,
         Node = BasicNode,
         Entry = Entry<TypeConfig>,
         SnapshotData = Cursor<Vec<u8>>,
 );
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsensusCommandBatch {
+    pub commands: Vec<CommandEnvelope>,
+}
 
 pub fn namespace_log_contains(
     metadata: &MetadataStore,
@@ -130,20 +219,25 @@ pub struct ConsensusResponse {
     pub error: Option<String>,
 }
 
-impl ConsensusResponse {
-    fn blank() -> Self {
-        Self {
-            result: None,
-            error_code: None,
-            error: None,
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusBatchResponse {
+    pub responses: Vec<ConsensusResponse>,
+}
 
+impl ConsensusResponse {
     fn application_error(error: NamespaceError) -> Self {
         Self {
             result: None,
             error_code: Some(namespace_error_code(&error).to_string()),
             error: Some(error.to_string()),
+        }
+    }
+}
+
+impl ConsensusBatchResponse {
+    fn blank() -> Self {
+        Self {
+            responses: Vec::new(),
         }
     }
 }
@@ -198,6 +292,14 @@ pub enum ConsensusError {
 pub trait ConsensusDataBackend: Send + Sync + 'static {
     async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String>;
     async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String>;
+
+    async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
+        let mut cids = Vec::with_capacity(blocks.len());
+        for (codec, payload) in blocks {
+            cids.push(self.put(codec, payload).await?);
+        }
+        Ok(cids)
+    }
 }
 
 #[derive(Clone)]
@@ -229,6 +331,70 @@ impl ConsensusDataStore {
             block_store,
             network,
         })
+    }
+
+    async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
+        self.0.put_batch(blocks).await
+    }
+}
+
+type BufferedBlocks = BTreeMap<String, (Codec, Vec<u8>)>;
+
+#[derive(Clone)]
+struct BufferedConsensusDataStore {
+    base: ConsensusDataStore,
+    blocks: Arc<Mutex<BufferedBlocks>>,
+}
+
+impl BufferedConsensusDataStore {
+    fn new(base: ConsensusDataStore) -> Self {
+        Self {
+            base,
+            blocks: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        let blocks = {
+            let mut pending = self.blocks.lock().await;
+            std::mem::take(&mut *pending)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let expected = blocks
+            .iter()
+            .map(|(codec, payload)| Cid::new(*codec, payload))
+            .collect::<Vec<_>>();
+        let actual = self.base.put_batch(blocks).await?;
+        if actual != expected {
+            return Err("batch store returned a CID different from the buffered block".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MerkleReadStore for BufferedConsensusDataStore {
+    async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+        if let Some((_, payload)) = self.blocks.lock().await.get(&cid.to_string()) {
+            return Ok(payload.clone());
+        }
+        MerkleReadStore::get(&self.base, cid).await
+    }
+}
+
+#[async_trait]
+impl MerkleWriteStore for BufferedConsensusDataStore {
+    async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String> {
+        let cid = Cid::new(codec, &payload);
+        self.blocks
+            .lock()
+            .await
+            .insert(cid.to_string(), (codec, payload));
+        Ok(cid)
     }
 }
 
@@ -286,6 +452,13 @@ impl ConsensusDataBackend for NetworkBlockStoreDataBackend {
             .map(|response| response.cid)
             .map_err(|error| error.to_string())
     }
+
+    async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
+        self.block_store
+            .put_batch(&blocks)
+            .map(|responses| responses.into_iter().map(|response| response.cid).collect())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -304,6 +477,13 @@ impl ConsensusDataBackend for BlockStoreDataBackend {
         self.0
             .put(codec, &payload)
             .map(|response| response.cid)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
+        self.0
+            .put_batch(&blocks)
+            .map(|responses| responses.into_iter().map(|response| response.cid).collect())
             .map_err(|error| error.to_string())
     }
 }
@@ -330,21 +510,16 @@ impl ConsensusDataBackend for MemoryDataBackend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GroupMetadata {
     pub namespace_id: NamespaceId,
-    #[serde(default = "initial_membership_epoch")]
     pub membership_epoch: u64,
     pub local_node_identity: String,
     pub local_raft_node_id: NodeId,
     pub members: Vec<String>,
-    #[serde(default)]
     pub learners: Vec<String>,
     pub status: String,
     pub created_at_unix_seconds: i64,
-}
-
-fn initial_membership_epoch() -> u64 {
-    1
 }
 
 #[derive(Debug, Clone)]
@@ -369,9 +544,9 @@ impl Default for ConsensusConfig {
             max_consensus_log_bytes: 256 * 1024 * 1024,
             max_namespace_write_rate: 1_000,
             max_command_bytes: 1024 * 1024,
-            heartbeat_interval_ms: 50,
-            election_timeout_min_ms: 250,
-            election_timeout_max_ms: 500,
+            heartbeat_interval_ms: 100,
+            election_timeout_min_ms: 1_000,
+            election_timeout_max_ms: 2_000,
             snapshot_after_logs: 1_000,
             max_logs_after_snapshot: 128,
             checkpoint_log_bytes: 64 * 1024 * 1024,
@@ -616,8 +791,16 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
-        let _guard = self.io_lock.lock().await;
         let entries = entries.into_iter().collect::<Vec<_>>();
+        LOG_APPEND_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+        LOG_APPEND_ENTRIES.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        let queued_at = Instant::now();
+        let _guard = self.io_lock.lock().await;
+        LOG_APPEND_QUEUE_MICROS.fetch_add(
+            queued_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        let _execution_timer = ProcessTimer::start(&LOG_APPEND_EXECUTION_MICROS);
         let encoded = entries
             .iter()
             .map(|entry| serde_json::to_vec(entry).map_err(write_logs_error))
@@ -725,10 +908,11 @@ fn committed_publication_intent(
         PinAction::Protect => "protect",
         PinAction::Release => "release",
     };
+    let request_hash = blake3::hash(request_id.as_bytes()).to_hex();
     PublicationIntentRecord {
         intent_id: format!(
-            "{}|{:016x}|committed|{}|{}",
-            namespace_id, log_index, action, intent.cid
+            "{}|{:016x}|committed|{}|{}|{}",
+            namespace_id, log_index, request_hash, action, intent.cid
         ),
         namespace_id: namespace_id.clone(),
         log_index,
@@ -745,32 +929,42 @@ fn proposal_protection_intents(
     group: &str,
     entry: &Entry<TypeConfig>,
 ) -> Vec<PublicationIntentRecord> {
-    let EntryPayload::Normal(envelope) = &entry.payload else {
-        return Vec::new();
-    };
-    let NamespaceCommand::ApplyTransaction { transaction } = &envelope.command else {
+    let EntryPayload::Normal(command) = &entry.payload else {
         return Vec::new();
     };
     let Ok(namespace_id) = parse_namespace_id(group) else {
         return Vec::new();
     };
-    transaction
-        .mutations
+    command
+        .commands
         .iter()
-        .filter_map(|mutation| match mutation {
-            NamespaceMutation::Put { value_cid, .. } => Some(value_cid.clone()),
-            NamespaceMutation::Delete { .. } => None,
-        })
-        .map(|cid| PublicationIntentRecord {
-            intent_id: format!("{}|{:016x}|proposal|{}", group, entry.log_id.index, cid),
-            namespace_id: namespace_id.clone(),
-            log_index: entry.log_id.index,
-            request_id: envelope.request_id.clone(),
-            cid,
-            action: PinAction::Protect,
-            reason: "proposal-input".to_string(),
-            status: "pending".to_string(),
-            created_at_unix_seconds: unix_seconds(),
+        .flat_map(|envelope| {
+            let NamespaceCommand::ApplyTransaction { transaction } = &envelope.command else {
+                return Vec::new();
+            };
+            let request_hash = blake3::hash(envelope.request_id.as_bytes()).to_hex();
+            transaction
+                .mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    NamespaceMutation::Put { value_cid, .. } => Some(value_cid.clone()),
+                    NamespaceMutation::Delete { .. } => None,
+                })
+                .map(|cid| PublicationIntentRecord {
+                    intent_id: format!(
+                        "{}|{:016x}|proposal|{}|{}",
+                        group, entry.log_id.index, request_hash, cid
+                    ),
+                    namespace_id: namespace_id.clone(),
+                    log_index: entry.log_id.index,
+                    request_id: envelope.request_id.clone(),
+                    cid,
+                    action: PinAction::Protect,
+                    reason: "proposal-input".to_string(),
+                    status: "pending".to_string(),
+                    created_at_unix_seconds: unix_seconds(),
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -809,9 +1003,9 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedStateMachine {
     last_applied_log: Option<LogId<NodeId>>,
-    #[serde(default = "initial_membership_epoch")]
     membership_epoch: u64,
     membership: StoredMembership<NodeId, BasicNode>,
     namespace_state: NamespaceState,
@@ -861,7 +1055,7 @@ impl RedbStateMachineStore {
         let state = read_json_table::<PersistedStateMachine>(&metadata, NAMESPACE_STATE, &group)?
             .unwrap_or(PersistedStateMachine {
                 last_applied_log: None,
-                membership_epoch: initial_membership_epoch(),
+                membership_epoch: INITIAL_MEMBERSHIP_EPOCH,
                 membership: StoredMembership::default(),
                 namespace_state: initial_state,
             });
@@ -1195,12 +1389,24 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         Ok((state.last_applied_log, state.membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ConsensusResponse>, StorageError<NodeId>>
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<ConsensusBatchResponse>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        STATE_APPLY_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+        STATE_APPLY_ENTRIES.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        let queued_at = Instant::now();
         let _guard = self.io_lock.lock().await;
+        STATE_APPLY_QUEUE_MICROS.fetch_add(
+            queued_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        let _execution_timer = ProcessTimer::start(&STATE_APPLY_EXECUTION_MICROS);
         let mut next = self.state.read().await.clone();
         let mut responses = Vec::new();
         let mut publication_intents = Vec::new();
@@ -1209,39 +1415,54 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
             let log_index = entry.log_id.index;
             next.last_applied_log = Some(entry.log_id);
             match entry.payload {
-                EntryPayload::Blank => responses.push(ConsensusResponse::blank()),
+                EntryPayload::Blank => responses.push(ConsensusBatchResponse::blank()),
                 EntryPayload::Membership(membership) => {
                     next.membership_epoch = next.membership_epoch.saturating_add(1);
                     next.membership = StoredMembership::new(Some(entry.log_id), membership);
-                    responses.push(ConsensusResponse::blank());
+                    responses.push(ConsensusBatchResponse::blank());
                 }
                 EntryPayload::Normal(command) => {
-                    let request_id = command.request_id.clone();
                     resolved_log_indexes.push(log_index);
-                    let mut machine = NamespaceStateMachine::new(
-                        self.data_store.clone(),
-                        next.namespace_state.clone(),
-                    )
-                    .map_err(|error| apply_error(&entry.log_id, error))?;
-                    match machine.apply(command).await {
-                        Ok(result) => {
-                            next.namespace_state = machine.state().clone();
-                            publication_intents.extend(result.pin_intents.iter().map(|intent| {
-                                committed_publication_intent(
-                                    &next.namespace_state.namespace_id,
-                                    log_index,
-                                    &request_id,
-                                    intent,
-                                )
-                            }));
-                            responses.push(ConsensusResponse {
-                                result: Some(result),
-                                error_code: None,
-                                error: None,
-                            });
+                    let buffered_store = BufferedConsensusDataStore::new(self.data_store.clone());
+                    let mut command_responses = Vec::with_capacity(command.commands.len());
+                    for command in command.commands {
+                        let request_id = command.request_id.clone();
+                        let mut machine = NamespaceStateMachine::new(
+                            buffered_store.clone(),
+                            next.namespace_state.clone(),
+                        )
+                        .map_err(|error| apply_error(&entry.log_id, error))?;
+                        match machine.apply(command).await {
+                            Ok(result) => {
+                                next.namespace_state = machine.state().clone();
+                                publication_intents.extend(result.pin_intents.iter().map(
+                                    |intent| {
+                                        committed_publication_intent(
+                                            &next.namespace_state.namespace_id,
+                                            log_index,
+                                            &request_id,
+                                            intent,
+                                        )
+                                    },
+                                ));
+                                command_responses.push(ConsensusResponse {
+                                    result: Some(result),
+                                    error_code: None,
+                                    error: None,
+                                });
+                            }
+                            Err(error) => {
+                                command_responses.push(ConsensusResponse::application_error(error))
+                            }
                         }
-                        Err(error) => responses.push(ConsensusResponse::application_error(error)),
                     }
+                    buffered_store
+                        .flush()
+                        .await
+                        .map_err(|error| apply_error(&entry.log_id, error))?;
+                    responses.push(ConsensusBatchResponse {
+                        responses: command_responses,
+                    });
                 }
             }
         }
@@ -1586,6 +1807,132 @@ struct RateBucket {
     count: u64,
 }
 
+struct PendingProposal {
+    command: CommandEnvelope,
+    encoded_bytes: usize,
+    queued_at: Instant,
+    response: oneshot::Sender<Result<ConsensusResponse, String>>,
+}
+
+#[derive(Clone)]
+struct ProposalBatcher {
+    sender: mpsc::Sender<PendingProposal>,
+}
+
+impl ProposalBatcher {
+    fn spawn(raft: NamespaceRaft, max_command_bytes: u64) -> Self {
+        let (sender, receiver) = mpsc::channel(PROPOSAL_BATCH_CHANNEL_CAPACITY);
+        tokio::spawn(run_proposal_batcher(raft, max_command_bytes, receiver));
+        Self { sender }
+    }
+
+    async fn submit(
+        &self,
+        command: CommandEnvelope,
+        encoded_bytes: usize,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(PendingProposal {
+                command,
+                encoded_bytes,
+                queued_at: Instant::now(),
+                response,
+            })
+            .await
+            .map_err(|_| ConsensusError::Raft("namespace proposal batcher stopped".to_string()))?;
+        result
+            .await
+            .map_err(|_| ConsensusError::Raft("namespace proposal response dropped".to_string()))?
+            .map_err(ConsensusError::Raft)
+    }
+}
+
+async fn run_proposal_batcher(
+    raft: NamespaceRaft,
+    max_command_bytes: u64,
+    mut receiver: mpsc::Receiver<PendingProposal>,
+) {
+    let mut carry = None;
+    loop {
+        let first = match carry.take() {
+            Some(request) => request,
+            None => match receiver.recv().await {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let mut encoded_bytes = first.encoded_bytes.saturating_add(32);
+        let mut requests = vec![first];
+        let deadline = tokio::time::Instant::now() + PROPOSAL_BATCH_MAX_DELAY;
+        while requests.len() < PROPOSAL_BATCH_MAX_COMMANDS {
+            let next = match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(Some(request)) => request,
+                Ok(None) | Err(_) => break,
+            };
+            let next_bytes = encoded_bytes
+                .saturating_add(next.encoded_bytes)
+                .saturating_add(1);
+            if next_bytes as u64 > max_command_bytes {
+                carry = Some(next);
+                break;
+            }
+            encoded_bytes = next_bytes;
+            requests.push(next);
+        }
+
+        let request_count = requests.len() as u64;
+        PROPOSAL_REQUESTS.fetch_add(request_count, Ordering::Relaxed);
+        PROPOSAL_BATCHES.fetch_add(1, Ordering::Relaxed);
+        PROPOSAL_BATCH_SIZE_MAX.fetch_max(request_count, Ordering::Relaxed);
+        let submitted_at = Instant::now();
+        for request in &requests {
+            PROPOSAL_QUEUE_MICROS.fetch_add(
+                request
+                    .queued_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        let payload = ConsensusCommandBatch {
+            commands: requests
+                .iter()
+                .map(|request| request.command.clone())
+                .collect(),
+        };
+        let result = raft.client_write(payload).await;
+        PROPOSAL_EXECUTION_MICROS.fetch_add(
+            submitted_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        match result {
+            Ok(response) if response.data.responses.len() == requests.len() => {
+                for (request, response) in requests.into_iter().zip(response.data.responses) {
+                    let _ = request.response.send(Ok(response));
+                }
+            }
+            Ok(response) => {
+                let error = format!(
+                    "namespace proposal batch response count mismatch: expected {}, got {}",
+                    requests.len(),
+                    response.data.responses.len()
+                );
+                for request in requests {
+                    let _ = request.response.send(Err(error.clone()));
+                }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                for request in requests {
+                    let _ = request.response.send(Err(error.clone()));
+                }
+            }
+        }
+    }
+}
+
 pub struct GroupHandle {
     pub namespace_id: NamespaceId,
     pub raft: NamespaceRaft,
@@ -1593,6 +1940,35 @@ pub struct GroupHandle {
     pub state_machine: RedbStateMachineStore,
     membership_epoch: Arc<AtomicU64>,
     rate: Mutex<RateBucket>,
+    initialize_lock: Mutex<()>,
+    linearizable_arrivals: AtomicU64,
+    linearizable_covered: AtomicU64,
+    linearizable_lock: Mutex<()>,
+    last_known_leader: RwLock<Option<(NodeId, u64)>>,
+    proposal_batcher: ProposalBatcher,
+}
+
+fn project_namespace_state(
+    state: NamespaceState,
+    projection: proto::NamespaceStateProjection,
+) -> NamespaceState {
+    if projection == proto::NamespaceStateProjection::Head {
+        return state.into_head_projection();
+    }
+    state
+}
+
+fn leader_read_lease_current(
+    local_node: NodeId,
+    current_leader: Option<NodeId>,
+    millis_since_quorum_ack: Option<u64>,
+    heartbeat_interval_ms: u64,
+    last_applied_index: Option<u64>,
+    last_log_index: Option<u64>,
+) -> bool {
+    current_leader == Some(local_node)
+        && millis_since_quorum_ack.is_some_and(|millis| millis <= heartbeat_interval_ms)
+        && last_applied_index >= last_log_index
 }
 
 impl GroupHandle {
@@ -1600,8 +1976,68 @@ impl GroupHandle {
         self.state_machine.namespace_state().await
     }
 
+    pub async fn durability_replicas(&self) -> u16 {
+        self.state_machine
+            .state
+            .read()
+            .await
+            .namespace_state
+            .descriptor
+            .durability
+            .replicas
+    }
+
+    async fn applied_log_id(&self) -> Option<LogId<NodeId>> {
+        self.state_machine.state.read().await.last_applied_log
+    }
+
+    async fn wait_for_applied_index(&self, target: u64, timeout: Duration) -> bool {
+        let mut metrics = self.raft.metrics();
+        tokio::time::timeout(timeout, async {
+            loop {
+                if metrics
+                    .borrow()
+                    .last_applied
+                    .is_some_and(|log_id| log_id.index >= target)
+                {
+                    return true;
+                }
+                if metrics.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     pub fn membership_epoch(&self) -> u64 {
         self.membership_epoch.load(Ordering::Acquire)
+    }
+
+    /// Confirm leadership once for every overlapping batch of linearizable
+    /// reads. OpenRaft implements this as an empty AppendEntries round to the
+    /// voters. Without single-flight coalescing, concurrent S3 GET/HEAD/PUT
+    /// requests each start their own quorum round and can exhaust the QUIC
+    /// stream budget that Raft heartbeats also need.
+    pub async fn ensure_linearizable(&self) -> Result<(), ConsensusError> {
+        let arrival = self.linearizable_arrivals.fetch_add(1, Ordering::AcqRel) + 1;
+        let _guard = self.linearizable_lock.lock().await;
+        if self.linearizable_covered.load(Ordering::Acquire) >= arrival {
+            return Ok(());
+        }
+        // Give concurrently arriving reads a small window to join this quorum
+        // confirmation. The arrival watermark is captured after the window, so
+        // a request that begins after the proof starts can never reuse it.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let cover_through = self.linearizable_arrivals.load(Ordering::Acquire);
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        self.linearizable_covered
+            .store(cover_through, Ordering::Release);
+        Ok(())
     }
 
     pub async fn voter_identities(&self) -> Vec<String> {
@@ -1884,6 +2320,7 @@ impl NamespaceGroupManager {
             created_at_unix_seconds: unix_seconds(),
         };
         write_json_table(&self.metadata, NAMESPACE_GROUPS, &group, &metadata)?;
+        let proposal_batcher = ProposalBatcher::spawn(raft.clone(), self.config.max_command_bytes);
         let handle = Arc::new(GroupHandle {
             namespace_id: state.namespace_id,
             raft,
@@ -1894,6 +2331,12 @@ impl NamespaceGroupManager {
                 second: 0,
                 count: 0,
             }),
+            initialize_lock: Mutex::new(()),
+            linearizable_arrivals: AtomicU64::new(0),
+            linearizable_covered: AtomicU64::new(0),
+            linearizable_lock: Mutex::new(()),
+            last_known_leader: RwLock::new(None),
+            proposal_batcher,
         });
         if restore_started.elapsed().as_millis()
             > u128::from(self.config.checkpoint_restore_target_ms)
@@ -1957,11 +2400,7 @@ impl NamespaceGroupManager {
             ));
         }
         let group = self.group(namespace_id).await?;
-        group
-            .raft
-            .ensure_linearizable()
-            .await
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        group.ensure_linearizable().await?;
         let key = namespace_id.to_string();
         let mut metadata =
             read_json_table::<GroupMetadata>(&self.metadata, NAMESPACE_GROUPS, &key)?
@@ -2053,7 +2492,7 @@ impl NamespaceGroupManager {
         let group = state.namespace_id.to_string();
         let previous_epoch =
             read_json_table::<PersistedStateMachine>(&self.metadata, NAMESPACE_STATE, &group)?
-                .map_or(initial_membership_epoch(), |stored| stored.membership_epoch);
+                .map_or(INITIAL_MEMBERSHIP_EPOCH, |stored| stored.membership_epoch);
         let new_epoch = previous_epoch.saturating_add(1);
         clear_consensus_group(&self.metadata, &group)?;
         let persisted = PersistedStateMachine {
@@ -2098,6 +2537,7 @@ impl NamespaceGroupManager {
         members: BTreeMap<NodeId, BasicNode>,
     ) -> Result<(), ConsensusError> {
         let group = self.group(namespace_id).await?;
+        let _initialize_guard = group.initialize_lock.lock().await;
         let metadata = read_json_table::<GroupMetadata>(
             &self.metadata,
             NAMESPACE_GROUPS,
@@ -2109,6 +2549,23 @@ impl NamespaceGroupManager {
             return Err(ConsensusError::InvalidConfig(
                 "initial Raft membership does not match the namespace descriptor".to_string(),
             ));
+        }
+        let existing = {
+            let state = group.state_machine.state.read().await;
+            state
+                .membership
+                .nodes()
+                .map(|(node_id, node)| (*node_id, node.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        if !existing.is_empty() {
+            return if existing == members {
+                Ok(())
+            } else {
+                Err(ConsensusError::InvalidConfig(
+                    "namespace is already initialized with different members".to_string(),
+                ))
+            };
         }
         group
             .raft
@@ -2122,6 +2579,13 @@ impl NamespaceGroupManager {
         namespace_id: &NamespaceId,
     ) -> Result<NamespaceState, ConsensusError> {
         self.routed_linearizable_namespace_state(namespace_id).await
+    }
+
+    pub async fn linearizable_namespace_head(
+        &self,
+        namespace_id: &NamespaceId,
+    ) -> Result<NamespaceState, ConsensusError> {
+        self.routed_linearizable_namespace_head(namespace_id).await
     }
 
     pub async fn command_metrics(&self) -> Vec<ConsensusCommandMetric> {
@@ -2143,6 +2607,37 @@ impl NamespaceGroupManager {
         namespace_id: &NamespaceId,
         command: CommandEnvelope,
     ) -> Result<NamespaceClientWriteResponse, ConsensusError> {
+        let (group, _) = self.admit_write(namespace_id, &command).await?;
+        let response = group
+            .raft
+            .client_write(ConsensusCommandBatch {
+                commands: vec![command],
+            })
+            .await
+            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        self.maybe_checkpoint(&group).await?;
+        Ok(response)
+    }
+
+    async fn batched_client_write(
+        &self,
+        namespace_id: &NamespaceId,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        let (group, encoded_bytes) = self.admit_write(namespace_id, &command).await?;
+        let response = group
+            .proposal_batcher
+            .submit(command, encoded_bytes)
+            .await?;
+        self.maybe_checkpoint(&group).await?;
+        Ok(response)
+    }
+
+    async fn admit_write(
+        &self,
+        namespace_id: &NamespaceId,
+        command: &CommandEnvelope,
+    ) -> Result<(Arc<GroupHandle>, usize), ConsensusError> {
         let command_bytes = serde_json::to_vec(&command)
             .map_err(|error| ConsensusError::Serde(error.to_string()))?;
         let command_class = match &command.command {
@@ -2178,11 +2673,10 @@ impl NamespaceGroupManager {
             }
             rate.count += 1;
         }
-        let response = group
-            .raft
-            .client_write(command)
-            .await
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        Ok((group, command_bytes.len()))
+    }
+
+    async fn maybe_checkpoint(&self, group: &GroupHandle) -> Result<(), ConsensusError> {
         if group
             .log_store
             .log_bytes()
@@ -2191,7 +2685,7 @@ impl NamespaceGroupManager {
         {
             let _ = group.raft.trigger().snapshot().await;
         }
-        Ok(response)
+        Ok(())
     }
 
     pub async fn select_replica_set(
@@ -2284,15 +2778,32 @@ impl NamespaceGroupManager {
         &self,
         namespace_id: &NamespaceId,
     ) -> Result<NamespaceState, ConsensusError> {
+        self.routed_linearizable_namespace_state_projection(
+            namespace_id,
+            proto::NamespaceStateProjection::Full,
+        )
+        .await
+    }
+
+    pub async fn routed_linearizable_namespace_head(
+        &self,
+        namespace_id: &NamespaceId,
+    ) -> Result<NamespaceState, ConsensusError> {
+        self.routed_linearizable_namespace_state_projection(
+            namespace_id,
+            proto::NamespaceStateProjection::Head,
+        )
+        .await
+    }
+
+    async fn routed_linearizable_namespace_state_projection(
+        &self,
+        namespace_id: &NamespaceId,
+        projection: proto::NamespaceStateProjection,
+    ) -> Result<NamespaceState, ConsensusError> {
         if let Ok(group) = self.group(namespace_id).await {
-            let metrics = group.raft.metrics().borrow().clone();
-            if metrics.current_leader == Some(self.node_id) {
-                group
-                    .raft
-                    .ensure_linearizable()
-                    .await
-                    .map_err(|error| ConsensusError::Raft(error.to_string()))?;
-                return Ok(group.namespace_state().await);
+            if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+                return Ok(project_namespace_state(state, projection));
             }
         }
         let network = self.network.as_ref().ok_or_else(|| {
@@ -2301,12 +2812,30 @@ impl NamespaceGroupManager {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(group) = self.group(namespace_id).await {
-                let metrics = group.raft.metrics().borrow().clone();
-                if metrics.current_leader == Some(self.node_id)
-                    && group.raft.ensure_linearizable().await.is_ok()
-                {
-                    return Ok(group.namespace_state().await);
+                if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+                    return Ok(project_namespace_state(state, projection));
                 }
+                if let Some(state) = self
+                    .namespace_state_from_local_leader(network, namespace_id, &group, projection)
+                    .await
+                {
+                    return Ok(state);
+                }
+            }
+
+            let cached_candidates = self
+                .discovery_records(&namespace_id.to_string())
+                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+            if let Some(state) = self
+                .namespace_state_from_candidates(
+                    network,
+                    namespace_id,
+                    cached_candidates,
+                    projection,
+                )
+                .await
+            {
+                return Ok(state);
             }
 
             let peers = network.peers().await;
@@ -2341,63 +2870,19 @@ impl NamespaceGroupManager {
                     }
                 }
             }
-            candidates.sort_by(|left, right| {
-                right
-                    .membership_epoch
-                    .cmp(&left.membership_epoch)
-                    .then_with(|| right.leader_term.cmp(&left.leader_term))
-            });
-            candidates.dedup_by(|left, right| {
-                left.membership_epoch == right.membership_epoch
-                    && left.leader_node_id == right.leader_node_id
-            });
-
             // An election may complete while discovery is in flight. Check the
             // local group again before routing to remote candidates.
             if let Ok(group) = self.group(namespace_id).await {
-                let metrics = group.raft.metrics().borrow().clone();
-                if metrics.current_leader == Some(self.node_id)
-                    && group.raft.ensure_linearizable().await.is_ok()
-                {
-                    return Ok(group.namespace_state().await);
+                if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+                    return Ok(project_namespace_state(state, projection));
                 }
             }
 
-            let mut reads = tokio::task::JoinSet::new();
-            for record in candidates.into_iter().take(3) {
-                if record.leader_node_id == self.node_identity {
-                    continue;
-                }
-                let Some(peer) = network.peer_address(&record.leader_node_id).await else {
-                    continue;
-                };
-                let network = network.clone();
-                let request = proto::NamespaceStateRequest {
-                    context: Some(proto::NamespaceRpcContext {
-                        namespace_id: namespace_id.to_string(),
-                        namespace_protocol_version: 1,
-                        membership_epoch: record.membership_epoch,
-                        term: record.leader_term,
-                        sender_identity: self.node_identity.clone(),
-                        request_id: String::new(),
-                    }),
-                };
-                reads.spawn(async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(2),
-                        network.namespace_state(peer, request),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                });
-            }
-            while let Some(result) = reads.join_next().await {
-                if let Ok(Some(response)) = result
-                    && let Ok(state) = serde_json::from_slice(&response.state_json)
-                {
-                    return Ok(state);
-                }
+            if let Some(state) = self
+                .namespace_state_from_candidates(network, namespace_id, candidates, projection)
+                .await
+            {
+                return Ok(state);
             }
 
             if tokio::time::Instant::now() >= deadline || peers.is_empty() {
@@ -2410,42 +2895,133 @@ impl NamespaceGroupManager {
         ))
     }
 
-    pub async fn routed_write(
+    async fn linearizable_local_namespace_state(
         &self,
+        group: &GroupHandle,
+    ) -> Option<NamespaceState> {
+        let metrics = group.raft.metrics().borrow().clone();
+        let leader = if let Some(leader) = metrics.current_leader {
+            *group.last_known_leader.write().await = Some((leader, metrics.current_term));
+            leader
+        } else {
+            group
+                .last_known_leader
+                .read()
+                .await
+                .filter(|(_, term)| *term == metrics.current_term)
+                .map(|(leader, _)| leader)?
+        };
+        if leader != self.node_id {
+            return None;
+        }
+        // A quorum acknowledgement resets the election timer on enough voters
+        // that another leader cannot be elected before the minimum election
+        // timeout. Reuse only the much shorter heartbeat interval, and only
+        // when this leader has applied its complete local log. This preserves
+        // linearizability while removing a quorum RPC from the common read.
+        let lease_current = leader_read_lease_current(
+            self.node_id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+            self.config.heartbeat_interval_ms,
+            metrics.last_applied.map(|log| log.index),
+            metrics.last_log_index,
+        );
+        if lease_current {
+            LINEARIZABLE_READ_LEASE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(group.namespace_state().await);
+        }
+        LINEARIZABLE_READ_PROOFS.fetch_add(1, Ordering::Relaxed);
+        if group.ensure_linearizable().await.is_err() {
+            return None;
+        }
+        let confirmed = group.raft.metrics().borrow().clone();
+        if confirmed.current_leader != Some(self.node_id)
+            || confirmed.current_term != metrics.current_term
+        {
+            return None;
+        }
+        *group.last_known_leader.write().await = Some((self.node_id, confirmed.current_term));
+        Some(group.namespace_state().await)
+    }
+
+    async fn namespace_state_from_local_leader(
+        &self,
+        network: &NetworkHandle,
         namespace_id: &NamespaceId,
-        command: CommandEnvelope,
-    ) -> Result<ConsensusResponse, ConsensusError> {
-        if let Ok(group) = self.group(namespace_id).await {
-            let metrics = group.raft.metrics().borrow().clone();
-            if metrics.current_leader == Some(self.node_id) {
-                return self
-                    .client_write(namespace_id, command)
-                    .await
-                    .map(|response| response.data);
-            }
+        group: &GroupHandle,
+        projection: proto::NamespaceStateProjection,
+    ) -> Option<NamespaceState> {
+        let metrics = group.raft.metrics().borrow().clone();
+        let leader = if let Some(leader) = metrics.current_leader {
+            *group.last_known_leader.write().await = Some((leader, metrics.current_term));
+            leader
+        } else {
+            group
+                .last_known_leader
+                .read()
+                .await
+                .filter(|(_, term)| *term == metrics.current_term)
+                .map(|(leader, _)| leader)?
+        };
+        if leader == self.node_id {
+            return None;
         }
-        let network = self.network.as_ref().ok_or_else(|| {
-            ConsensusError::Raft("networked namespace routing is disabled".to_string())
-        })?;
-        let mut candidates = self
-            .discovery_records(&namespace_id.to_string())
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
-        for peer in network.peers().await {
-            for address in peer.addresses {
-                let Ok(address) = address.parse::<SocketAddr>() else {
-                    continue;
-                };
-                if let Ok(records) = network
-                    .namespace_discover(address, namespace_id.to_string())
-                    .await
-                {
-                    for record in records {
-                        let _ = self.persist_discovery_record(record.clone());
-                        candidates.push(record);
-                    }
-                }
-            }
+        let state = group.state_machine.state.read().await;
+        let leader_identity = state
+            .membership
+            .nodes()
+            .find(|(node_id, _)| **node_id == leader)
+            .map(|(_, node)| node.addr.clone())
+            .or_else(|| {
+                state
+                    .namespace_state
+                    .descriptor
+                    .initial_replica_set
+                    .iter()
+                    .find(|identity| raft_node_id(identity) == leader)
+                    .cloned()
+            })?;
+        drop(state);
+        let peer = network.peer_address(&leader_identity).await?;
+        let request = proto::NamespaceStateRequest {
+            context: Some(proto::NamespaceRpcContext {
+                namespace_id: namespace_id.to_string(),
+                namespace_protocol_version: 1,
+                membership_epoch: group.membership_epoch(),
+                term: metrics.current_term,
+                sender_identity: self.node_identity.clone(),
+                request_id: String::new(),
+            }),
+            projection: proto::NamespaceStateProjection::AppliedIndex as i32,
+        };
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            network.namespace_state(peer, request),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if response.has_applied_index
+            && group
+                .wait_for_applied_index(response.applied_index, Duration::from_secs(2))
+                .await
+        {
+            return Some(project_namespace_state(
+                group.namespace_state().await,
+                projection,
+            ));
         }
+        None
+    }
+
+    async fn namespace_state_from_candidates(
+        &self,
+        network: &NetworkHandle,
+        namespace_id: &NamespaceId,
+        mut candidates: Vec<proto::NamespaceDiscoveryRecord>,
+        projection: proto::NamespaceStateProjection,
+    ) -> Option<NamespaceState> {
         candidates.sort_by(|left, right| {
             right
                 .membership_epoch
@@ -2456,14 +3032,15 @@ impl NamespaceGroupManager {
             left.membership_epoch == right.membership_epoch
                 && left.leader_node_id == right.leader_node_id
         });
+
         for record in candidates.into_iter().take(3) {
-            if record.leader_node_id.is_empty() {
+            if record.leader_node_id.is_empty() || record.leader_node_id == self.node_identity {
                 continue;
             }
             let Some(peer) = network.peer_address(&record.leader_node_id).await else {
                 continue;
             };
-            let request = proto::NamespaceForwardRequest {
+            let request = proto::NamespaceStateRequest {
                 context: Some(proto::NamespaceRpcContext {
                     namespace_id: namespace_id.to_string(),
                     namespace_protocol_version: 1,
@@ -2472,14 +3049,132 @@ impl NamespaceGroupManager {
                     sender_identity: self.node_identity.clone(),
                     request_id: String::new(),
                 }),
-                command_json: serde_json::to_vec(&command)
-                    .map_err(|error| ConsensusError::Serde(error.to_string()))?,
+                projection: projection as i32,
             };
-            if let Ok(response) = network.namespace_forward(peer, request).await
-                && let Ok(result) = serde_json::from_slice(&response.response_json)
+            if let Some(response) = tokio::time::timeout(
+                Duration::from_millis(500),
+                network.namespace_state(peer, request),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+                && let Ok(state) = serde_json::from_slice(&response.state_json)
             {
-                return Ok(result);
+                return Some(state);
             }
+        }
+        None
+    }
+
+    pub async fn routed_write(
+        &self,
+        namespace_id: &NamespaceId,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        if let Ok(group) = self.group(namespace_id).await {
+            let metrics = group.raft.metrics().borrow().clone();
+            if metrics.current_leader == Some(self.node_id) {
+                return self.batched_client_write(namespace_id, command).await;
+            }
+        }
+        let network = self.network.as_ref().ok_or_else(|| {
+            ConsensusError::Raft("networked namespace routing is disabled".to_string())
+        })?;
+        let command_json = serde_json::to_vec(&command)
+            .map_err(|error| ConsensusError::Serde(error.to_string()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(group) = self.group(namespace_id).await {
+                let metrics = group.raft.metrics().borrow().clone();
+                if metrics.current_leader == Some(self.node_id) {
+                    return self
+                        .batched_client_write(namespace_id, command.clone())
+                        .await;
+                }
+            }
+            let peers = network.peers().await;
+            let mut discoveries = tokio::task::JoinSet::new();
+            for peer in &peers {
+                for address in &peer.addresses {
+                    let Ok(address) = address.parse::<SocketAddr>() else {
+                        continue;
+                    };
+                    let network = network.clone();
+                    let namespace_id = namespace_id.to_string();
+                    discoveries.spawn(async move {
+                        tokio::time::timeout(
+                            Duration::from_secs(1),
+                            network.namespace_discover(address, namespace_id),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    });
+                }
+            }
+            let mut candidates = self
+                .discovery_records(&namespace_id.to_string())
+                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+            while let Some(result) = discoveries.join_next().await {
+                if let Ok(Some(records)) = result {
+                    for record in records {
+                        let _ = self.persist_discovery_record(record.clone());
+                        candidates.push(record);
+                    }
+                }
+            }
+            candidates.sort_by(|left, right| {
+                right
+                    .membership_epoch
+                    .cmp(&left.membership_epoch)
+                    .then_with(|| right.leader_term.cmp(&left.leader_term))
+            });
+            candidates.dedup_by(|left, right| {
+                left.membership_epoch == right.membership_epoch
+                    && left.leader_node_id == right.leader_node_id
+            });
+
+            let mut forwards = tokio::task::JoinSet::new();
+            for record in candidates.into_iter().take(3) {
+                if record.leader_node_id.is_empty() || record.leader_node_id == self.node_identity {
+                    continue;
+                }
+                let Some(peer) = network.peer_address(&record.leader_node_id).await else {
+                    continue;
+                };
+                let network = network.clone();
+                let request = proto::NamespaceForwardRequest {
+                    context: Some(proto::NamespaceRpcContext {
+                        namespace_id: namespace_id.to_string(),
+                        namespace_protocol_version: 1,
+                        membership_epoch: record.membership_epoch,
+                        term: record.leader_term,
+                        sender_identity: self.node_identity.clone(),
+                        request_id: String::new(),
+                    }),
+                    command_json: command_json.clone(),
+                };
+                forwards.spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        network.namespace_forward(peer, request),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                });
+            }
+            while let Some(result) = forwards.join_next().await {
+                if let Ok(Some(response)) = result
+                    && let Ok(result) = serde_json::from_slice(&response.response_json)
+                {
+                    return Ok(result);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline || peers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(ConsensusError::Raft(
             "namespace leader unavailable after bounded rediscovery".to_string(),
@@ -3023,7 +3718,7 @@ impl NetworkNamespaceService for NamespaceGroupManager {
         let command: CommandEnvelope =
             serde_json::from_slice(&request.command_json).map_err(namespace_network_error)?;
         let response = self
-            .client_write(&group.namespace_id, command)
+            .batched_client_write(&group.namespace_id, command)
             .await
             .map_err(namespace_network_error)?;
         let metrics = group.raft.metrics().borrow().clone();
@@ -3043,7 +3738,7 @@ impl NetworkNamespaceService for NamespaceGroupManager {
             })
         });
         Ok(proto::NamespaceForwardResponse {
-            response_json: serde_json::to_vec(&response.data).map_err(namespace_network_error)?,
+            response_json: serde_json::to_vec(&response).map_err(namespace_network_error)?,
             leader_node_id: leader_node_id.unwrap_or_default(),
             leader_term: metrics.current_term,
         })
@@ -3062,17 +3757,33 @@ impl NetworkNamespaceService for NamespaceGroupManager {
             .as_ref()
             .ok_or_else(|| namespace_network_error("missing state context"))?;
         let metrics = group.raft.metrics().borrow().clone();
-        if metrics.current_leader != Some(self.node_id) || metrics.current_term != context.term {
+        if metrics.current_term != context.term {
             return Err(namespace_network_error("stale namespace leader hint"));
         }
-        group
-            .raft
-            .ensure_linearizable()
+        if self
+            .linearizable_local_namespace_state(&group)
             .await
-            .map_err(namespace_network_error)?;
+            .is_none()
+        {
+            return Err(namespace_network_error("stale namespace leader hint"));
+        }
+        let applied = group.applied_log_id().await;
+        let projection = proto::NamespaceStateProjection::try_from(request.projection)
+            .map_err(|_| namespace_network_error("invalid namespace state projection"))?;
+        if projection == proto::NamespaceStateProjection::AppliedIndex {
+            return Ok(proto::NamespaceStateResponse {
+                state_json: Vec::new(),
+                applied_index: applied.map_or(0, |log_id| log_id.index),
+                applied_term: applied.map_or(0, |log_id| log_id.leader_id.term),
+                has_applied_index: applied.is_some(),
+            });
+        }
+        let state = project_namespace_state(group.namespace_state().await, projection);
         Ok(proto::NamespaceStateResponse {
-            state_json: serde_json::to_vec(&group.namespace_state().await)
-                .map_err(namespace_network_error)?,
+            state_json: serde_json::to_vec(&state).map_err(namespace_network_error)?,
+            applied_index: applied.map_or(0, |log_id| log_id.index),
+            applied_term: applied.map_or(0, |log_id| log_id.leader_id.term),
+            has_applied_index: applied.is_some(),
         })
     }
 
@@ -3334,6 +4045,42 @@ mod tests {
     use pepper_types::{CODEC_RAW, PutBlockResponse};
     use std::time::Duration;
 
+    #[test]
+    fn leader_read_lease_requires_current_leader_quorum_and_complete_apply() {
+        assert!(leader_read_lease_current(
+            7,
+            Some(7),
+            Some(100),
+            100,
+            Some(42),
+            Some(42),
+        ));
+        assert!(!leader_read_lease_current(
+            7,
+            Some(8),
+            Some(1),
+            100,
+            Some(42),
+            Some(42),
+        ));
+        assert!(!leader_read_lease_current(
+            7,
+            Some(7),
+            Some(101),
+            100,
+            Some(42),
+            Some(42),
+        ));
+        assert!(!leader_read_lease_current(
+            7,
+            Some(7),
+            Some(1),
+            100,
+            Some(41),
+            Some(42),
+        ));
+    }
+
     #[derive(Clone)]
     struct TestBlockService(Arc<BlockStore>);
 
@@ -3535,6 +4282,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn consensus_command_uses_uniform_batch_wire_shape() {
+        let store = ConsensusDataStore::new(MemoryDataBackend::default());
+        let state = create_namespace(
+            &store,
+            descriptor(1),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap()
+        .state;
+        let command = put_command(&state, "canonical-wire-shape", "key");
+        let payload = ConsensusCommandBatch {
+            commands: vec![command.clone()],
+        };
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(encoded["commands"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<ConsensusCommandBatch>(encoded).unwrap(),
+            payload
+        );
+    }
+
     async fn wait_for_leader(nodes: &[&TestNode]) -> NodeId {
         for _ in 0..100 {
             for node in nodes {
@@ -3688,7 +4459,7 @@ mod tests {
             .client_write(&namespace_id, put_command(&state, "request-1", "alpha"))
             .await
             .unwrap();
-        assert!(response.data.result.is_some());
+        assert!(response.data.responses[0].result.is_some());
         let command_metrics = leader.manager.command_metrics().await;
         assert_eq!(command_metrics.len(), 1);
         assert_eq!(command_metrics[0].command_class, "apply_transaction");
@@ -3998,7 +4769,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-    #[ignore = "manual legacy removal gate; system replacement is RAFT-004"]
+    #[ignore = "manual topology replacement gate; system replacement is RAFT-004"]
     async fn learner_replacement_catches_up_during_writes_and_promotes_safely() {
         let a = network_test_node("replace-a").await;
         let b = network_test_node("replace-b").await;

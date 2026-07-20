@@ -9,9 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 
-const BUCKET_OBJECT_TYPE: &str = "pepper.bucket_object";
-const FORMAT_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, Copy)]
 pub struct BucketLimits {
     pub max_descriptor_bytes: usize,
@@ -36,14 +33,12 @@ impl Default for BucketLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BucketObjectDescriptor {
-    #[serde(rename = "type")]
-    pub descriptor_type: String,
-    pub version: u32,
     pub content_cid: Option<Cid>,
     pub logical_size: u64,
     pub content_type: String,
     pub metadata: BTreeMap<String, String>,
     pub creation_revision: u64,
+    pub committed_at_unix_seconds: i64,
     pub integrity_id: String,
     pub previous_version_cid: Option<Cid>,
     pub tombstone: bool,
@@ -56,32 +51,35 @@ impl BucketObjectDescriptor {
         content_type: impl Into<String>,
         metadata: BTreeMap<String, String>,
         creation_revision: u64,
+        committed_at_unix_seconds: i64,
         previous_version_cid: Option<Cid>,
     ) -> Self {
         let integrity_id = content_cid.to_string();
         Self {
-            descriptor_type: BUCKET_OBJECT_TYPE.to_string(),
-            version: FORMAT_VERSION,
             content_cid: Some(content_cid),
             logical_size,
             content_type: content_type.into(),
             metadata,
             creation_revision,
+            committed_at_unix_seconds,
             integrity_id,
             previous_version_cid,
             tombstone: false,
         }
     }
 
-    pub fn tombstone(creation_revision: u64, previous_version_cid: Option<Cid>) -> Self {
+    pub fn tombstone(
+        creation_revision: u64,
+        committed_at_unix_seconds: i64,
+        previous_version_cid: Option<Cid>,
+    ) -> Self {
         Self {
-            descriptor_type: BUCKET_OBJECT_TYPE.to_string(),
-            version: FORMAT_VERSION,
             content_cid: None,
             logical_size: 0,
             content_type: "application/x.pepper-tombstone".to_string(),
             metadata: BTreeMap::new(),
             creation_revision,
+            committed_at_unix_seconds,
             integrity_id: "tombstone".to_string(),
             previous_version_cid,
             tombstone: true,
@@ -89,11 +87,6 @@ impl BucketObjectDescriptor {
     }
 
     pub fn validate(&self, limits: BucketLimits) -> Result<(), BucketError> {
-        if self.descriptor_type != BUCKET_OBJECT_TYPE || self.version != FORMAT_VERSION {
-            return Err(BucketError::InvalidDescriptor(
-                "unsupported type or version".into(),
-            ));
-        }
         if self.content_type.is_empty() || self.content_type.len() > limits.max_content_type_bytes {
             return Err(BucketError::InvalidDescriptor(
                 "invalid content type".into(),
@@ -306,6 +299,7 @@ mod tests {
             "text/plain",
             BTreeMap::new(),
             1,
+            1_700_000_001,
             None,
         );
         let first_cid = put_descriptor(&store, &first, BucketLimits::default())
@@ -317,6 +311,7 @@ mod tests {
             "text/plain",
             BTreeMap::new(),
             2,
+            1_700_000_002,
             Some(first_cid.clone()),
         );
         let second_cid = put_descriptor(&store, &second, BucketLimits::default())
@@ -324,7 +319,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             second_cid.to_string(),
-            "cid://pepper-v1:0xb:b3:3f75987f9e835b8aefbc64cf9e0600267de3ebc394df0de5d53dadbabeaea273"
+            "cid://pepper-v1:0xb:b3:1883b3d2b6990f91445cd4e347d3c043d70cb5a7c9fcf14e56e3736a2fde1e08"
         );
         let history = versions(&store, &second_cid, BucketLimits::default())
             .await

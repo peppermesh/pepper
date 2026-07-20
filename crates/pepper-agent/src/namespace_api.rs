@@ -5,9 +5,9 @@
 use super::*;
 use pepper_merkle::{MerkleLimits, ScanQuery};
 use pepper_namespace::{
-    CommandEnvelope, CommandResponse, KeyPrecondition, NamespaceCommand, NamespaceDescriptor,
-    NamespaceId, NamespaceKind, NamespaceLimits, NamespaceMutation, NamespaceState,
-    TransactionCommand, create_namespace, load_checkpoint,
+    CommandEnvelope, CommandResponse, CreatedNamespace, KeyPrecondition, NamespaceCommand,
+    NamespaceDescriptor, NamespaceId, NamespaceKind, NamespaceLimits, NamespaceMutation,
+    NamespaceState, TransactionCommand, create_namespace, load_checkpoint,
 };
 use pepper_publication::{
     DurabilityBackend, PublicationCoordinator, PublicationError, PublicationRequest, ReadLease,
@@ -226,33 +226,6 @@ pub(super) fn namespace_alias(state: &AppState, value: &str) -> Result<Namespace
     NamespaceId::new(cid).map_err(namespace_error)
 }
 
-pub(super) fn namespace_aliases(state: &AppState) -> Result<Vec<(String, NamespaceId)>, ApiError> {
-    let read = state
-        .metadata
-        .database()
-        .begin_read()
-        .map_err(ApiError::redb_transaction)?;
-    let table = match read.open_table(NAMESPACE_ALIASES) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(ApiError::redb_table(error)),
-    };
-    let mut aliases = Vec::new();
-    for entry in table.iter().map_err(ApiError::redb_storage)? {
-        let (alias, namespace) = entry.map_err(ApiError::redb_storage)?;
-        let cid = namespace
-            .value()
-            .parse::<Cid>()
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        aliases.push((
-            alias.value().to_string(),
-            NamespaceId::new(cid).map_err(namespace_error)?,
-        ));
-    }
-    aliases.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(aliases)
-}
-
 pub(super) fn persist_alias(
     state: &AppState,
     alias: &str,
@@ -287,44 +260,48 @@ pub(super) fn persist_alias(
     write.commit().map_err(ApiError::redb_commit)
 }
 
-pub(super) async fn namespace_create(
-    State(state): State<AppState>,
-    Json(request): Json<CreateNamespaceRequest>,
-) -> Result<Json<CreateNamespaceResponse>, ApiError> {
-    let manager = namespace_manager(&state)?;
-    let seed = Cid::new(
-        CODEC_RAW,
-        format!(
-            "{}:{}:{}",
-            state.status.node_id,
-            request.request_id.as_deref().unwrap_or("create"),
-            unix_seconds()
-        )
-        .as_bytes(),
-    );
-    let replicas = manager
-        .select_replica_set(&seed, state.namespace_log_bytes)
-        .await
-        .map_err(consensus_error)?;
+pub(super) fn cache_alias(
+    state: &AppState,
+    alias: &str,
+    namespace_id: &NamespaceId,
+) -> Result<(), ApiError> {
+    if alias.is_empty() || alias.len() > 256 {
+        return Err(ApiError::bad_request("alias must contain 1 to 256 bytes"));
+    }
+    match namespace_alias(state, alias) {
+        Ok(existing) if existing == *namespace_id => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.code == ErrorCode::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let write = state
+        .metadata
+        .database()
+        .begin_write()
+        .map_err(ApiError::redb_transaction)?;
+    {
+        let mut table = write
+            .open_table(NAMESPACE_ALIASES)
+            .map_err(ApiError::redb_table)?;
+        table
+            .insert(alias, namespace_id.to_string().as_str())
+            .map_err(ApiError::redb_storage)?;
+    }
+    write.commit().map_err(ApiError::redb_commit)
+}
+
+pub(super) async fn bootstrap_namespace_group(
+    state: &AppState,
+    descriptor: NamespaceDescriptor,
+) -> Result<CreatedNamespace, ApiError> {
+    let manager = namespace_manager(state)?;
+    let replicas = descriptor.initial_replica_set.clone();
     if replicas.len() != 3 {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::NamespaceUnavailable,
             "exactly three consensus replicas are required",
         ));
-    }
-    let mut descriptor = NamespaceDescriptor::new(
-        request.kind,
-        replicas.clone(),
-        state.status.node_id.clone(),
-        "00",
-        unix_seconds(),
-    );
-    if let Some(keep_last) = request.retention_keep_last {
-        descriptor.retention.keep_last = keep_last;
-    }
-    if request.retention_max_age_seconds.is_some() {
-        descriptor.retention.max_age_seconds = request.retention_max_age_seconds;
     }
     let created = create_namespace(
         &state.namespace_data_store,
@@ -339,7 +316,9 @@ pub(super) async fn namespace_create(
         &created.root_cid,
         &created.checkpoint_cid,
     ] {
-        let block = state.block_store.get(cid)?;
+        let encoded = state.block_store.get_encoded(cid)?;
+        let logical_size = encoded.logical_size_bytes();
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
         let mut accepted = 0;
         for replica in &replicas {
             if replica == &state.status.node_id {
@@ -353,7 +332,13 @@ pub(super) async fn namespace_create(
             for _ in 0..5 {
                 if let Ok(response) = state
                     .network
-                    .block_put_replica(address, cid.codec, block.payload.clone())
+                    .block_put_replica_stream(
+                        address,
+                        cid.codec,
+                        cid,
+                        logical_size,
+                        encoded_payload.clone(),
+                    )
                     .await
                     && response.cid == cid.to_string()
                 {
@@ -377,10 +362,12 @@ pub(super) async fn namespace_create(
 
     for replica in &replicas {
         if replica == &state.status.node_id {
-            manager
-                .start_group(created.state.clone(), state.namespace_data_store.clone())
-                .await
-                .map_err(consensus_error)?;
+            if manager.group(&created.namespace_id).await.is_err() {
+                manager
+                    .start_group(created.state.clone(), state.namespace_data_store.clone())
+                    .await
+                    .map_err(consensus_error)?;
+            }
         } else {
             let address = state.network.peer_address(replica).await.ok_or_else(|| {
                 ApiError::new(
@@ -447,6 +434,49 @@ pub(super) async fn namespace_create(
             .await
             .map_err(ApiError::network)?;
     }
+    Ok(created)
+}
+
+pub(super) async fn namespace_create(
+    State(state): State<AppState>,
+    Json(request): Json<CreateNamespaceRequest>,
+) -> Result<Json<CreateNamespaceResponse>, ApiError> {
+    let manager = namespace_manager(&state)?;
+    let seed = Cid::new(
+        CODEC_RAW,
+        format!(
+            "{}:{}:{}",
+            state.status.node_id,
+            request.request_id.as_deref().unwrap_or("create"),
+            unix_seconds()
+        )
+        .as_bytes(),
+    );
+    let replicas = manager
+        .select_replica_set(&seed, state.namespace_log_bytes)
+        .await
+        .map_err(consensus_error)?;
+    if replicas.len() != 3 {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::NamespaceUnavailable,
+            "exactly three consensus replicas are required",
+        ));
+    }
+    let mut descriptor = NamespaceDescriptor::new(
+        request.kind,
+        replicas.clone(),
+        state.status.node_id.clone(),
+        "00",
+        unix_seconds(),
+    );
+    if let Some(keep_last) = request.retention_keep_last {
+        descriptor.retention.keep_last = keep_last;
+    }
+    if request.retention_max_age_seconds.is_some() {
+        descriptor.retention.max_age_seconds = request.retention_max_age_seconds;
+    }
+    let created = bootstrap_namespace_group(&state, descriptor).await?;
     if let Some(alias) = &request.alias {
         persist_alias(&state, alias, &created.namespace_id)?;
     }
@@ -602,6 +632,7 @@ pub(super) async fn apply_command(
     namespace_id: NamespaceId,
     command: CommandEnvelope,
     uploaded_roots: Vec<Cid>,
+    preverified_durability: Vec<DurabilityReceipt>,
     staged_bytes: u64,
     retain_uploaded_on_conflict: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -642,6 +673,7 @@ pub(super) async fn apply_command(
                 namespace_id: namespace_id.clone(),
                 command,
                 uploaded_roots,
+                preverified_durability,
                 staged_bytes,
                 staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
                 retain_uploaded_on_conflict,
@@ -735,6 +767,7 @@ pub(super) async fn kv_put(
         id,
         command,
         request.uploaded_roots,
+        Vec::new(),
         request.staged_bytes,
         request.retain_uploaded_on_conflict,
     )
@@ -769,7 +802,7 @@ pub(super) async fn kv_delete(
             },
         },
     };
-    apply_command(&state, id, command, Vec::new(), 0, false).await
+    apply_command(&state, id, command, Vec::new(), Vec::new(), 0, false).await
 }
 
 pub(super) async fn kv_transaction(
@@ -799,6 +832,7 @@ pub(super) async fn kv_transaction(
         id,
         command,
         request.uploaded_roots,
+        Vec::new(),
         request.staged_bytes,
         request.retain_uploaded_on_conflict,
     )
@@ -1089,6 +1123,7 @@ pub(super) async fn namespace_rollback(
             },
         },
         Vec::new(),
+        Vec::new(),
         0,
         false,
     )
@@ -1138,6 +1173,7 @@ pub(super) async fn namespace_snapshot_mutate(
             command,
         },
         Vec::new(),
+        Vec::new(),
         0,
         false,
     )
@@ -1173,9 +1209,7 @@ pub(super) async fn admin_namespace_rebalance(
         .group(&id)
         .await
         .map_err(consensus_error)?;
-    group.raft.ensure_linearizable().await.map_err(|error| {
-        consensus_error(pepper_consensus::ConsensusError::Raft(error.to_string()))
-    })?;
+    group.ensure_linearizable().await.map_err(consensus_error)?;
     let reachable = state
         .network
         .peers()

@@ -18,22 +18,12 @@ pub(super) async fn put_object(
     if let Some(length) = content_length {
         enforce_size_limit(state.max_object_bytes, length, "object")?;
     }
-    let use_erasure = query.erasure_data_shards.is_some()
-        || query.erasure_parity_shards.is_some()
-        || (state.erasure_enabled
-            && content_length.is_some_and(|length| length >= state.erasure_min_size_bytes));
-    let receipt = if use_erasure {
-        let erasure_limit = state
-            .max_object_bytes
-            .unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
-            .min(MAX_ERASURE_OBJECT_BYTES);
-        if let Some(length) = content_length {
-            enforce_size_limit(Some(erasure_limit), length, "erasure object")?;
-        }
-        let bytes = read_body_limited(body, Some(erasure_limit), "erasure object").await?;
-        put_erasure_object_bytes(
+    let explicit_erasure =
+        query.erasure_data_shards.is_some() || query.erasure_parity_shards.is_some();
+    let receipt = if explicit_erasure {
+        put_erasure_object_stream_receipts(
             &state,
-            bytes,
+            body,
             query
                 .erasure_data_shards
                 .unwrap_or(state.erasure_data_shards),
@@ -42,8 +32,11 @@ pub(super) async fn put_object(
                 .unwrap_or(state.erasure_parity_shards),
         )
         .await?
+        .receipt
     } else {
-        put_object_stream_receipt(&state, body).await?
+        put_policy_object_stream_receipts(&state, body, content_length, false)
+            .await?
+            .receipt
     };
     if query.pin.unwrap_or(true) {
         ensure_implicit_pin(&state, &receipt.cid).await?;
@@ -61,8 +54,48 @@ pub(super) async fn get_object(
         return Err(ApiError::bad_request("CID is not an object manifest"));
     }
     let body = if cid.codec == CODEC_ERASURE_MANIFEST {
-        let bytes = object_bytes(&state, &cid).await?;
-        Body::from(bytes)
+        let manifest_block = get_block_resolved(&state, &cid).await?;
+        let manifest: ErasureManifest =
+            serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
+        validate_erasure_resource_limits(&state, &manifest)?;
+        let data_shards = manifest.data_shards;
+        let parity_shards = manifest.parity_shards;
+        let mut stripes = manifest.stripes.into_iter();
+        let Some(first_stripe) = stripes.next() else {
+            return Ok((
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                Body::empty(),
+            )
+                .into_response());
+        };
+        let first_frames = erasure_stripe_frames(&state, data_shards, parity_shards, &first_stripe)
+            .await
+            .map_err(|error| {
+                warn!(
+                    ?error,
+                    offset = first_stripe.offset,
+                    "erasure GET first stripe failed"
+                );
+                error
+            })?;
+        let remaining_stream = stream::iter(stripes.map(move |stripe| {
+            let state = state.clone();
+            let guard = guard.clone();
+            async move {
+                let _guard = guard;
+                erasure_stripe_frames(&state, data_shards, parity_shards, &stripe)
+                    .await
+                    .map_err(|error| {
+                        warn!(?error, offset = stripe.offset, "erasure GET stripe failed");
+                        std::io::Error::other(error.message)
+                    })
+            }
+        }))
+        .buffered(4)
+        .map_ok(|frames| stream::iter(frames.into_iter().map(Ok::<Bytes, std::io::Error>)))
+        .try_flatten();
+        let first_stream = stream::iter(first_frames.into_iter().map(Ok::<Bytes, std::io::Error>));
+        Body::from_stream(first_stream.chain(remaining_stream))
     } else {
         let manifest_block = get_block_resolved(&state, &cid).await?;
         let manifest: ObjectManifest =
@@ -174,25 +207,35 @@ pub(super) fn validate_erasure_resource_limits(
     manifest: &ErasureManifest,
 ) -> Result<(), ApiError> {
     manifest.validate().map_err(ApiError::manifest)?;
-    let object_limit = state
-        .max_object_bytes
-        .unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
-        .min(MAX_ERASURE_OBJECT_BYTES);
-    enforce_size_limit(Some(object_limit), manifest.size, "erasure object manifest")?;
+    enforce_size_limit(
+        state.max_object_bytes,
+        manifest.size,
+        "erasure object manifest",
+    )?;
     let max_block = state.max_block_bytes.unwrap_or(DEFAULT_MAX_BLOCK_BYTES);
-    if manifest.shard_size > max_block {
+    if manifest
+        .stripes
+        .iter()
+        .any(|stripe| stripe.shard_size > max_block)
+    {
         return Err(ApiError::bad_request(
             "erasure manifest shard size exceeds the local block limit",
         ));
     }
     let total = u64::from(manifest.data_shards) + u64::from(manifest.parity_shards);
-    let encoded = manifest
-        .shard_size
-        .checked_mul(total)
-        .ok_or_else(|| ApiError::bad_request("erasure working-set size overflow"))?;
-    if encoded > 512 * 1024 * 1024 {
+    if manifest.stripes.iter().any(|stripe| {
+        stripe
+            .shard_size
+            .checked_mul(total)
+            .is_none_or(|encoded| encoded > 512 * 1024 * 1024)
+    }) {
         return Err(ApiError::bad_request(
-            "erasure reconstruction exceeds the 512 MiB working-set limit",
+            "an erasure stripe exceeds the 512 MiB reconstruction working-set limit",
+        ));
+    }
+    if manifest.stripes.len() > 1_000_000 {
+        return Err(ApiError::bad_request(
+            "erasure manifest contains too many stripes",
         ));
     }
     Ok(())

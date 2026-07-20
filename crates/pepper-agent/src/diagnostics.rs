@@ -383,41 +383,51 @@ pub(super) async fn erasure_diagnostic(
         .into_iter()
         .map(|peer| (peer.node_id.clone(), peer))
         .collect::<HashMap<_, _>>();
-    let mut shards = Vec::with_capacity(manifest.shards.len());
-    for shard in &manifest.shards {
-        let local_present = state.block_store.has(&shard.cid)?;
-        let local_verified = if local_present {
-            state
-                .block_store
-                .get(&shard.cid)
-                .is_ok_and(|block| block.size == shard.size && shard.cid.verify(&block.payload))
-        } else {
-            false
-        };
-        let providers = state
-            .network
-            .local_provider_records(&shard.cid)?
-            .into_iter()
-            .take(MAX_PAGE_LIMIT)
-            .map(|provider| {
-                let peer = peers.get(&provider.node_id);
-                serde_json::json!({
-                    "node_id":provider.node_id,
-                    "expires_at_unix_seconds":provider.expires_at_unix_seconds,
-                    "not_expired":provider.expires_at_unix_seconds > now,
-                    "connected":peer.is_some_and(|peer| peer.connected),
-                    "failure_domain":peer.and_then(|peer| peer.failure_domain.clone())
+    let mut shards = Vec::with_capacity(
+        manifest
+            .stripes
+            .iter()
+            .map(|stripe| stripe.shards.len())
+            .sum(),
+    );
+    for (stripe_index, stripe) in manifest.stripes.iter().enumerate() {
+        for shard in &stripe.shards {
+            let local_present = state.block_store.has(&shard.cid)?;
+            let local_verified = if local_present {
+                state
+                    .block_store
+                    .get(&shard.cid)
+                    .is_ok_and(|block| block.size == shard.size && shard.cid.verify(&block.payload))
+            } else {
+                false
+            };
+            let providers = state
+                .network
+                .local_provider_records(&shard.cid)?
+                .into_iter()
+                .take(MAX_PAGE_LIMIT)
+                .map(|provider| {
+                    let peer = peers.get(&provider.node_id);
+                    serde_json::json!({
+                        "node_id":provider.node_id,
+                        "expires_at_unix_seconds":provider.expires_at_unix_seconds,
+                        "not_expired":provider.expires_at_unix_seconds > now,
+                        "connected":peer.is_some_and(|peer| peer.connected),
+                        "failure_domain":peer.and_then(|peer| peer.failure_domain.clone())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        shards.push(serde_json::json!({
-            "index":shard.index,
-            "cid":shard.cid,
-            "expected_size_bytes":shard.size,
-            "local_present":local_present,
-            "local_verified":local_verified,
-            "providers":providers
-        }));
+                .collect::<Vec<_>>();
+            shards.push(serde_json::json!({
+                "stripe_index":stripe_index,
+                "stripe_offset":stripe.offset,
+                "index":shard.index,
+                "cid":shard.cid,
+                "expected_size_bytes":shard.size,
+                "local_present":local_present,
+                "local_verified":local_verified,
+                "providers":providers
+            }));
+        }
     }
     Ok(envelope(
         &state,
@@ -426,7 +436,8 @@ pub(super) async fn erasure_diagnostic(
             "logical_size_bytes":manifest.size,
             "data_shards":manifest.data_shards,
             "parity_shards":manifest.parity_shards,
-            "shard_size_bytes":manifest.shard_size,
+            "stripe_size_bytes":manifest.stripe_size,
+            "stripe_count":manifest.stripes.len(),
             "shards":shards
         }),
     ))

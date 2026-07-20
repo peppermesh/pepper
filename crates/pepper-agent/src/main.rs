@@ -12,6 +12,7 @@ mod network_services;
 mod objects;
 mod pins;
 mod publication;
+mod reconstructed_cache;
 mod repair;
 mod s3_api;
 
@@ -25,6 +26,7 @@ use network_services::*;
 use objects::*;
 use pins::*;
 use publication::*;
+use reconstructed_cache::ReconstructedStripeCache;
 use repair::*;
 use s3_api::*;
 
@@ -47,7 +49,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use pepper_bucket::BucketObjectCodecHandler;
 use pepper_compute::validate_job_spec;
 use pepper_config::{LoadedConfig, default_config_path, load_from_path};
@@ -59,7 +61,7 @@ use pepper_merkle::MerkleNodeCodecHandler;
 use pepper_metadata::MetadataStore;
 use pepper_namespace::{
     NamespaceCheckpointCodecHandler, NamespaceCommitCodecHandler, NamespaceDescriptorCodecHandler,
-    NamespaceId, PinAction,
+    NamespaceId, NamespaceState, PinAction,
 };
 use pepper_network::{
     NetworkBlockService, NetworkComputeService, NetworkConfig, NetworkError, NetworkHandle,
@@ -72,8 +74,9 @@ use pepper_types::{
     CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_RAW, Cid, Codec,
     ComputeAttempt, ComputeJobSpec, ComputeJobStatus, ComputeLogsResponse, ComputeOffer,
     ComputeReceipt, DirEntry, DirManifest, DurabilityReceipt, ErasureManifest, ErasureShard,
-    ErrorCode, GcReport, InitStatus, NodeStatus, ObjectChunk, ObjectManifest, PinCreateRequest,
-    PinRecord, PinStatusResponse, ProviderRecord, PutBlockResponse, SubmitComputeResponse,
+    ErasureStripe, ErasureStripeEncoding, ErrorCode, GcReport, InitStatus, NodeStatus, ObjectChunk,
+    ObjectManifest, PinCreateRequest, PinRecord, PinStatusResponse, ProviderRecord,
+    PutBlockResponse, SubmitComputeResponse,
 };
 use redb::{ReadableTable, TableDefinition};
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -106,8 +109,21 @@ const STORAGE_SOFT_PRESSURE_PERCENT: u64 = 85;
 const STORAGE_HARD_PRESSURE_PERCENT: u64 = 95;
 const DEFAULT_MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_ERASURE_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
+const OBJECT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const OBJECT_CHUNK_PIPELINE_DEPTH: usize = 4;
+const REPLICATED_BLOCK_CONCURRENCY: usize = 8;
+const S3_HTTP_CONCURRENCY: usize = 128;
+const S3_WRITE_CONCURRENCY: usize = 16;
+const S3_WRITE_QUEUE_DEPTH: usize = 48;
+const S3_WRITE_QUEUE_TIMEOUT_MS: u64 = 5_000;
+const S3_WRITE_INITIAL_SERVICE_MICROS: u64 = 5_000_000;
 const S3_INTERNAL_KEY_PREFIX: &[u8] = b"\xffs3/";
+const ERASURE_COMPRESSION_LEVEL: i32 = 1;
+const ERASURE_COMPRESSION_MIN_SAVINGS_PERCENT: usize = 10;
+const ERASURE_COMPRESSION_PROBE_REGION_BYTES: usize = 16 * 1024;
+const ERASURE_HEDGE_MAX_ACTIVE_STRIPE_READS: u64 = 1;
+const ERASURE_STRIPE_READ_CONCURRENCY: usize = 32;
+const ERASURE_REPAIR_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "pepper-agent", about = "Pepper node agent")]
@@ -149,6 +165,13 @@ struct AppState {
     _publication_limits: PublicationLimits,
     namespace_log_bytes: u64,
     replication_factor: usize,
+    local_block_writer: BlockBatchWriter,
+    replicated_block_slots: Arc<Semaphore>,
+    s3_write_slots: Arc<Semaphore>,
+    s3_write_queue_slots: Arc<Semaphore>,
+    s3_write_queue_timeout: Duration,
+    s3_write_service_micros: Arc<AtomicU64>,
+    s3_list_cache: Arc<S3ListCache>,
     repair_interval: Duration,
     repair_semaphore: Arc<Semaphore>,
     repair_diagnostics: Arc<Mutex<VecDeque<RepairDiagnosticRecord>>>,
@@ -189,11 +212,13 @@ struct AppState {
     erasure_min_size_bytes: u64,
     erasure_data_shards: u16,
     erasure_parity_shards: u16,
+    reconstructed_stripe_cache: Option<Arc<ReconstructedStripeCache>>,
+    erasure_stripe_read_slots: Arc<Semaphore>,
     http_requests_per_minute: Option<u64>,
     http_concurrency: Arc<Semaphore>,
     http_rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
     erasure_repair_semaphore: Arc<Semaphore>,
-    erasure_repair_bytes_per_second: Option<u64>,
+    erasure_repair_bytes_per_second: u64,
     _identity_lock: Arc<std::fs::File>,
 }
 
@@ -609,8 +634,11 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         .context("failed to open local block store")?,
     );
     let operation_lock = Arc::new(RwLock::new(()));
+    let local_block_writer = BlockBatchWriter::normal(block_store.clone());
+    let replica_block_writer = BlockBatchWriter::replica(block_store.clone());
     let network_block_service = Arc::new(AgentBlockService {
         block_store: block_store.clone(),
+        replica_writer: replica_block_writer,
         operation_lock: operation_lock.clone(),
     });
     let cluster_secret = load_cluster_secret(loaded.config.auth.cluster_secret_path.as_ref())?;
@@ -632,6 +660,7 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
             secret_access_key: load_s3_secret(path)?,
             max_clock_skew_seconds: loaded.config.s3.max_clock_skew_seconds,
             bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bucket_catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
             multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     } else {
@@ -766,6 +795,10 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         ..PublicationLimits::default()
     };
     let publication_repository = PublicationRepository::new(metadata.clone(), publication_limits)?;
+    let reconstructed_stripe_cache =
+        ReconstructedStripeCache::open(&loaded.config.erasure.reconstructed_cache)
+            .map_err(anyhow::Error::msg)?
+            .map(Arc::new);
     let state = AppState {
         status: Arc::new(status),
         metadata: metadata.clone(),
@@ -778,6 +811,31 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         _publication_limits: publication_limits,
         namespace_log_bytes: loaded.config.namespace.max_consensus_log_bytes,
         replication_factor: loaded.config.replication.default_factor as usize,
+        local_block_writer,
+        replicated_block_slots: Arc::new(Semaphore::new(REPLICATED_BLOCK_CONCURRENCY)),
+        s3_write_slots: Arc::new(Semaphore::new(
+            loaded
+                .config
+                .limits
+                .s3_write_concurrency
+                .unwrap_or(S3_WRITE_CONCURRENCY),
+        )),
+        s3_write_queue_slots: Arc::new(Semaphore::new(
+            loaded
+                .config
+                .limits
+                .s3_write_queue_depth
+                .unwrap_or(S3_WRITE_QUEUE_DEPTH),
+        )),
+        s3_write_queue_timeout: Duration::from_millis(
+            loaded
+                .config
+                .limits
+                .s3_write_queue_timeout_ms
+                .unwrap_or(S3_WRITE_QUEUE_TIMEOUT_MS),
+        ),
+        s3_write_service_micros: Arc::new(AtomicU64::new(S3_WRITE_INITIAL_SERVICE_MICROS)),
+        s3_list_cache: Arc::new(S3ListCache::default()),
         repair_interval: Duration::from_secs(loaded.config.replication.repair_interval_seconds),
         repair_semaphore: Arc::new(Semaphore::new(1)),
         repair_diagnostics: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
@@ -857,8 +915,22 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         erasure_min_size_bytes: loaded.config.erasure.min_size_bytes,
         erasure_data_shards: loaded.config.erasure.data_shards,
         erasure_parity_shards: loaded.config.erasure.parity_shards,
+        reconstructed_stripe_cache,
+        erasure_stripe_read_slots: Arc::new(Semaphore::new(
+            loaded
+                .config
+                .limits
+                .erasure_read_max_concurrent_stripes
+                .unwrap_or(ERASURE_STRIPE_READ_CONCURRENCY),
+        )),
         http_requests_per_minute: loaded.config.limits.http_requests_per_minute,
-        http_concurrency: Arc::new(Semaphore::new(128)),
+        http_concurrency: Arc::new(Semaphore::new(
+            loaded
+                .config
+                .limits
+                .s3_http_concurrency
+                .unwrap_or(S3_HTTP_CONCURRENCY),
+        )),
         http_rate_limits: Arc::new(Mutex::new(HashMap::new())),
         erasure_repair_semaphore: Arc::new(Semaphore::new(
             loaded
@@ -867,7 +939,11 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
                 .erasure_repair_max_concurrent_shards
                 .unwrap_or(2),
         )),
-        erasure_repair_bytes_per_second: loaded.config.limits.erasure_repair_bytes_per_second,
+        erasure_repair_bytes_per_second: loaded
+            .config
+            .limits
+            .erasure_repair_bytes_per_second
+            .unwrap_or(ERASURE_REPAIR_BYTES_PER_SECOND),
         _identity_lock: identity_lock,
     };
 
@@ -991,6 +1067,21 @@ async fn get_block(
 }
 
 async fn get_block_resolved(state: &AppState, cid: &Cid) -> Result<pepper_types::Block, ApiError> {
+    get_block_resolved_with_policy(state, cid, true).await
+}
+
+async fn get_block_resolved_transient(
+    state: &AppState,
+    cid: &Cid,
+) -> Result<pepper_types::Block, ApiError> {
+    get_block_resolved_with_policy(state, cid, false).await
+}
+
+async fn get_block_resolved_with_policy(
+    state: &AppState,
+    cid: &Cid,
+    persist_remote: bool,
+) -> Result<pepper_types::Block, ApiError> {
     match tokio::task::block_in_place(|| state.block_store.get(cid)) {
         Ok(block) => Ok(block),
         Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {
@@ -1007,9 +1098,11 @@ async fn get_block_resolved(state: &AppState, cid: &Cid) -> Result<pepper_types:
                     "remote block hash mismatch".to_string(),
                 )));
             }
-            let repaired = state.block_store.put_replica(cid.codec, &payload)?;
-            if repaired.cid != *cid {
-                return Err(ApiError::internal("recovered block CID mismatch"));
+            if persist_remote {
+                let repaired = state.block_store.put_replica(cid.codec, &payload)?;
+                if repaired.cid != *cid {
+                    return Err(ApiError::internal("recovered block CID mismatch"));
+                }
             }
             let mut records = state
                 .read_diagnostics
@@ -1036,6 +1129,30 @@ async fn get_block_resolved(state: &AppState, cid: &Cid) -> Result<pepper_types:
                 size: payload.len() as u64,
                 payload,
             })
+        }
+        Err(error) => Err(ApiError::from(error)),
+    }
+}
+
+async fn get_block_range_resolved(
+    state: &AppState,
+    cid: &Cid,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, ApiError> {
+    match tokio::task::block_in_place(|| state.block_store.get_range(cid, start, end)) {
+        Ok(payload) => Ok(payload),
+        Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {
+            let block = get_block_resolved(state, cid).await?;
+            let start = usize::try_from(start)
+                .map_err(|_| ApiError::bad_request("block range start is too large"))?;
+            let end = usize::try_from(end)
+                .map_err(|_| ApiError::bad_request("block range end is too large"))?;
+            block
+                .payload
+                .get(start..end)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| ApiError::bad_request("block range exceeds recovered payload"))
         }
         Err(error) => Err(ApiError::from(error)),
     }
@@ -1083,11 +1200,31 @@ fn placement_candidates(state: &AppState, peers: Vec<PeerStatus>) -> Vec<Placeme
         storage_capacity_bytes: Some(peer.storage_capacity_bytes),
         storage_available_bytes: Some(peer.storage_available_bytes),
     }));
+    let mut seen_node_ids = HashSet::new();
+    candidates.retain(|candidate| seen_node_ids.insert(candidate.node_id.clone()));
     candidates
 }
 
 fn validate_replica_ack(
     state: &AppState,
+    expected_node_id: &str,
+    expected_cid: &Cid,
+    expected_codec: Codec,
+    expected_size: u64,
+    ack: &proto::BlockPutReplicaResponse,
+) -> Result<ProviderRecord, ApiError> {
+    let record = parse_replica_ack(
+        expected_node_id,
+        expected_cid,
+        expected_codec,
+        expected_size,
+        ack,
+    )?;
+    state.network.persist_provider_record(&record)?;
+    Ok(record)
+}
+
+fn parse_replica_ack(
     expected_node_id: &str,
     expected_cid: &Cid,
     expected_codec: Codec,
@@ -1110,7 +1247,6 @@ fn validate_replica_ack(
             "replica provider record does not match target node or CID",
         ));
     }
-    state.network.persist_provider_record(&record)?;
     Ok(record)
 }
 
@@ -1133,13 +1269,36 @@ async fn put_replicated_block_with_factor(
             "replication factor must be greater than zero",
         ));
     }
-    let local_put = tokio::task::block_in_place(|| state.block_store.put(codec, &payload))?;
+    let _publication_slot = if replication_factor > 1 {
+        Some(
+            state
+                .replicated_block_slots
+                .acquire()
+                .await
+                .map_err(|_| ApiError::internal("replicated block scheduler is unavailable"))?,
+        )
+    } else {
+        None
+    };
+    let local_put_started = time::Instant::now();
+    let local_put = if replication_factor > 1 {
+        state
+            .local_block_writer
+            .put_with_payload(codec, payload)
+            .await
+            .map_err(ApiError::internal)
+    } else {
+        tokio::task::block_in_place(|| state.block_store.put(codec, &payload))
+            .map(|put| (put, payload))
+            .map_err(ApiError::from)
+    };
+    metrics::observe_phase(
+        &metrics::S3_BLOCK_HASH_STORAGE_PHASES,
+        &metrics::S3_BLOCK_HASH_STORAGE_MICROS,
+        local_put_started.elapsed(),
+    );
+    let (local_put, payload) = local_put?;
     let local_provider = state.network.local_provider_record(&local_put.cid);
-    state.network.persist_provider_record(&local_provider)?;
-    state
-        .network
-        .announce_provider_to_peers(&local_provider)
-        .await;
 
     let local_descriptor = state.network.local_descriptor();
     let candidates = placement_candidates(state, state.network.peers().await);
@@ -1154,11 +1313,11 @@ async fn put_replicated_block_with_factor(
         .into_iter()
         .collect::<Vec<_>>();
     let mut providers = local_selected
-        .then_some(local_provider)
+        .then_some(local_provider.clone())
         .into_iter()
         .collect::<Vec<_>>();
 
-    let payload = Arc::new(payload);
+    let payload: Arc<[u8]> = Arc::from(payload);
     let writes = selected
         .into_iter()
         .filter(|node| !node.is_local)
@@ -1173,39 +1332,42 @@ async fn put_replicated_block_with_factor(
         .map(|(node, address)| {
             let network = state.network.clone();
             let payload = payload.clone();
+            let cid = local_put.cid.clone();
             async move {
                 let result = network
-                    .block_put_replica(address, codec, payload.as_ref().clone())
+                    .block_put_replica_stream(address, codec, &cid, local_put.size, payload)
                     .await;
                 (node, result)
             }
         });
     let mut replica_writes = stream::iter(writes).buffered(8);
+    let replica_transfer_started = time::Instant::now();
 
     while let Some((node, result)) = replica_writes.next().await {
         match result {
-            Ok(ack) => match validate_replica_ack(
-                state,
-                &node.node_id,
-                &local_put.cid,
-                codec,
-                local_put.size,
-                &ack,
-            ) {
-                Ok(record) => {
-                    state.network.announce_provider_to_peers(&record).await;
-                    replica_nodes.push(node.node_id.clone());
-                    providers.push(record);
+            Ok(ack) => {
+                match parse_replica_ack(&node.node_id, &local_put.cid, codec, local_put.size, &ack)
+                {
+                    Ok(record) => {
+                        replica_nodes.push(node.node_id.clone());
+                        providers.push(record.clone());
+                    }
+                    Err(error) => warn!(
+                        node_id = %node.node_id,
+                        %error.message,
+                        "replica acknowledgement validation failed"
+                    ),
                 }
-                Err(error) => warn!(
-                    node_id = %node.node_id,
-                    %error.message,
-                    "replica acknowledgement validation failed"
-                ),
-            },
+            }
             Err(error) => warn!(%error, node_id = %node.node_id, "replica write failed"),
         }
     }
+
+    metrics::observe_phase(
+        &metrics::S3_REPLICA_TRANSFER_PHASES,
+        &metrics::S3_REPLICA_TRANSFER_MICROS,
+        replica_transfer_started.elapsed(),
+    );
 
     replica_nodes.sort();
     replica_nodes.dedup();
@@ -1220,7 +1382,7 @@ async fn put_replicated_block_with_factor(
     .to_string();
 
     Ok(DurabilityReceipt {
-        cid: local_put.cid,
+        cid: local_put.cid.clone(),
         codec: local_put.codec,
         size: local_put.size,
         replicas_accepted,
@@ -1230,48 +1392,72 @@ async fn put_replicated_block_with_factor(
     })
 }
 
-async fn put_erasure_object_bytes(
+struct StoredErasureStripe {
+    stripe: ErasureStripe,
+    receipts: Vec<DurabilityReceipt>,
+    distinct_nodes: usize,
+}
+
+async fn encode_and_store_erasure_stripe(
     state: &AppState,
     bytes: Vec<u8>,
+    offset: u64,
     data_shards: u16,
     parity_shards: u16,
-) -> Result<DurabilityReceipt, ApiError> {
+    candidates: Vec<PlacementNode>,
+) -> Result<StoredErasureStripe, ApiError> {
     validate_erasure_policy(data_shards, parity_shards)?;
     let data_shards_usize = data_shards as usize;
     let parity_shards_usize = parity_shards as usize;
     let total_shards = data_shards_usize + parity_shards_usize;
-    let shard_size = std::cmp::max(1, bytes.len().div_ceil(data_shards_usize));
+    let logical_size = bytes.len() as u64;
+    let logical_cid = Cid::new(CODEC_RAW, &bytes);
     let max_block_bytes = state.max_block_bytes.unwrap_or(DEFAULT_MAX_BLOCK_BYTES);
-    if shard_size as u64 > max_block_bytes {
-        return Err(ApiError::bad_request(format!(
-            "erasure shard size {shard_size} exceeds block limit {max_block_bytes}; increase data_shards"
-        )));
-    }
-    let encoded_bytes = shard_size
-        .checked_mul(total_shards)
-        .ok_or_else(|| ApiError::bad_request("erasure allocation size overflow"))?;
-    if encoded_bytes > 512 * 1024 * 1024 {
-        return Err(ApiError::bad_request(
-            "erasure encoding would exceed the 512 MiB memory safety limit",
-        ));
-    }
-    let mut shards = vec![vec![0u8; shard_size]; total_shards];
-    for (index, chunk) in bytes.chunks(shard_size).enumerate() {
-        shards[index][..chunk.len()].copy_from_slice(chunk);
-    }
-    let reed_solomon = ReedSolomon::new(data_shards_usize, parity_shards_usize)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    reed_solomon
-        .encode(&mut shards)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let compression_started = std::time::Instant::now();
+    let (encoding, encoded_size, shard_size, mut shards) = tokio::task::spawn_blocking(move || {
+        let (encoding, encoded) = encode_erasure_stripe_payload(bytes)?;
+        let encoded_size = encoded.len();
+        let shard_size = std::cmp::max(1, encoded_size.div_ceil(data_shards_usize));
+        if shard_size as u64 > max_block_bytes {
+            return Err(ApiError::bad_request(format!(
+                "erasure shard size {shard_size} exceeds block limit {max_block_bytes}; increase data_shards"
+            )));
+        }
+        let allocation_bytes = shard_size
+            .checked_mul(total_shards)
+            .ok_or_else(|| ApiError::bad_request("erasure allocation size overflow"))?;
+        if allocation_bytes > 512 * 1024 * 1024 {
+            return Err(ApiError::bad_request(
+                "erasure encoding would exceed the 512 MiB memory safety limit",
+            ));
+        }
+        let mut shards = vec![vec![0u8; shard_size]; total_shards];
+        for (index, chunk) in encoded.chunks(shard_size).enumerate() {
+            shards[index][..chunk.len()].copy_from_slice(chunk);
+        }
+        let reed_solomon = ReedSolomon::new(data_shards_usize, parity_shards_usize)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        reed_solomon
+            .encode(&mut shards)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok::<_, ApiError>((encoding, encoded_size, shard_size, shards))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("erasure encoder task failed: {error}")))??;
+    metrics::record_erasure_stripe_encoding(
+        logical_size,
+        encoded_size as u64,
+        encoding,
+        compression_started.elapsed(),
+    );
 
-    let candidates = placement_candidates(state, state.network.peers().await);
     let mut manifest_shards = Vec::with_capacity(total_shards);
+    let mut receipts = Vec::with_capacity(total_shards);
     let mut used_nodes = HashSet::new();
     let mut used_constraint_values = HashSet::new();
-    for (index, shard) in shards.into_iter().enumerate() {
+    for (index, shard) in shards.drain(..).enumerate() {
         let cid = Cid::new(CODEC_RAW, &shard);
-        let (node_id, constraints) = store_erasure_shard(
+        let (node_id, constraints, receipt) = store_erasure_shard(
             state,
             &candidates,
             cid.clone(),
@@ -1282,28 +1468,63 @@ async fn put_erasure_object_bytes(
         .await?;
         used_nodes.insert(node_id);
         used_constraint_values.extend(constraints);
+        receipts.push(receipt);
         manifest_shards.push(ErasureShard {
             index: index as u16,
             cid,
             size: shard_size as u64,
         });
     }
-    ERASURE_OBJECT_WRITES.fetch_add(1, Ordering::Relaxed);
+    Ok(StoredErasureStripe {
+        stripe: ErasureStripe {
+            offset,
+            size: logical_size,
+            logical_cid,
+            encoding,
+            encoded_size: encoded_size as u64,
+            shard_size: shard_size as u64,
+            shards: manifest_shards,
+        },
+        receipts,
+        distinct_nodes: used_nodes.len(),
+    })
+}
 
-    let manifest = ErasureManifest::new(
-        bytes.len() as u64,
-        data_shards,
-        parity_shards,
-        shard_size as u64,
-        manifest_shards,
-    );
-    manifest.validate().map_err(ApiError::manifest)?;
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
-    let mut receipt = put_replicated_block(state, CODEC_ERASURE_MANIFEST, manifest_bytes).await?;
-    if used_nodes.len() < data_shards as usize {
-        receipt.status = "degraded".to_string();
+fn encode_erasure_stripe_payload(
+    logical: Vec<u8>,
+) -> Result<(ErasureStripeEncoding, Vec<u8>), ApiError> {
+    let region = ERASURE_COMPRESSION_PROBE_REGION_BYTES.min(logical.len() / 3);
+    if region == 0 {
+        return Ok((ErasureStripeEncoding::Raw, logical));
     }
-    Ok(receipt)
+    let middle = logical.len() / 2 - region / 2;
+    let end = logical.len() - region;
+    let mut sample = Vec::with_capacity(region * 3);
+    sample.extend_from_slice(&logical[..region]);
+    sample.extend_from_slice(&logical[middle..middle + region]);
+    sample.extend_from_slice(&logical[end..]);
+    let compressed_sample =
+        zstd::bulk::compress(&sample, ERASURE_COMPRESSION_LEVEL).map_err(|error| {
+            ApiError::internal(format!("erasure compression probe failed: {error}"))
+        })?;
+    let required_sample_savings = sample
+        .len()
+        .saturating_mul(ERASURE_COMPRESSION_MIN_SAVINGS_PERCENT)
+        / 100;
+    if compressed_sample.len() > sample.len().saturating_sub(required_sample_savings) {
+        return Ok((ErasureStripeEncoding::Raw, logical));
+    }
+    let compressed = zstd::bulk::compress(&logical, ERASURE_COMPRESSION_LEVEL)
+        .map_err(|error| ApiError::internal(format!("erasure compression failed: {error}")))?;
+    let required_savings = logical
+        .len()
+        .saturating_mul(ERASURE_COMPRESSION_MIN_SAVINGS_PERCENT)
+        / 100;
+    if compressed.len() <= logical.len().saturating_sub(required_savings) {
+        Ok((ErasureStripeEncoding::Zstd, compressed))
+    } else {
+        Ok((ErasureStripeEncoding::Raw, logical))
+    }
 }
 
 fn primary_failure_domain_key(node: &PlacementNode) -> String {
@@ -1419,13 +1640,19 @@ async fn store_erasure_shard(
     payload: Vec<u8>,
     excluded_node_ids: &HashSet<String>,
     used_constraint_values: &HashSet<String>,
-) -> Result<(String, HashSet<String>), ApiError> {
+) -> Result<(String, HashSet<String>, DurabilityReceipt), ApiError> {
+    let payload_size = payload.len() as u64;
+    let encoded = state
+        .block_store
+        .encode_preverified_raw(cid.clone(), &payload)?;
+    drop(payload);
+    let logical_size = encoded.logical_size_bytes();
     let selected = select_erasure_target(
         &cid,
         candidates,
         excluded_node_ids,
         used_constraint_values,
-        payload.len() as u64,
+        payload_size,
     );
     if let Some(node) = selected
         && !node.is_local
@@ -1434,9 +1661,16 @@ async fn store_erasure_shard(
             .iter()
             .find_map(|address| address.parse().ok())
     {
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
         match state
             .network
-            .block_put_replica(address, CODEC_RAW, payload.clone())
+            .block_put_replica_stream(
+                address,
+                CODEC_RAW,
+                &cid,
+                logical_size,
+                encoded_payload.clone(),
+            )
             .await
         {
             Ok(ack) => match validate_replica_ack(
@@ -1444,12 +1678,24 @@ async fn store_erasure_shard(
                 &node.node_id,
                 &cid,
                 CODEC_RAW,
-                payload.len() as u64,
+                logical_size,
                 &ack,
             ) {
                 Ok(record) => {
                     state.network.announce_provider_to_peers(&record).await;
-                    return Ok((node.node_id.clone(), placement_constraint_values(&node)));
+                    return Ok((
+                        node.node_id.clone(),
+                        placement_constraint_values(&node),
+                        DurabilityReceipt {
+                            cid,
+                            codec: CODEC_RAW,
+                            size: logical_size,
+                            replicas_accepted: 1,
+                            replica_nodes: vec![node.node_id.clone()],
+                            status: "durable".to_string(),
+                            providers: vec![record],
+                        },
+                    ));
                 }
                 Err(error) => {
                     warn!(%error.message, expected = %cid, "remote erasure shard acknowledgement failed validation; storing locally")
@@ -1457,9 +1703,15 @@ async fn store_erasure_shard(
             },
             Err(error) => warn!(%error, "remote erasure shard write failed; storing locally"),
         }
+        let encoded = state.block_store.validate_encoded_replica(
+            cid.clone(),
+            logical_size,
+            encoded_payload.as_ref().to_vec(),
+        )?;
+        state.block_store.put_encoded(&encoded)?;
+    } else {
+        state.block_store.put_encoded(&encoded)?;
     }
-
-    state.block_store.put(CODEC_RAW, &payload)?;
     let provider = state.network.local_provider_record(&cid);
     state.network.persist_provider_record(&provider)?;
     state.network.announce_provider_to_peers(&provider).await;
@@ -1479,6 +1731,15 @@ async fn store_erasure_shard(
     Ok((
         state.status.node_id.clone(),
         placement_constraint_values(&local),
+        DurabilityReceipt {
+            cid,
+            codec: CODEC_RAW,
+            size: logical_size,
+            replicas_accepted: 1,
+            replica_nodes: vec![state.status.node_id.clone()],
+            status: "durable".to_string(),
+            providers: vec![provider],
+        },
     ))
 }
 
@@ -1488,8 +1749,15 @@ async fn copy_erasure_shard_to_node(
     cid: &Cid,
     payload: Vec<u8>,
 ) -> Result<(), ApiError> {
+    let encoded = state
+        .block_store
+        .encode_preverified_raw(cid.clone(), &payload)?;
+    drop(payload);
     if node.is_local {
-        let ack = state.block_store.put_replica(CODEC_RAW, &payload)?;
+        let ack = state
+            .block_store
+            .put_replica_encoded_batch(std::slice::from_ref(&encoded))?[0]
+            .clone();
         if ack.cid != *cid {
             return Err(ApiError::internal(format!(
                 "local erasure shard CID mismatch: expected {cid}, got {}",
@@ -1509,10 +1777,16 @@ async fn copy_erasure_shard_to_node(
         .ok_or_else(|| {
             ApiError::internal(format!("node {} has no routable address", node.node_id))
         })?;
-    let payload_len = payload.len() as u64;
+    let payload_len = encoded.logical_size_bytes();
     let ack = time::timeout(
         Duration::from_secs(2),
-        state.network.block_put_replica(address, CODEC_RAW, payload),
+        state.network.block_put_replica_stream(
+            address,
+            CODEC_RAW,
+            cid,
+            payload_len,
+            Arc::from(encoded.into_bytes()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -1636,6 +1910,8 @@ async fn admin_erasure(State(state): State<AppState>) -> Result<Json<serde_json:
     let blocks = state.block_store.list_blocks()?;
     let mut manifests = 0usize;
     let mut logical_bytes = 0u64;
+    let mut encoded_bytes = 0u64;
+    let mut shard_bytes = 0u64;
     let mut total_shards = 0usize;
     let mut healthy_shards = 0usize;
     let mut repairable_manifests = 0usize;
@@ -1650,23 +1926,39 @@ async fn admin_erasure(State(state): State<AppState>) -> Result<Json<serde_json:
         manifest.validate().map_err(ApiError::manifest)?;
         manifests += 1;
         logical_bytes = logical_bytes.saturating_add(manifest.size);
-        total_shards += manifest.shards.len();
-        let mut healthy = 0usize;
-        for shard in &manifest.shards {
-            if has_healthy_provider(&state, &shard.cid).await {
-                healthy += 1;
+        let mut manifest_unrecoverable = false;
+        let mut manifest_repairable = false;
+        for stripe in &manifest.stripes {
+            encoded_bytes = encoded_bytes.saturating_add(stripe.encoded_size);
+            shard_bytes = shard_bytes
+                .saturating_add(stripe.shards.iter().map(|shard| shard.size).sum::<u64>());
+            total_shards += stripe.shards.len();
+            let mut healthy = 0usize;
+            for shard in &stripe.shards {
+                if has_healthy_provider(&state, &shard.cid).await {
+                    healthy += 1;
+                }
+            }
+            healthy_shards += healthy;
+            if healthy < manifest.data_shards as usize {
+                manifest_unrecoverable = true;
+            } else if healthy < stripe.shards.len() {
+                manifest_repairable = true;
             }
         }
-        healthy_shards += healthy;
-        if healthy < manifest.data_shards as usize {
+        if manifest_unrecoverable {
             unrecoverable_manifests += 1;
-        } else if healthy < manifest.shards.len() {
+        } else if manifest_repairable {
             repairable_manifests += 1;
         }
     }
     Ok(Json(serde_json::json!({
         "manifests": manifests,
         "logical_bytes": logical_bytes,
+        "encoded_bytes": encoded_bytes,
+        "shard_bytes": shard_bytes,
+        "encoded_ratio": if logical_bytes > 0 { Some(encoded_bytes as f64 / logical_bytes as f64) } else { None },
+        "shard_amplification": if logical_bytes > 0 { Some(shard_bytes as f64 / logical_bytes as f64) } else { None },
         "total_shards": total_shards,
         "healthy_shards": healthy_shards,
         "missing_shards": total_shards.saturating_sub(healthy_shards),
@@ -1686,6 +1978,11 @@ async fn admin_erasure(State(state): State<AppState>) -> Result<Json<serde_json:
             "shard_repairs_total": ERASURE_SHARD_REPAIRS.load(Ordering::Relaxed),
             "shard_rebalances_total": ERASURE_SHARD_REBALANCES.load(Ordering::Relaxed),
             "reconstruction_failures_total": ERASURE_RECONSTRUCTION_FAILURES.load(Ordering::Relaxed),
+            "stripes_encoded_total": metrics::ERASURE_STRIPES_ENCODED.load(Ordering::Relaxed),
+            "stripes_compressed_total": metrics::ERASURE_STRIPES_COMPRESSED.load(Ordering::Relaxed),
+            "stripe_logical_bytes_total": metrics::ERASURE_STRIPE_LOGICAL_BYTES.load(Ordering::Relaxed),
+            "stripe_encoded_bytes_total": metrics::ERASURE_STRIPE_ENCODED_BYTES.load(Ordering::Relaxed),
+            "stripe_encoding_microseconds_total": metrics::ERASURE_STRIPE_ENCODING_MICROS.load(Ordering::Relaxed),
         }
     })))
 }
@@ -1825,17 +2122,425 @@ async fn erasure_object_bytes(state: &AppState, cid: &Cid) -> Result<Vec<u8>, Ap
     let manifest: ErasureManifest =
         serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
     validate_erasure_resource_limits(state, &manifest)?;
-    let data_shards = manifest.data_shards as usize;
-    let parity_shards = manifest.parity_shards as usize;
-    let total_shards = data_shards + parity_shards;
-    let shard_size = manifest.shard_size as usize;
-    let mut shards = vec![None::<Vec<u8>>; total_shards];
-    let mut available = 0usize;
-    for shard in &manifest.shards {
-        if available >= data_shards {
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(manifest.size)
+            .map_err(|_| ApiError::bad_request("erasure object is too large for this node"))?,
+    );
+    for stripe in &manifest.stripes {
+        bytes.extend_from_slice(
+            &erasure_stripe_bytes(state, manifest.data_shards, manifest.parity_shards, stripe)
+                .await?,
+        );
+    }
+    bytes.truncate(manifest.size as usize);
+    ERASURE_OBJECT_READS.fetch_add(1, Ordering::Relaxed);
+    Ok(bytes)
+}
+
+async fn erasure_stripe_bytes(
+    state: &AppState,
+    data_shards: u16,
+    parity_shards: u16,
+    stripe: &ErasureStripe,
+) -> Result<Bytes, ApiError> {
+    let logical_size = usize::try_from(stripe.size)
+        .map_err(|_| ApiError::bad_request("erasure logical stripe is too large"))?;
+    if let Some(bytes) = cached_erasure_stripe(state, &stripe.logical_cid, logical_size).await? {
+        return Ok(bytes);
+    }
+    let bytes = reconstruct_erasure_stripe_bytes(state, data_shards, parity_shards, stripe).await?;
+    admit_reconstructed_stripe(
+        state,
+        stripe.logical_cid.clone(),
+        bytes.clone(),
+        0..logical_size,
+    );
+    Ok(bytes)
+}
+
+async fn erasure_stripe_range_bytes(
+    state: &AppState,
+    data_shards: u16,
+    parity_shards: u16,
+    stripe: &ErasureStripe,
+    range: std::ops::Range<usize>,
+) -> Result<Bytes, ApiError> {
+    let logical_size = usize::try_from(stripe.size)
+        .map_err(|_| ApiError::bad_request("erasure logical stripe is too large"))?;
+    if range.start >= range.end || range.end > logical_size {
+        return Err(ApiError::bad_request(
+            "erasure range exceeds its logical stripe",
+        ));
+    }
+    if let Some(bytes) = cached_erasure_stripe(state, &stripe.logical_cid, logical_size).await? {
+        return Ok(bytes.slice(range));
+    }
+    if let Some(bytes) =
+        read_raw_systematic_erasure_range(state, data_shards, stripe, range.clone()).await?
+    {
+        return Ok(bytes);
+    }
+    let bytes = reconstruct_erasure_stripe_bytes(state, data_shards, parity_shards, stripe).await?;
+    admit_reconstructed_stripe(
+        state,
+        stripe.logical_cid.clone(),
+        bytes.clone(),
+        range.clone(),
+    );
+    Ok(bytes.slice(range))
+}
+
+async fn read_raw_systematic_erasure_range(
+    state: &AppState,
+    data_shards: u16,
+    stripe: &ErasureStripe,
+    range: std::ops::Range<usize>,
+) -> Result<Option<Bytes>, ApiError> {
+    if stripe.encoding != ErasureStripeEncoding::Raw {
+        return Ok(None);
+    }
+    let _read_slot = acquire_erasure_stripe_read_slot(state).await?;
+    let shard_size = usize::try_from(stripe.shard_size)
+        .map_err(|_| ApiError::bad_request("erasure shard is too large"))?;
+    if shard_size == 0 {
+        return Err(ApiError::bad_request("erasure shard size must be non-zero"));
+    }
+    let first = range.start / shard_size;
+    let last = (range.end - 1) / shard_size;
+    if last >= usize::from(data_shards) {
+        return Err(ApiError::bad_request(
+            "erasure range references a parity shard",
+        ));
+    }
+    let selected = (first..=last)
+        .map(|index| {
+            stripe
+                .shards
+                .iter()
+                .find(|shard| usize::from(shard.index) == index)
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("erasure manifest is missing a data shard"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fetches = stream::FuturesUnordered::new();
+    for shard in selected {
+        fetches.push(fetch_erasure_shard(state.clone(), shard));
+    }
+    let mut blocks = vec![None::<Vec<u8>>; last - first + 1];
+    while let Some((shard, result)) = fetches.next().await {
+        let Ok(block) = result else {
+            return Ok(None);
+        };
+        if block.payload.len() != shard_size {
+            return Ok(None);
+        }
+        blocks[usize::from(shard.index) - first] = Some(block.payload);
+    }
+    let mut output = Vec::with_capacity(range.end - range.start);
+    for (relative_index, block) in blocks.into_iter().enumerate() {
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        let shard_start = (first + relative_index) * shard_size;
+        let overlap_start = range.start.max(shard_start) - shard_start;
+        let overlap_end = range.end.min(shard_start + shard_size) - shard_start;
+        output.extend_from_slice(&block[overlap_start..overlap_end]);
+    }
+    if output.len() != range.end - range.start {
+        return Err(ApiError::internal(
+            "systematic erasure range produced an unexpected length",
+        ));
+    }
+    metrics::ERASURE_SYSTEMATIC_RANGE_BYTES.fetch_add(output.len() as u64, Ordering::Relaxed);
+    Ok(Some(Bytes::from(output)))
+}
+
+async fn erasure_stripe_frames(
+    state: &AppState,
+    data_shards: u16,
+    parity_shards: u16,
+    stripe: &ErasureStripe,
+) -> Result<Vec<Bytes>, ApiError> {
+    let logical_size = usize::try_from(stripe.size)
+        .map_err(|_| ApiError::bad_request("erasure logical stripe is too large"))?;
+    if let Some(bytes) = cached_erasure_stripe(state, &stripe.logical_cid, logical_size).await? {
+        return Ok(vec![bytes]);
+    }
+    if stripe.encoding == ErasureStripeEncoding::Zstd {
+        let shards = read_erasure_data_shards(state, data_shards, parity_shards, stripe).await?;
+        let encoded_size = usize::try_from(stripe.encoded_size)
+            .map_err(|_| ApiError::bad_request("erasure encoded stripe is too large"))?;
+        let logical_cid = stripe.logical_cid.clone();
+        let frames = tokio::task::spawn_blocking(move || {
+            decode_zstd_erasure_stripe_frames(shards, encoded_size, logical_size, &logical_cid)
+        })
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("erasure decompressor task failed: {error}"))
+        })??;
+        metrics::ERASURE_STREAMED_DECOMPRESSION_BYTES.fetch_add(stripe.size, Ordering::Relaxed);
+        admit_reconstructed_stripe_frames(
+            state,
+            stripe.logical_cid.clone(),
+            frames.clone(),
+            logical_size,
+        );
+        return Ok(frames);
+    }
+
+    let shards = read_erasure_data_shards(state, data_shards, parity_shards, stripe).await?;
+    let mut remaining = logical_size;
+    let mut frames = Vec::with_capacity(shards.len());
+    for shard in shards {
+        if remaining == 0 {
             break;
         }
-        match get_block_resolved(state, &shard.cid).await {
+        let take = remaining.min(shard.len());
+        let mut frame = Bytes::from(shard);
+        frame.truncate(take);
+        frames.push(frame);
+        remaining -= take;
+    }
+    if remaining != 0 {
+        return Err(ApiError::internal(
+            "erasure systematic shards are shorter than the logical stripe",
+        ));
+    }
+    let segments = frames.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+    if !stripe.logical_cid.verify_segments(&segments) {
+        return Err(ApiError::internal(
+            "erasure stripe logical checksum mismatch",
+        ));
+    }
+    metrics::ERASURE_ZERO_COPY_STREAMED_BYTES.fetch_add(stripe.size, Ordering::Relaxed);
+    admit_reconstructed_stripe_frames(
+        state,
+        stripe.logical_cid.clone(),
+        frames.clone(),
+        logical_size,
+    );
+    Ok(frames)
+}
+
+fn decode_zstd_erasure_stripe_frames(
+    shards: Vec<Vec<u8>>,
+    encoded_size: usize,
+    logical_size: usize,
+    logical_cid: &Cid,
+) -> Result<Vec<Bytes>, ApiError> {
+    const RESPONSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+    let mut decoder = zstd_safe::DCtx::try_create()
+        .ok_or_else(|| ApiError::internal("could not allocate erasure decompressor"))?;
+    let mut encoded_remaining = encoded_size;
+    let mut logical_produced = 0usize;
+    let mut frame_finished = false;
+    let mut frames = Vec::with_capacity(logical_size.div_ceil(RESPONSE_FRAME_BYTES));
+    for shard in shards {
+        if encoded_remaining == 0 {
+            break;
+        }
+        let input_size = shard.len().min(encoded_remaining);
+        encoded_remaining -= input_size;
+        let mut input = zstd_safe::InBuffer {
+            src: &shard[..input_size],
+            pos: 0,
+        };
+        while input.pos < input.src.len() {
+            let remaining_bound = logical_size.saturating_sub(logical_produced);
+            let mut frame = Vec::with_capacity(RESPONSE_FRAME_BYTES.min(remaining_bound + 1));
+            let input_before = input.pos;
+            let (hint, output_size) = {
+                let mut output = zstd_safe::OutBuffer::around(&mut frame);
+                let hint = decoder
+                    .decompress_stream(&mut output, &mut input)
+                    .map_err(|code| {
+                        ApiError::internal(format!(
+                            "erasure decompression failed: {}",
+                            zstd_safe::get_error_name(code)
+                        ))
+                    })?;
+                (hint, output.pos())
+            };
+            if logical_produced.saturating_add(output_size) > logical_size {
+                return Err(ApiError::internal(
+                    "erasure stripe decompressed beyond its logical size",
+                ));
+            }
+            logical_produced += output_size;
+            if !frame.is_empty() {
+                frames.push(Bytes::from(frame));
+            }
+            if hint == 0 {
+                frame_finished = true;
+                if input.pos != input.src.len() || encoded_remaining != 0 {
+                    return Err(ApiError::internal(
+                        "erasure stripe contains trailing compressed bytes",
+                    ));
+                }
+                break;
+            }
+            if input.pos == input_before && output_size == 0 {
+                return Err(ApiError::internal(
+                    "erasure decompressor made no forward progress",
+                ));
+            }
+        }
+    }
+    if !frame_finished {
+        return Err(ApiError::internal(
+            "erasure stripe contains a truncated compressed frame",
+        ));
+    }
+    if logical_produced != logical_size {
+        return Err(ApiError::internal(
+            "erasure stripe decoded to an unexpected logical size",
+        ));
+    }
+    let segments = frames.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+    if !logical_cid.verify_segments(&segments) {
+        return Err(ApiError::internal(
+            "erasure stripe logical checksum mismatch",
+        ));
+    }
+    Ok(frames)
+}
+
+async fn cached_erasure_stripe(
+    state: &AppState,
+    cid: &Cid,
+    logical_size: usize,
+) -> Result<Option<Bytes>, ApiError> {
+    if let Some(cache) = &state.reconstructed_stripe_cache {
+        let cache = cache.clone();
+        let cid = cid.clone();
+        return tokio::task::spawn_blocking(move || cache.get(&cid, logical_size))
+            .await
+            .map_err(|error| ApiError::internal(format!("cache reader task failed: {error}")));
+    }
+    Ok(None)
+}
+
+fn admit_reconstructed_stripe(
+    state: &AppState,
+    cid: Cid,
+    bytes: Bytes,
+    observation: std::ops::Range<usize>,
+) {
+    let Some(cache) = &state.reconstructed_stripe_cache else {
+        return;
+    };
+    let cache = cache.clone();
+    // This cache is disposable and never receives durability credit. Do not
+    // hold the response behind a large cache-file write; the verified
+    // reconstructed bytes can be returned while admission completes on the
+    // blocking pool.
+    if let Some(write_slot) = cache.try_write_slot() {
+        let _admission = tokio::task::spawn_blocking(move || {
+            cache.observe_range_and_maybe_put(&cid, &bytes, observation);
+            drop(write_slot);
+        });
+    } else {
+        cache.record_write_saturation_bypass();
+    }
+}
+
+fn admit_reconstructed_stripe_frames(
+    state: &AppState,
+    cid: Cid,
+    frames: Vec<Bytes>,
+    logical_size: usize,
+) {
+    let Some(cache) = &state.reconstructed_stripe_cache else {
+        return;
+    };
+    let cache = cache.clone();
+    if let Some(write_slot) = cache.try_write_slot() {
+        let _admission = tokio::task::spawn_blocking(move || {
+            cache.observe_and_maybe_put_frames(&cid, &frames, logical_size);
+            drop(write_slot);
+        });
+    } else {
+        cache.record_write_saturation_bypass();
+    }
+}
+
+async fn reconstruct_erasure_stripe_bytes(
+    state: &AppState,
+    data_shards: u16,
+    parity_shards: u16,
+    stripe: &ErasureStripe,
+) -> Result<Bytes, ApiError> {
+    let logical_size = usize::try_from(stripe.size)
+        .map_err(|_| ApiError::bad_request("erasure logical stripe is too large"))?;
+    let data_shards = read_erasure_data_shards(state, data_shards, parity_shards, stripe).await?;
+    let encoded_size = usize::try_from(stripe.encoded_size)
+        .map_err(|_| ApiError::bad_request("erasure encoded stripe is too large"))?;
+    let mut encoded = Vec::with_capacity(encoded_size);
+    for shard in data_shards {
+        encoded.extend_from_slice(&shard);
+    }
+    encoded.truncate(encoded_size);
+    let encoding = stripe.encoding;
+    let logical_cid = stripe.logical_cid.clone();
+    let logical = tokio::task::spawn_blocking(move || {
+        decode_erasure_stripe_payload(encoding, encoded, logical_size, &logical_cid)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("erasure decompressor task failed: {error}")))??;
+    Ok(Bytes::from(logical))
+}
+
+async fn read_erasure_data_shards(
+    state: &AppState,
+    data_shards: u16,
+    parity_shards: u16,
+    stripe: &ErasureStripe,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    let _read_slot = acquire_erasure_stripe_read_slot(state).await?;
+    let active_stripe_reads = metrics::ERASURE_ACTIVE_STRIPE_READS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let _active_guard = ErasureActiveStripeReadGuard;
+    let allow_one_hedge = active_stripe_reads <= ERASURE_HEDGE_MAX_ACTIVE_STRIPE_READS;
+    let mut hedge_issued = false;
+    let data_shards = data_shards as usize;
+    let parity_shards = parity_shards as usize;
+    let total_shards = data_shards + parity_shards;
+    let shard_size = stripe.shard_size as usize;
+    let mut shards = vec![None::<Vec<u8>>; total_shards];
+    let mut fetches = stream::FuturesUnordered::new();
+    for shard in stripe.shards.iter().take(data_shards).cloned() {
+        fetches.push(fetch_erasure_shard(state.clone(), shard));
+    }
+    let mut parity = stripe.shards.iter().skip(data_shards).cloned();
+    let mut available = 0usize;
+    while available < data_shards {
+        if fetches.is_empty() {
+            let Some(shard) = parity.next() else { break };
+            fetches.push(fetch_erasure_shard(state.clone(), shard));
+        }
+        let next = if allow_one_hedge && !hedge_issued {
+            let hedge_delay = erasure_shard_hedge_delay();
+            match time::timeout(hedge_delay, fetches.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    if let Some(shard) = parity.next() {
+                        hedge_issued = true;
+                        metrics::ERASURE_SHARD_READ_HEDGES.fetch_add(1, Ordering::Relaxed);
+                        fetches.push(fetch_erasure_shard(state.clone(), shard));
+                        continue;
+                    } else {
+                        fetches.next().await
+                    }
+                }
+            }
+        } else {
+            fetches.next().await
+        };
+        let Some((shard, result)) = next else {
+            continue;
+        };
+        match result {
             Ok(block) if block.payload.len() == shard_size => {
                 let slot = &mut shards[shard.index as usize];
                 if slot.is_none() {
@@ -1853,21 +2558,104 @@ async fn erasure_object_bytes(state: &AppState, cid: &Cid) -> Result<Vec<u8>, Ap
             "not enough erasure shards to reconstruct object",
         ));
     }
-    let reed_solomon = ReedSolomon::new(data_shards, parity_shards)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    reed_solomon
-        .reconstruct(&mut shards)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let mut bytes = Vec::with_capacity(manifest.size as usize);
+    if shards.iter().take(data_shards).any(Option::is_none) {
+        shards = tokio::task::spawn_blocking(move || {
+            let reed_solomon = ReedSolomon::new(data_shards, parity_shards)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            reed_solomon
+                .reconstruct(&mut shards)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            Ok::<_, ApiError>(shards)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("erasure decoder task failed: {error}")))??;
+    }
+    let mut data = Vec::with_capacity(data_shards);
     for shard in shards.iter_mut().take(data_shards) {
         let shard = shard
             .take()
             .ok_or_else(|| ApiError::internal("erasure reconstruction left data shard missing"))?;
-        bytes.extend_from_slice(&shard);
+        data.push(shard);
     }
-    bytes.truncate(manifest.size as usize);
-    ERASURE_OBJECT_READS.fetch_add(1, Ordering::Relaxed);
-    Ok(bytes)
+    Ok(data)
+}
+
+async fn acquire_erasure_stripe_read_slot(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    let started = time::Instant::now();
+    let permit = state
+        .erasure_stripe_read_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("erasure read scheduler is unavailable"))?;
+    metrics::ERASURE_READ_ADMISSION_QUEUE_MICROS.fetch_add(
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    metrics::ERASURE_READ_ADMISSION_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+    Ok(permit)
+}
+
+struct ErasureActiveStripeReadGuard;
+
+impl Drop for ErasureActiveStripeReadGuard {
+    fn drop(&mut self) {
+        metrics::ERASURE_ACTIVE_STRIPE_READS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn fetch_erasure_shard(
+    state: AppState,
+    shard: ErasureShard,
+) -> (ErasureShard, Result<pepper_types::Block, ApiError>) {
+    let started = std::time::Instant::now();
+    let result = get_block_resolved_transient(&state, &shard.cid).await;
+    let sample = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let _ = metrics::ERASURE_SHARD_FETCH_EWMA_MICROS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_mul(7).saturating_add(sample) / 8),
+    );
+    (shard, result)
+}
+
+fn erasure_shard_hedge_delay() -> Duration {
+    Duration::from_micros(
+        metrics::ERASURE_SHARD_FETCH_EWMA_MICROS
+            .load(Ordering::Relaxed)
+            .saturating_mul(4)
+            .clamp(10_000, 100_000),
+    )
+}
+
+fn decode_erasure_stripe_payload(
+    encoding: ErasureStripeEncoding,
+    encoded: Vec<u8>,
+    logical_size: usize,
+    logical_cid: &Cid,
+) -> Result<Vec<u8>, ApiError> {
+    let logical = match encoding {
+        ErasureStripeEncoding::Raw => encoded,
+        ErasureStripeEncoding::Zstd => {
+            zstd::bulk::decompress(&encoded, logical_size).map_err(|error| {
+                ApiError::internal(format!("erasure decompression failed: {error}"))
+            })?
+        }
+    };
+    if logical.len() != logical_size {
+        return Err(ApiError::internal(format!(
+            "erasure stripe decoded to {} bytes; expected {logical_size}",
+            logical.len()
+        )));
+    }
+    if !logical_cid.verify(&logical) {
+        return Err(ApiError::internal(
+            "erasure stripe logical checksum mismatch",
+        ));
+    }
+    Ok(logical)
 }
 
 async fn restore_dir_manifest(state: &AppState, cid: &Cid, path: &FsPath) -> Result<(), ApiError> {
@@ -2041,56 +2829,244 @@ async fn read_body_limited(
     Ok(bytes)
 }
 
-async fn put_object_stream_receipt(
+struct ObjectWriteReceipts {
+    receipt: DurabilityReceipt,
+    blocks: Vec<DurabilityReceipt>,
+}
+
+async fn put_policy_object_stream_receipts(
     state: &AppState,
     body: Body,
-) -> Result<DurabilityReceipt, ApiError> {
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    content_length: Option<u64>,
+    force_erasure: bool,
+) -> Result<ObjectWriteReceipts, ApiError> {
+    if !state.erasure_enabled {
+        return put_object_stream_receipts(state, body).await;
+    }
+    if force_erasure || content_length.is_some_and(|length| length >= state.erasure_min_size_bytes)
+    {
+        return put_erasure_object_stream_receipts(
+            state,
+            body,
+            state.erasure_data_shards,
+            state.erasure_parity_shards,
+        )
+        .await;
+    }
+    if content_length.is_some() {
+        return put_object_stream_receipts(state, body).await;
+    }
+
+    let mut source = body.into_data_stream();
+    let mut prefix = Vec::<Bytes>::new();
+    let mut prefix_bytes = 0u64;
+    while prefix_bytes < state.erasure_min_size_bytes {
+        let Some(chunk) = source.next().await else {
+            let body = Body::from_stream(stream::iter(
+                prefix
+                    .into_iter()
+                    .map(Ok::<Bytes, std::convert::Infallible>),
+            ));
+            return put_object_stream_receipts(state, body).await;
+        };
+        let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
+        prefix_bytes = prefix_bytes.saturating_add(chunk.len() as u64);
+        prefix.push(chunk);
+    }
+    let body = Body::from_stream(
+        stream::iter(prefix.into_iter().map(Ok::<Bytes, axum::Error>)).chain(source),
+    );
+    put_erasure_object_stream_receipts(
+        state,
+        body,
+        state.erasure_data_shards,
+        state.erasure_parity_shards,
+    )
+    .await
+}
+
+async fn put_erasure_object_stream_receipts(
+    state: &AppState,
+    body: Body,
+    data_shards: u16,
+    parity_shards: u16,
+) -> Result<ObjectWriteReceipts, ApiError> {
+    validate_erasure_policy(data_shards, parity_shards)?;
+    let max_block_bytes = state.max_block_bytes.unwrap_or(DEFAULT_MAX_BLOCK_BYTES);
+    let shard_size = max_block_bytes.min(OBJECT_CHUNK_SIZE as u64) as usize;
+    if shard_size == 0 {
+        return Err(ApiError::internal(
+            "erasure stripe shard size must be greater than zero",
+        ));
+    }
+    let stripe_size = shard_size
+        .checked_mul(data_shards as usize)
+        .ok_or_else(|| ApiError::bad_request("erasure stripe size overflow"))?;
+    let candidates = placement_candidates(state, state.network.peers().await);
+    let pipeline_depth = object_chunk_pipeline_depth(1).clamp(1, 4);
     let mut body_stream = body.into_data_stream();
-    let mut pending = Vec::with_capacity(CHUNK_SIZE);
-    let mut chunks = Vec::new();
+    let mut pending = Vec::with_capacity(stripe_size);
+    let mut transfers = stream::FuturesOrdered::new();
+    let mut stripes = Vec::new();
+    let mut block_receipts = Vec::new();
     let mut total = 0u64;
+    let mut next_offset = 0u64;
+    let mut all_stripes_durable = true;
+
+    loop {
+        let streaming_started = time::Instant::now();
+        let next = body_stream.next().await;
+        metrics::observe_phase(
+            &metrics::S3_REQUEST_STREAMING_PHASES,
+            &metrics::S3_REQUEST_STREAMING_MICROS,
+            streaming_started.elapsed(),
+        );
+        let Some(data) = next else {
+            break;
+        };
+        let data = data.map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let projected = total.saturating_add(data.len() as u64);
+        enforce_size_limit(state.max_object_bytes, projected, "erasure object")?;
+        total = projected;
+        let mut remaining = data.as_ref();
+        while !remaining.is_empty() {
+            let take = (stripe_size - pending.len()).min(remaining.len());
+            pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if pending.len() == stripe_size {
+                let payload = std::mem::replace(&mut pending, Vec::with_capacity(stripe_size));
+                transfers.push_back(encode_and_store_erasure_stripe(
+                    state,
+                    payload,
+                    next_offset,
+                    data_shards,
+                    parity_shards,
+                    candidates.clone(),
+                ));
+                next_offset = next_offset.saturating_add(stripe_size as u64);
+                if transfers.len() >= pipeline_depth {
+                    let stored = transfers
+                        .next()
+                        .await
+                        .expect("a full erasure stripe pipeline has a result")?;
+                    all_stripes_durable &=
+                        stored.distinct_nodes >= data_shards.saturating_add(parity_shards) as usize;
+                    stripes.push(stored.stripe);
+                    block_receipts.extend(stored.receipts);
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        transfers.push_back(encode_and_store_erasure_stripe(
+            state,
+            pending,
+            next_offset,
+            data_shards,
+            parity_shards,
+            candidates,
+        ));
+    }
+    while let Some(stored) = transfers.next().await {
+        let stored = stored?;
+        all_stripes_durable &=
+            stored.distinct_nodes >= data_shards.saturating_add(parity_shards) as usize;
+        stripes.push(stored.stripe);
+        block_receipts.extend(stored.receipts);
+    }
+
+    let manifest = ErasureManifest::new(
+        total,
+        data_shards,
+        parity_shards,
+        stripe_size as u64,
+        stripes,
+    );
+    manifest.validate().map_err(ApiError::manifest)?;
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
+    let mut receipt = put_replicated_block(state, CODEC_ERASURE_MANIFEST, manifest_bytes).await?;
+    if !all_stripes_durable {
+        receipt.status = "degraded".to_string();
+    }
+    ERASURE_OBJECT_WRITES.fetch_add(1, Ordering::Relaxed);
+    block_receipts.push(receipt.clone());
+    Ok(ObjectWriteReceipts {
+        receipt,
+        blocks: block_receipts,
+    })
+}
+
+async fn put_object_stream_receipts(
+    state: &AppState,
+    body: Body,
+) -> Result<ObjectWriteReceipts, ApiError> {
+    let mut body_stream = body.into_data_stream();
+    let mut pending = Vec::with_capacity(OBJECT_CHUNK_SIZE);
+    let mut transfers = stream::FuturesOrdered::new();
+    let mut chunks = Vec::new();
+    let mut block_receipts = Vec::new();
+    let mut total = 0u64;
+    let mut next_chunk_offset = 0u64;
     let mut all_chunks_durable = true;
-    while let Some(data) = body_stream.next().await {
+    let pipeline_depth = object_chunk_pipeline_depth(state.replication_factor);
+    loop {
+        let streaming_started = time::Instant::now();
+        let next = body_stream.next().await;
+        metrics::observe_phase(
+            &metrics::S3_REQUEST_STREAMING_PHASES,
+            &metrics::S3_REQUEST_STREAMING_MICROS,
+            streaming_started.elapsed(),
+        );
+        let Some(data) = next else {
+            break;
+        };
         let data = data.map_err(|error| ApiError::bad_request(error.to_string()))?;
         let projected = total.saturating_add(data.len() as u64);
         enforce_size_limit(state.max_object_bytes, projected, "object")?;
         total = projected;
         let mut remaining = data.as_ref();
         while !remaining.is_empty() {
-            let take = (CHUNK_SIZE - pending.len()).min(remaining.len());
+            let take = (OBJECT_CHUNK_SIZE - pending.len()).min(remaining.len());
             pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
-            if pending.len() == CHUNK_SIZE {
-                let payload = std::mem::replace(&mut pending, Vec::with_capacity(CHUNK_SIZE));
-                let receipt = put_replicated_block(state, CODEC_RAW, payload).await?;
-                all_chunks_durable &= receipt.status == "durable";
-                chunks.push(ObjectChunk {
-                    offset: chunks.len() as u64 * CHUNK_SIZE as u64,
-                    size: CHUNK_SIZE as u64,
-                    cid: receipt.cid,
-                });
+            if pending.len() == OBJECT_CHUNK_SIZE {
+                let payload =
+                    std::mem::replace(&mut pending, Vec::with_capacity(OBJECT_CHUNK_SIZE));
+                transfers.push_back(put_object_chunk(state, payload, next_chunk_offset));
+                next_chunk_offset += OBJECT_CHUNK_SIZE as u64;
+                if transfers.len() >= pipeline_depth {
+                    let (chunk, receipt) = transfers
+                        .next()
+                        .await
+                        .expect("a full object chunk pipeline has a result")?;
+                    all_chunks_durable &= receipt.status == "durable";
+                    chunks.push(chunk);
+                    block_receipts.push(receipt);
+                }
             }
         }
     }
     if !pending.is_empty() {
-        let size = pending.len() as u64;
-        let receipt = put_replicated_block(state, CODEC_RAW, pending).await?;
-        all_chunks_durable &= receipt.status == "durable";
-        chunks.push(ObjectChunk {
-            offset: total - size,
-            size,
-            cid: receipt.cid,
-        });
+        transfers.push_back(put_object_chunk(state, pending, next_chunk_offset));
     }
-    let manifest = ObjectManifest::new(total, CHUNK_SIZE as u64, chunks);
+    while let Some(result) = transfers.next().await {
+        let (chunk, receipt) = result?;
+        all_chunks_durable &= receipt.status == "durable";
+        chunks.push(chunk);
+        block_receipts.push(receipt);
+    }
+    let manifest = ObjectManifest::new(total, OBJECT_CHUNK_SIZE as u64, chunks);
     manifest.validate().map_err(ApiError::manifest)?;
     let manifest_bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
     let mut receipt = put_replicated_block(state, CODEC_OBJECT_MANIFEST, manifest_bytes).await?;
     if !all_chunks_durable {
         receipt.status = "degraded".to_string();
     }
-    Ok(receipt)
+    block_receipts.push(receipt.clone());
+    Ok(ObjectWriteReceipts {
+        receipt,
+        blocks: block_receipts,
+    })
 }
 
 async fn put_object_bytes_internal(state: &AppState, bytes: Vec<u8>) -> Result<Cid, ApiError> {
@@ -2102,19 +3078,31 @@ async fn put_object_bytes_receipt(
     bytes: Vec<u8>,
 ) -> Result<DurabilityReceipt, ApiError> {
     enforce_size_limit(state.max_object_bytes, bytes.len() as u64, "object")?;
-    let chunk_size = 4 * 1024 * 1024usize;
+    let mut transfers = stream::FuturesOrdered::new();
     let mut chunks = Vec::new();
     let mut all_chunks_durable = true;
-    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
-        let receipt = put_replicated_block(state, CODEC_RAW, chunk.to_vec()).await?;
-        all_chunks_durable &= receipt.status == "durable";
-        chunks.push(ObjectChunk {
-            offset: (index * chunk_size) as u64,
-            size: chunk.len() as u64,
-            cid: receipt.cid,
-        });
+    let pipeline_depth = object_chunk_pipeline_depth(state.replication_factor);
+    for (index, chunk) in bytes.chunks(OBJECT_CHUNK_SIZE).enumerate() {
+        transfers.push_back(put_object_chunk(
+            state,
+            chunk.to_vec(),
+            (index * OBJECT_CHUNK_SIZE) as u64,
+        ));
+        if transfers.len() >= pipeline_depth {
+            let (chunk, receipt) = transfers
+                .next()
+                .await
+                .expect("a full object chunk pipeline has a result")?;
+            all_chunks_durable &= receipt.status == "durable";
+            chunks.push(chunk);
+        }
     }
-    let manifest = ObjectManifest::new(bytes.len() as u64, chunk_size as u64, chunks);
+    while let Some(result) = transfers.next().await {
+        let (chunk, receipt) = result?;
+        all_chunks_durable &= receipt.status == "durable";
+        chunks.push(chunk);
+    }
+    let manifest = ObjectManifest::new(bytes.len() as u64, OBJECT_CHUNK_SIZE as u64, chunks);
     manifest.validate().map_err(ApiError::manifest)?;
     let manifest_bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
     let mut receipt = put_replicated_block(state, CODEC_OBJECT_MANIFEST, manifest_bytes).await?;
@@ -2122,6 +3110,31 @@ async fn put_object_bytes_receipt(
         receipt.status = "degraded".to_string();
     }
     Ok(receipt)
+}
+
+async fn put_object_chunk(
+    state: &AppState,
+    payload: Vec<u8>,
+    offset: u64,
+) -> Result<(ObjectChunk, DurabilityReceipt), ApiError> {
+    let size = payload.len() as u64;
+    let receipt = put_replicated_block(state, CODEC_RAW, payload).await?;
+    Ok((
+        ObjectChunk {
+            offset,
+            size,
+            cid: receipt.cid.clone(),
+        },
+        receipt,
+    ))
+}
+
+fn object_chunk_pipeline_depth(replication_factor: usize) -> usize {
+    if replication_factor > 1 {
+        OBJECT_CHUNK_PIPELINE_DEPTH
+    } else {
+        1
+    }
 }
 
 fn safe_join(root: &FsPath, requested: &str) -> Result<PathBuf, ApiError> {
@@ -2272,20 +3285,29 @@ async fn require_http_auth_and_rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let _permit = state
-        .http_concurrency
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::Unavailable,
-                "HTTP concurrency limit exceeded",
-            )
-        })?;
     let s3_request = state.s3.is_some()
         && !request.uri().path().starts_with("/v1/")
         && !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
+    let permit = match state.http_concurrency.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) if s3_request => {
+            metrics::S3_HTTP_ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return Ok(S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SlowDown",
+                "the bounded S3 request queue is full",
+                request.uri().path(),
+            )
+            .into_response());
+        }
+        Err(_) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                "HTTP concurrency limit exceeded",
+            ));
+        }
+    };
     if let Some(token) = &state.api_bearer_token
         && !s3_request
     {
@@ -2308,7 +3330,13 @@ async fn require_http_auth_and_rate_limit(
         // The API is local/private by design. Do not trust caller-controlled forwarding headers.
         check_http_rate_limit(&state, "api", limit)?;
     }
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().map(move |result| {
+        let _permit = &permit;
+        result
+    });
+    Ok(Response::from_parts(parts, Body::from_stream(stream)))
 }
 
 fn check_http_rate_limit(state: &AppState, key: &str, limit: u64) -> Result<(), ApiError> {
@@ -2381,6 +3409,56 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn erasure_stripe_compression_is_canonical_and_checksum_bound() {
+        let compressible = vec![b'a'; 1024 * 1024];
+        let logical_cid = Cid::new(CODEC_RAW, &compressible);
+        let (encoding, encoded) = encode_erasure_stripe_payload(compressible.clone()).unwrap();
+        assert_eq!(encoding, ErasureStripeEncoding::Zstd);
+        assert!(encoded.len() < compressible.len() / 10);
+        assert_eq!(
+            decode_erasure_stripe_payload(encoding, encoded, compressible.len(), &logical_cid)
+                .unwrap(),
+            compressible
+        );
+
+        let mut value = 0x6a09e667f3bcc909u64;
+        let mut incompressible = vec![0u8; 1024 * 1024];
+        for byte in &mut incompressible {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            *byte = value as u8;
+        }
+        let (encoding, encoded) = encode_erasure_stripe_payload(incompressible.clone()).unwrap();
+        assert_eq!(encoding, ErasureStripeEncoding::Raw);
+        assert_eq!(encoded, incompressible);
+    }
+
+    #[test]
+    fn compressed_erasure_shards_decode_into_verified_frames() {
+        let logical = (0..3 * 1024 * 1024 + 17)
+            .map(|index| ((index / 97) % 251) as u8)
+            .collect::<Vec<_>>();
+        let cid = Cid::new(CODEC_RAW, &logical);
+        let encoded = zstd::bulk::compress(&logical, ERASURE_COMPRESSION_LEVEL).unwrap();
+        let shard_size = encoded.len().div_ceil(6);
+        let mut shards = encoded
+            .chunks(shard_size)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        while shards.len() < 6 {
+            shards.push(Vec::new());
+        }
+        for shard in &mut shards {
+            shard.resize(shard_size, 0);
+        }
+        let frames =
+            decode_zstd_erasure_stripe_frames(shards, encoded.len(), logical.len(), &cid).unwrap();
+        assert!(frames.len() > 1);
+        assert_eq!(frames.concat(), logical);
+    }
 
     #[test]
     fn rejects_unsafe_job_ids_and_paths() {

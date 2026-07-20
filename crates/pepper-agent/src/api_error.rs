@@ -97,9 +97,11 @@ impl ApiError {
 impl From<StorageError> for ApiError {
     fn from(error: StorageError) -> Self {
         let (status, code) = match error {
-            StorageError::InvalidCid(_) => (StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest),
+            StorageError::InvalidCid(_) | StorageError::InvalidRange { .. } => {
+                (StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest)
+            }
             StorageError::NotFound(_) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
-            StorageError::HashMismatch(_) => (
+            StorageError::HashMismatch(_) | StorageError::InvalidEncodedBlock(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ErrorCode::IntegrityFailure,
             ),
@@ -118,7 +120,12 @@ impl From<StorageError> for ApiError {
             | StorageError::Table(_)
             | StorageError::RedbStorage(_)
             | StorageError::Commit(_)
-            | StorageError::Serde(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
+            | StorageError::Serde(_)
+            | StorageError::BatchResultMissing
+            | StorageError::PreverifiedCidMismatch(_)
+            | StorageError::Compression(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
+            }
         };
         Self::new(status, code, error.to_string())
     }

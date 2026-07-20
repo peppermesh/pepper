@@ -22,6 +22,8 @@ services:
   node1:
     <<: *pepper-node
     hostname: node1
+    ports:
+      - "127.0.0.1:19080:19080"
     environment:
       <<: *pepper-environment
       PEPPER_TEST_NODE_NAME: node1

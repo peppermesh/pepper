@@ -617,18 +617,24 @@ fn estimate_cid_locality(
             if manifest.validate().is_err() {
                 return (0, 0);
             }
-            let local_shards = manifest
-                .shards
+            let local = manifest
+                .stripes
                 .iter()
-                .filter(|shard| state.block_store.has(&shard.cid).unwrap_or(false))
-                .count();
-            let local = if local_shards >= manifest.data_shards as usize {
-                manifest.size
-            } else {
-                (local_shards as u64)
-                    .saturating_mul(manifest.shard_size)
-                    .min(manifest.size)
-            };
+                .map(|stripe| {
+                    let local_shards = stripe
+                        .shards
+                        .iter()
+                        .filter(|shard| state.block_store.has(&shard.cid).unwrap_or(false))
+                        .count();
+                    if local_shards >= manifest.data_shards as usize {
+                        stripe.size
+                    } else {
+                        (local_shards as u64)
+                            .saturating_mul(stripe.shard_size)
+                            .min(stripe.size)
+                    }
+                })
+                .sum();
             (local, manifest.size)
         }
         CODEC_DIR_MANIFEST if has_local => {

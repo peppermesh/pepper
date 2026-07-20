@@ -4,13 +4,15 @@
 
 use super::*;
 use pepper_bucket::{
-    BucketLimits, BucketObjectDescriptor, get_descriptor, put_descriptor, versions,
+    BucketLimits, BucketObjectDescriptor, encode_descriptor, get_descriptor, put_descriptor,
+    versions,
 };
 use pepper_merkle::{MerkleLimits, ScanQuery};
 use pepper_namespace::{
     CommandEnvelope, NamespaceCommand, NamespaceKind, NamespaceMutation, NamespaceStateMachine,
     TransactionCommand,
 };
+use pepper_types::CODEC_BUCKET_OBJECT;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +33,8 @@ pub(super) struct BucketPutRequest {
     pub(super) if_generation: Option<u64>,
     pub(super) if_cid: Option<Cid>,
     pub(super) request_id: String,
+    #[serde(skip)]
+    pub(super) preverified_durability: Vec<DurabilityReceipt>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,32 +95,41 @@ pub(super) async fn bucket_put(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
-    let current = current_value(&state, &namespace_id, &request.key_hex).await?;
-    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
-    let previous = current.map(|value| value.cid);
+    let key =
+        hex::decode(&request.key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
     let base = namespace_manager(&state)?
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
+    let current = pepper_merkle::get(
+        &state.namespace_data_store,
+        &base.current_root_cid,
+        &key,
+        MerkleLimits::default(),
+    )
+    .await
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
+    let previous = current.map(|value| value.cid);
+    let committed_at_unix_seconds = unix_seconds();
     let descriptor = BucketObjectDescriptor::object(
         request.content_cid.clone(),
         request.logical_size,
         request.content_type,
         request.metadata,
         base.current_revision.saturating_add(1),
+        committed_at_unix_seconds,
         previous,
     );
-    let descriptor_cid = put_descriptor(
-        &state.namespace_data_store,
-        &descriptor,
-        BucketLimits::default(),
-    )
-    .await
-    .map_err(bucket_error)?;
+    let descriptor_bytes =
+        encode_descriptor(&descriptor, BucketLimits::default()).map_err(bucket_error)?;
+    let descriptor_receipt =
+        put_replicated_block(&state, CODEC_BUCKET_OBJECT, descriptor_bytes).await?;
+    let descriptor_cid = descriptor_receipt.cid.clone();
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: "bucket-http".to_string(),
-        timestamp_unix_seconds: unix_seconds(),
+        timestamp_unix_seconds: committed_at_unix_seconds,
         signature_hex: "00".to_string(),
         command: NamespaceCommand::ApplyTransaction {
             transaction: TransactionCommand {
@@ -133,11 +146,14 @@ pub(super) async fn bucket_put(
             },
         },
     };
+    let mut preverified_durability = request.preverified_durability;
+    preverified_durability.push(descriptor_receipt);
     let mut response = apply_command(
         &state,
         namespace_id,
         command,
         vec![request.content_cid],
+        preverified_durability,
         request.logical_size,
         true,
     )
@@ -208,8 +224,12 @@ pub(super) async fn bucket_delete(
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
-    let descriptor =
-        BucketObjectDescriptor::tombstone(base.current_revision.saturating_add(1), previous);
+    let committed_at_unix_seconds = unix_seconds();
+    let descriptor = BucketObjectDescriptor::tombstone(
+        base.current_revision.saturating_add(1),
+        committed_at_unix_seconds,
+        previous,
+    );
     let descriptor_cid = put_descriptor(
         &state.namespace_data_store,
         &descriptor,
@@ -220,7 +240,7 @@ pub(super) async fn bucket_delete(
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: "bucket-http".to_string(),
-        timestamp_unix_seconds: unix_seconds(),
+        timestamp_unix_seconds: committed_at_unix_seconds,
         signature_hex: "00".to_string(),
         command: NamespaceCommand::ApplyTransaction {
             transaction: TransactionCommand {
@@ -237,9 +257,17 @@ pub(super) async fn bucket_delete(
             },
         },
     };
-    let mut response = apply_command(&state, namespace_id, command, Vec::new(), 0, false)
-        .await?
-        .0;
+    let mut response = apply_command(
+        &state,
+        namespace_id,
+        command,
+        Vec::new(),
+        Vec::new(),
+        0,
+        false,
+    )
+    .await?
+    .0;
     response["object_descriptor_cid"] = serde_json::json!(descriptor_cid);
     response["tombstone"] = serde_json::json!(true);
     Ok(Json(response))

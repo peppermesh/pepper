@@ -52,10 +52,11 @@ impl Scenario for ErasureInventoryScenario {
         for node in cluster.nodes.values() {
             let inventory =
                 block_inventory(&cluster.backend, &node.id, &node.node_identity).await?;
-            for shard in &manifest.shards {
+            for shard in manifest.stripes.iter().flat_map(|stripe| &stripe.shards) {
                 if let Some(entry) = inventory.iter().find(|entry| entry.cid == shard.cid) {
                     ensure!(entry.integrity_state == "verified");
-                    ensure!(entry.stored_size_bytes == Some(shard.size));
+                    ensure!(entry.logical_size_bytes == shard.size);
+                    ensure!(entry.stored_size_bytes.is_some_and(|size| size > 0));
                     physical_locations
                         .entry(shard.cid.to_string())
                         .or_default()
@@ -63,8 +64,14 @@ impl Scenario for ErasureInventoryScenario {
                 }
             }
         }
+        let expected_shard_cids = manifest
+            .stripes
+            .iter()
+            .flat_map(|stripe| &stripe.shards)
+            .map(|shard| shard.cid.to_string())
+            .collect::<BTreeSet<_>>();
         ensure!(
-            physical_locations.len() == manifest.shards.len(),
+            physical_locations.keys().cloned().collect::<BTreeSet<_>>() == expected_shard_cids,
             "one or more shards are absent from physical inventories"
         );
         ensure!(
@@ -101,9 +108,15 @@ impl Scenario for ErasureInventoryScenario {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("erasure diagnostic shards missing"))?;
         let expected = manifest
-            .shards
+            .stripes
             .iter()
-            .map(|shard| (shard.index, shard.cid.clone(), shard.size))
+            .enumerate()
+            .flat_map(|(stripe_index, stripe)| {
+                stripe
+                    .shards
+                    .iter()
+                    .map(move |shard| (stripe_index, shard.index, shard.cid.clone(), shard.size))
+            })
             .collect::<Vec<_>>();
         verify_erasure_inventory(shards, &expected)?;
         let now = std::time::SystemTime::now()
@@ -125,7 +138,7 @@ impl Scenario for ErasureInventoryScenario {
             "invariant",
             json!({
                 "invariant_id":"SAF-EC-001","invariant_result":"pass",
-                "details":{"manifest_cid":receipt.cid,"shards":manifest.shards.len(),"physical_locations":physical_locations}
+                "details":{"manifest_cid":receipt.cid,"shards":expected.len(),"physical_locations":physical_locations}
             }),
         )?;
         Ok(())
