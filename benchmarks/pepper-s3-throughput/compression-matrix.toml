@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
+object_sizes = [67108864, 1073741824]
+concurrency = [1, 4, 16]
+routing = ["leader", "follower"]
+topologies = ["nine-ec"]
+operations = ["put", "multipart-put", "get", "range-get"]
+payload_profiles = ["incompressible", "compressible-2x", "compressible-4x", "compressible-10x", "compressible-20x"]
+range_bytes = 8388608
+minimum_duration_seconds = 60
+cold_dataset_memory_ratio = 1.25

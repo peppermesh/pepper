@@ -115,6 +115,18 @@ message BlockPutReplicaRequest {
   string codec = 2;
 }
 
+// Authenticated metadata for a replica payload that follows the request
+// envelope directly on the same QUIC stream. The signed CID binds the logical
+// payload while encoded_size frames Pepper's versioned storage representation.
+message BlockPutReplicaStreamRequest {
+  string cid = 1;
+  string codec = 2;
+  // Decoded logical size used by the CID and public APIs.
+  uint64 size = 3;
+  // Bytes following this message, including the storage envelope.
+  uint64 encoded_size = 4;
+}
+
 message BlockPutReplicaResponse {
   string cid = 1;
   string codec = 2;
@@ -137,6 +149,14 @@ message BlockAnnounceProviderRequest {
 
 message BlockAnnounceProviderResponse {
   bool accepted = 1;
+}
+
+message BlockAnnounceProviderBatchRequest {
+  repeated string provider_record_json = 1;
+}
+
+message BlockAnnounceProviderBatchResponse {
+  uint64 accepted = 1;
 }
 
 message PinApplyRequest {
@@ -271,12 +291,22 @@ message NamespaceForwardResponse {
   uint64 leader_term = 3;
 }
 
+enum NamespaceStateProjection {
+  NAMESPACE_STATE_PROJECTION_FULL = 0;
+  NAMESPACE_STATE_PROJECTION_APPLIED_INDEX = 1;
+  NAMESPACE_STATE_PROJECTION_HEAD = 2;
+}
+
 message NamespaceStateRequest {
   NamespaceRpcContext context = 1;
+  NamespaceStateProjection projection = 2;
 }
 
 message NamespaceStateResponse {
   bytes state_json = 1;
+  uint64 applied_index = 2;
+  uint64 applied_term = 3;
+  bool has_applied_index = 4;
 }
 
 message NamespaceBootstrapRequest {

@@ -9,9 +9,6 @@ use pepper_publication::{
     reconcile_pin_intents,
 };
 
-static PIN_BROADCAST_LIMIT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
-
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(super) struct AgentDurabilityBackend(pub(super) AppState);
@@ -27,6 +24,14 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .await
             .map_err(|error| PublicationError::Storage(error.message))?;
         let payload = block.payload;
+        let encoded = self
+            .0
+            .block_store
+            .get_encoded(cid)
+            .or_else(|_| self.0.block_store.encode(cid.codec, &payload))
+            .map_err(|error| PublicationError::Storage(error.to_string()))?;
+        let encoded_size = encoded.logical_size_bytes();
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
 
         // Object ingestion already persists signed provider records for every
         // acknowledged replica. Confirm those replicas with a cheap authenticated
@@ -42,7 +47,8 @@ impl DurabilityBackend for AgentDurabilityBackend {
         let provider_records = if replication_factor > 1 {
             self.0
                 .network
-                .local_provider_records(cid)
+                .find_providers(cid)
+                .await
                 .map_err(|error| PublicationError::Protection(error.to_string()))?
         } else {
             Vec::new()
@@ -118,7 +124,7 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .map(|peer| {
                 let state = self.0.clone();
                 let cid = cid.clone();
-                let payload = payload.clone();
+                let encoded_payload = encoded_payload.clone();
                 async move {
                     let transfer = async {
                         for address in &peer.addresses {
@@ -127,7 +133,13 @@ impl DurabilityBackend for AgentDurabilityBackend {
                             };
                             let Ok(ack) = state
                                 .network
-                                .block_put_replica(address, cid.codec, payload.clone())
+                                .block_put_replica_stream(
+                                    address,
+                                    cid.codec,
+                                    &cid,
+                                    encoded_size,
+                                    encoded_payload.clone(),
+                                )
                                 .await
                             else {
                                 continue;
@@ -137,7 +149,7 @@ impl DurabilityBackend for AgentDurabilityBackend {
                                 &peer.node_id,
                                 &cid,
                                 cid.codec,
-                                payload.len() as u64,
+                                encoded_size,
                                 &ack,
                             ) {
                                 return Some(provider);
@@ -186,7 +198,6 @@ impl DurabilityBackend for AgentDurabilityBackend {
 #[derive(Clone)]
 pub(super) struct AgentProtectionBackend {
     metadata: Arc<MetadataStore>,
-    network: NetworkHandle,
     identity: NodeIdentity,
     node_id: String,
     replication_factor: u16,
@@ -196,7 +207,6 @@ impl AgentProtectionBackend {
     pub(super) fn from_state(state: &AppState) -> Self {
         Self {
             metadata: state.metadata.clone(),
-            network: state.network.clone(),
             identity: state.identity.clone(),
             node_id: state.status.node_id.clone(),
             replication_factor: state.replication_factor as u16,
@@ -225,70 +235,6 @@ impl AgentProtectionBackend {
         pin.signature_hex = hex::encode(self.identity.sign(&payload));
         Ok(())
     }
-
-    fn schedule_broadcast(&self, pin: PinRecord) {
-        let Ok(permit) = PIN_BROADCAST_LIMIT.clone().try_acquire_owned() else {
-            warn!(pin_id = %pin.pin_id, "namespace pin broadcast concurrency limit reached; periodic repair will retry");
-            return;
-        };
-        let backend = self.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = backend.broadcast(&pin).await {
-                warn!(pin_id = %pin.pin_id, %error, "namespace pin broadcast failed; reconciliation will retry");
-            }
-        });
-    }
-
-    async fn broadcast(&self, pin: &PinRecord) -> Result<(), PublicationError> {
-        let json = serde_json::to_string(pin)
-            .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        let peers = self
-            .network
-            .peers()
-            .await
-            .into_iter()
-            // Gossip may teach a node its own signed descriptor. Local pin
-            // persistence already happened before broadcast, so never dial
-            // ourselves as a synchronization target.
-            .filter(|peer| peer.node_id != self.node_id)
-            .collect::<Vec<_>>();
-        let failed = stream::iter(peers)
-            .map(|peer| {
-                let network = self.network.clone();
-                let json = json.clone();
-                async move {
-                    for address in peer.addresses {
-                        let Ok(address) = address.parse() else {
-                            continue;
-                        };
-                        if matches!(
-                            time::timeout(
-                                Duration::from_millis(500),
-                                network.apply_pin(address, json.clone())
-                            )
-                            .await,
-                            Ok(Ok(()))
-                        ) {
-                            return None;
-                        }
-                    }
-                    Some(peer.node_id)
-                }
-            })
-            .buffer_unordered(8)
-            .filter_map(|node| async move { node })
-            .collect::<Vec<_>>()
-            .await;
-        if !failed.is_empty() {
-            warn!(
-                pin_id = %pin.pin_id,
-                failed_nodes = %failed.join(","),
-                "namespace pin synchronization is incomplete; reconciliation will retry"
-            );
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -301,20 +247,19 @@ impl ProtectionBackend for AgentProtectionBackend {
         expires_at_unix_seconds: Option<i64>,
     ) -> Result<(), PublicationError> {
         let prefix = self.pin_prefix(namespace_id, cid, reason);
-        if let Some(existing) = self
+        if self
             .metadata
             .pins()
             .all()
             .map_err(|error| PublicationError::Protection(error.to_string()))?
             .into_iter()
-            .find(|pin| {
+            .any(|pin| {
                 pin.pin_id.starts_with(&prefix)
                     && pin.owner == self.node_id
                     && pin.status == "active"
                     && pin.expires_at_unix_seconds == expires_at_unix_seconds
             })
         {
-            self.schedule_broadcast(existing);
             return Ok(());
         }
         // Every namespace replica reconciles the same durable intent. Keep the
@@ -341,7 +286,6 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .put(&pin)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        self.schedule_broadcast(pin);
         Ok(())
     }
 
@@ -372,10 +316,88 @@ impl ProtectionBackend for AgentProtectionBackend {
             .pins()
             .replace(&pins)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
-        for pin in pins {
-            self.schedule_broadcast(pin);
-        }
         Ok(())
+    }
+
+    async fn protect_many(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<(), PublicationError> {
+        let active_pin_ids = self
+            .metadata
+            .pins()
+            .all()
+            .map_err(|error| PublicationError::Protection(error.to_string()))?
+            .into_iter()
+            .filter(|pin| pin.owner == self.node_id && pin.status == "active")
+            .map(|pin| pin.pin_id)
+            .collect::<HashSet<_>>();
+        let created_at_unix_seconds = unix_seconds();
+        let mut pins = Vec::with_capacity(cids.len());
+        for cid in cids {
+            let prefix = self.pin_prefix(namespace_id, cid, reason);
+            let pin_id = format!(
+                "{}-{}-{}",
+                prefix,
+                expires_at_unix_seconds
+                    .map_or_else(|| "permanent".to_string(), |value| value.to_string()),
+                self.node_id
+            );
+            if active_pin_ids.contains(&pin_id) {
+                continue;
+            }
+            let mut pin = PinRecord {
+                pin_id,
+                root_cid: cid.clone(),
+                owner: self.node_id.clone(),
+                replication_factor: self.replication_factor,
+                created_at_unix_seconds,
+                expires_at_unix_seconds,
+                status: "active".to_string(),
+                signature_hex: String::new(),
+            };
+            self.sign(&mut pin)?;
+            pins.push(pin);
+        }
+        self.metadata
+            .pins()
+            .replace(&pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
+    }
+
+    async fn release_many(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+    ) -> Result<(), PublicationError> {
+        let prefixes = cids
+            .iter()
+            .map(|cid| format!("{}-", self.pin_prefix(namespace_id, cid, reason)))
+            .collect::<HashSet<_>>();
+        let mut pins = self
+            .metadata
+            .pins()
+            .all()
+            .map_err(|error| PublicationError::Protection(error.to_string()))?
+            .into_iter()
+            .filter(|pin| {
+                pin.owner == self.node_id
+                    && pin.status == "active"
+                    && prefixes.iter().any(|prefix| pin.pin_id.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        for pin in &mut pins {
+            pin.status = "deleted".to_string();
+            self.sign(pin)?;
+        }
+        self.metadata
+            .pins()
+            .replace(&pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
     }
 }
 

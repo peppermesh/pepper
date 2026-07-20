@@ -342,7 +342,11 @@ impl DagCodecHandler for ErasureManifestCodecHandler {
         manifest
             .validate()
             .map_err(|error| invalid_payload(self.codec(), error))?;
-        Ok(manifest.shards.into_iter().map(|shard| shard.cid).collect())
+        Ok(manifest
+            .stripes
+            .into_iter()
+            .flat_map(|stripe| stripe.shards.into_iter().map(|shard| shard.cid))
+            .collect())
     }
 }
 

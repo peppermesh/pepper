@@ -172,6 +172,7 @@ pub(super) async fn fs_commit(
         namespace_id,
         command,
         vec![filesystem_root.clone()],
+        Vec::new(),
         staged_bytes,
         true,
     )
@@ -323,6 +324,7 @@ pub(super) async fn fs_clone_root(
         namespace_id,
         command,
         vec![request.root_cid.clone()],
+        Vec::new(),
         0,
         false,
     )

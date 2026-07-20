@@ -296,8 +296,8 @@ pub async fn verify_receipt_inventory(
             "logical size differs on {node}"
         );
         ensure!(
-            entry.stored_size_bytes == Some(payload.len() as u64),
-            "stored size differs on {node}"
+            entry.stored_size_bytes.is_some_and(|size| size > 0),
+            "stored representation is absent or empty on {node}"
         );
     }
     Ok(())
@@ -376,24 +376,27 @@ pub fn verify_gc_reasons(reasons: &[serde_json::Value]) -> Result<()> {
 
 pub fn verify_erasure_inventory(
     shards: &[serde_json::Value],
-    expected: &[(u16, Cid, u64)],
+    expected: &[(usize, u16, Cid, u64)],
 ) -> Result<()> {
     ensure!(
         shards.len() == expected.len(),
         "erasure shard count differs"
     );
-    for (index, cid, size) in expected {
+    for (stripe_index, index, cid, size) in expected {
         let shard = shards
             .iter()
-            .find(|shard| shard["index"].as_u64() == Some(u64::from(*index)))
-            .with_context(|| format!("erasure shard {index} missing"))?;
+            .find(|shard| {
+                shard["stripe_index"].as_u64() == Some(*stripe_index as u64)
+                    && shard["index"].as_u64() == Some(u64::from(*index))
+            })
+            .with_context(|| format!("erasure stripe {stripe_index} shard {index} missing"))?;
         ensure!(
             shard["cid"] == serde_json::to_value(cid)?,
-            "shard {index} CID differs"
+            "stripe {stripe_index} shard {index} CID differs"
         );
         ensure!(
             shard["expected_size_bytes"].as_u64() == Some(*size),
-            "shard {index} size differs"
+            "stripe {stripe_index} shard {index} size differs"
         );
     }
     Ok(())

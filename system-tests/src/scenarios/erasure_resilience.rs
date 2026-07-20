@@ -141,7 +141,13 @@ impl Scenario for ErasureRepairScenario {
         let payload = deterministic_bytes(b"ec-003", context.run.seed, 654_321);
         let receipt = client.put_erasure_object(&ingress, &payload, 2, 1).await?;
         let manifest = client.erasure_manifest(&ingress, &receipt.cid).await?;
-        let target = manifest.shards[0].cid.clone();
+        let target = manifest
+            .stripes
+            .first()
+            .and_then(|stripe| stripe.shards.first())
+            .context("erasure manifest has no shards")?
+            .cid
+            .clone();
         let locations = shard_locations(cluster, &manifest).await?;
         let victim_id = locations
             .get(&target)
@@ -243,16 +249,18 @@ async fn remove_shards(
 ) -> Result<()> {
     let locations = shard_locations(cluster, manifest).await?;
     let mut by_node = BTreeMap::<crate::harness::cluster::NodeId, Vec<Cid>>::new();
-    for index in indexes {
-        let shard = manifest
-            .shards
-            .get(*index)
-            .context("shard index out of bounds")?;
-        for node in locations.get(&shard.cid).into_iter().flatten() {
-            by_node
-                .entry(node.clone())
-                .or_default()
-                .push(shard.cid.clone());
+    for stripe in &manifest.stripes {
+        for index in indexes {
+            let shard = stripe
+                .shards
+                .get(*index)
+                .context("shard index out of bounds")?;
+            for node in locations.get(&shard.cid).into_iter().flatten() {
+                by_node
+                    .entry(node.clone())
+                    .or_default()
+                    .push(shard.cid.clone());
+            }
         }
     }
     for (node, cids) in by_node {
@@ -273,7 +281,7 @@ async fn shard_locations(
     let mut locations = HashMap::new();
     for node in cluster.nodes.values() {
         let inventory = block_inventory(&cluster.backend, &node.id, &node.node_identity).await?;
-        for shard in &manifest.shards {
+        for shard in manifest.stripes.iter().flat_map(|stripe| &stripe.shards) {
             if inventory
                 .iter()
                 .any(|entry| entry.cid == shard.cid && entry.integrity_state == "verified")

@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[node]
+name = "s3-benchmark-ec-7"
+listen_addr = "0.0.0.0:9000"
+advertise_addr = "172.30.43.27:9000"
+failure_domain = "rack-7"
+
+[data]
+path = "/var/lib/pepper/metadata"
+
+[identity]
+key_path = "/var/lib/pepper/identity/node.key"
+generate_if_missing = true
+
+[api]
+bind_addr = "127.0.0.1:9080"
+
+[auth]
+cluster_secret_path = "/var/lib/pepper/identity/cluster.secret"
+
+[[storage.locations]]
+path = "/var/lib/pepper/storage"
+max_capacity_bytes = 1099511627776
+
+[network]
+bootstrap_peers = ["172.30.43.21:9000", "172.30.43.22:9000", "172.30.43.23:9000", "172.30.43.24:9000", "172.30.43.25:9000", "172.30.43.26:9000", "172.30.43.28:9000", "172.30.43.29:9000"]
+
+[namespace]
+enabled = true
+consensus_enabled = true
+heartbeat_interval_ms = 500
+election_timeout_min_ms = 3000
+election_timeout_max_ms = 6000
+
+[replication]
+default_factor = 3
+repair_interval_seconds = 3600
+
+[erasure]
+enabled = true
+min_size_bytes = 1
+data_shards = 6
+parity_shards = 3
+
+[erasure.reconstructed_cache]
+path = "/var/lib/pepper/reconstructed-cache"
+max_capacity_bytes = 17179869184
+admission_hits = 2
+
+[compute]
+enabled = false
+runtime = "firecracker"
+max_concurrent_jobs = 1
+work_dir = "/var/lib/pepper/compute"
+
+[s3]
+enabled = true
+region = "us-east-1"
+access_key_id = "pepper-benchmark"
+secret_access_key_path = "/var/lib/pepper/identity/s3.secret"
+max_clock_skew_seconds = 900
+
+[limits]
+max_block_bytes = 67108864
+max_object_bytes = 5368709120
+http_requests_per_minute = 10000000
+rpc_requests_per_minute = 10000000
+s3_http_concurrency = 128
+s3_write_concurrency = 16
+s3_write_queue_depth = 48
+s3_write_queue_timeout_ms = 5000
+erasure_read_max_concurrent_stripes = 32
+erasure_repair_bytes_per_second = 33554432
+
+[logging]
+format = "json"

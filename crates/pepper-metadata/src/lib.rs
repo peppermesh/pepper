@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use pepper_types::{PinRecord, SCHEMA_VERSION};
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -32,9 +32,6 @@ pub const NAMESPACE_DISCOVERY_RECORDS: TableDefinition<&str, &[u8]> =
 const KEY_SCHEMA_VERSION: &str = "schema_version";
 const KEY_CREATED_AT: &str = "created_at_unix_seconds";
 const KEY_UPDATED_AT: &str = "updated_at_unix_seconds";
-const KEY_MIGRATION_2: &str = "migration_2_completed_at_unix_seconds";
-const KEY_MIGRATION_3: &str = "migration_3_completed_at_unix_seconds";
-const KEY_MIGRATION_4: &str = "migration_4_completed_at_unix_seconds";
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
@@ -86,8 +83,6 @@ pub enum MetadataError {
         #[source]
         source: std::io::Error,
     },
-    #[error("metadata schema version {found} is newer than supported version {supported}")]
-    UnsupportedSchema { found: u32, supported: u32 },
     #[error("metadata schema version value is invalid: {0}")]
     InvalidSchemaVersion(String),
     #[error("metadata schema verification failed: expected {expected}, found {found}")]
@@ -124,7 +119,7 @@ impl MetadataStore {
             path: path.display().to_string(),
             source: Box::new(source),
         })?;
-        let schema_version = initialize_and_migrate_schema(&path, &db)?;
+        let schema_version = initialize_schema(&path, &db)?;
         let store = Self {
             path,
             db,
@@ -341,7 +336,7 @@ fn validate_pin_update(existing: &PinRecord, pin: &PinRecord) -> Result<(), Meta
     Ok(())
 }
 
-fn initialize_and_migrate_schema(path: &Path, db: &Database) -> Result<u32, MetadataError> {
+fn initialize_schema(path: &Path, db: &Database) -> Result<u32, MetadataError> {
     let write_txn = db
         .begin_write()
         .map_err(|source| MetadataError::Transaction {
@@ -350,7 +345,7 @@ fn initialize_and_migrate_schema(path: &Path, db: &Database) -> Result<u32, Meta
         })?;
 
     let now = unix_seconds().to_string();
-    let existing_version = {
+    {
         let mut table = write_txn
             .open_table(SCHEMA_META)
             .map_err(|source| map_table(path, source))?;
@@ -359,34 +354,69 @@ fn initialize_and_migrate_schema(path: &Path, db: &Database) -> Result<u32, Meta
             .map_err(|source| map_storage(path, source))?
             .map(|value| parse_schema_version(value.value()))
             .transpose()?;
-        if existing.is_none() {
+        if let Some(found) = existing {
+            if found != SCHEMA_VERSION {
+                return Err(MetadataError::SchemaVerification {
+                    expected: SCHEMA_VERSION,
+                    found,
+                });
+            }
+        } else {
+            let version = SCHEMA_VERSION.to_string();
             table
-                .insert(KEY_SCHEMA_VERSION, "1")
+                .insert(KEY_SCHEMA_VERSION, version.as_str())
                 .map_err(|source| map_storage(path, source))?;
             table
                 .insert(KEY_CREATED_AT, now.as_str())
                 .map_err(|source| map_storage(path, source))?;
         }
-        existing
-    };
-
-    let mut version = existing_version.unwrap_or(1);
-    if version > SCHEMA_VERSION {
-        return Err(MetadataError::UnsupportedSchema {
-            found: version,
-            supported: SCHEMA_VERSION,
-        });
     }
-    while version < SCHEMA_VERSION {
-        version = run_migration(path, &write_txn, version, &now)?;
-    }
+    write_txn
+        .open_table(PINS)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(PINS_BY_ROOT)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_GROUPS)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_RAFT_VOTE)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_RAFT_LOG)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_RAFT_MEMBERSHIP)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_STATE)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_CHECKPOINTS)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_IDEMPOTENCY)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_STAGING_LEASES)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_READ_LEASES)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_DISCOVERY_RECORDS)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_PUBLICATION_INTENTS)
+        .map_err(|source| map_table(path, source))?;
+    write_txn
+        .open_table(NAMESPACE_DURABILITY_RECEIPTS)
+        .map_err(|source| map_table(path, source))?;
     {
         let mut table = write_txn
             .open_table(SCHEMA_META)
             .map_err(|source| map_table(path, source))?;
-        table
-            .insert(KEY_SCHEMA_VERSION, version.to_string().as_str())
-            .map_err(|source| map_storage(path, source))?;
         table
             .insert(KEY_UPDATED_AT, now.as_str())
             .map_err(|source| map_storage(path, source))?;
@@ -395,93 +425,7 @@ fn initialize_and_migrate_schema(path: &Path, db: &Database) -> Result<u32, Meta
         path: path.display().to_string(),
         source: Box::new(source),
     })?;
-    Ok(version)
-}
-
-fn run_migration(
-    path: &Path,
-    write_txn: &WriteTransaction,
-    from: u32,
-    now: &str,
-) -> Result<u32, MetadataError> {
-    match from {
-        1 => {
-            // Schema 2 centralizes pin persistence in pepper-metadata. Opening
-            // these tables is idempotent and preserves tables created by 0.1.0.
-            write_txn
-                .open_table(PINS)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(PINS_BY_ROOT)
-                .map_err(|source| map_table(path, source))?;
-            let mut schema = write_txn
-                .open_table(SCHEMA_META)
-                .map_err(|source| map_table(path, source))?;
-            schema
-                .insert(KEY_MIGRATION_2, now)
-                .map_err(|source| map_storage(path, source))?;
-            Ok(2)
-        }
-        2 => {
-            // Schema 3 reserves all durable namespace/Raft tables. Individual
-            // repositories own record encodings in later implementation phases.
-            write_txn
-                .open_table(NAMESPACE_GROUPS)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_RAFT_VOTE)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_RAFT_LOG)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_RAFT_MEMBERSHIP)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_STATE)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_CHECKPOINTS)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_IDEMPOTENCY)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_STAGING_LEASES)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_READ_LEASES)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_DISCOVERY_RECORDS)
-                .map_err(|source| map_table(path, source))?;
-            let mut schema = write_txn
-                .open_table(SCHEMA_META)
-                .map_err(|source| map_table(path, source))?;
-            schema
-                .insert(KEY_MIGRATION_3, now)
-                .map_err(|source| map_storage(path, source))?;
-            Ok(3)
-        }
-        3 => {
-            write_txn
-                .open_table(NAMESPACE_PUBLICATION_INTENTS)
-                .map_err(|source| map_table(path, source))?;
-            write_txn
-                .open_table(NAMESPACE_DURABILITY_RECEIPTS)
-                .map_err(|source| map_table(path, source))?;
-            let mut schema = write_txn
-                .open_table(SCHEMA_META)
-                .map_err(|source| map_table(path, source))?;
-            schema
-                .insert(KEY_MIGRATION_4, now)
-                .map_err(|source| map_storage(path, source))?;
-            Ok(4)
-        }
-        other => Err(MetadataError::InvalidSchemaVersion(format!(
-            "no migration from {other}"
-        ))),
-    }
+    Ok(SCHEMA_VERSION)
 }
 
 fn map_table(path: &Path, source: redb::TableError) -> MetadataError {
@@ -541,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_schema_one_and_preserves_pins() {
+    fn rejects_non_current_schema_without_modifying_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.redb");
         {
@@ -550,78 +494,15 @@ mod tests {
             {
                 let mut schema = txn.open_table(SCHEMA_META).unwrap();
                 schema.insert(KEY_SCHEMA_VERSION, "1").unwrap();
-                schema.insert(KEY_CREATED_AT, "1").unwrap();
-                let mut pins = txn.open_table(PINS).unwrap();
-                let record = pin("legacy");
-                let bytes = serde_json::to_vec(&record).unwrap();
-                pins.insert("legacy", bytes.as_slice()).unwrap();
-            }
-            txn.commit().unwrap();
-        }
-        let store = MetadataStore::open_or_create(&path).unwrap();
-        assert_eq!(store.schema_version(), 4);
-        assert_eq!(store.pins().all().unwrap(), vec![pin("legacy")]);
-        let read = store.database().begin_read().unwrap();
-        let schema = read.open_table(SCHEMA_META).unwrap();
-        assert!(schema.get(KEY_MIGRATION_2).unwrap().is_some());
-        assert!(schema.get(KEY_MIGRATION_3).unwrap().is_some());
-        assert!(schema.get(KEY_MIGRATION_4).unwrap().is_some());
-    }
-
-    #[test]
-    fn interrupted_migration_retries_from_schema_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.redb");
-        {
-            let db = Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            {
-                let mut schema = txn.open_table(SCHEMA_META).unwrap();
-                schema.insert(KEY_SCHEMA_VERSION, "1").unwrap();
-                schema.insert(KEY_CREATED_AT, "1").unwrap();
-            }
-            txn.commit().unwrap();
-
-            // Simulate termination after migration writes but before commit.
-            let interrupted = db.begin_write().unwrap();
-            {
-                interrupted.open_table(PINS).unwrap();
-                let mut schema = interrupted.open_table(SCHEMA_META).unwrap();
-                schema.insert(KEY_SCHEMA_VERSION, "2").unwrap();
-                schema.insert(KEY_MIGRATION_2, "2").unwrap();
-            }
-            drop(interrupted);
-        }
-
-        let store = MetadataStore::open_or_create(&path).unwrap();
-        assert_eq!(store.schema_version(), 4);
-        store.verify().unwrap();
-        let read = store.database().begin_read().unwrap();
-        let schema = read.open_table(SCHEMA_META).unwrap();
-        assert!(schema.get(KEY_MIGRATION_2).unwrap().is_some());
-        assert!(schema.get(KEY_MIGRATION_3).unwrap().is_some());
-        assert!(schema.get(KEY_MIGRATION_4).unwrap().is_some());
-    }
-
-    #[test]
-    fn rejects_a_newer_schema_without_modifying_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.redb");
-        {
-            let db = Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            {
-                let mut schema = txn.open_table(SCHEMA_META).unwrap();
-                schema.insert(KEY_SCHEMA_VERSION, "99").unwrap();
                 schema.insert(KEY_CREATED_AT, "1").unwrap();
             }
             txn.commit().unwrap();
         }
         assert!(matches!(
             MetadataStore::open_or_create(&path),
-            Err(MetadataError::UnsupportedSchema {
-                found: 99,
-                supported: 4
+            Err(MetadataError::SchemaVerification {
+                expected: SCHEMA_VERSION,
+                found: 1
             })
         ));
         let db = Database::create(&path).unwrap();
@@ -629,7 +510,7 @@ mod tests {
         let schema = read.open_table(SCHEMA_META).unwrap();
         assert_eq!(
             schema.get(KEY_SCHEMA_VERSION).unwrap().unwrap().value(),
-            "99"
+            "1"
         );
     }
 

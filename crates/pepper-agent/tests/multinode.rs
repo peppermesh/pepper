@@ -2,8 +2,8 @@
 
 use hmac::{Hmac, Mac};
 use pepper_types::{
-    Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, GcReport, NodeStatus,
-    PinStatusResponse,
+    Cid, ComputeJobStatus, DurabilityReceipt, ErasureManifest, ErasureStripeEncoding, GcReport,
+    NodeStatus, PinStatusResponse,
 };
 use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
@@ -412,6 +412,23 @@ async fn s3_multipart_upload_http_contract() -> TestResult<()> {
     let mut expected = first;
     expected.extend_from_slice(&second);
     assert_eq!(downloaded.as_ref(), expected.as_slice());
+    let range_start = 3 * 1024 * 1024 + 512 * 1024;
+    let range_end = range_start + 1024 * 1024 - 1;
+    let range_header = format!("bytes={range_start}-{range_end}");
+    let ranged = signed_s3_request_with_headers(
+        &client,
+        api3,
+        Method::GET,
+        "/multipart-test/large.bin",
+        Vec::new(),
+        &[("range", &range_header)],
+    )
+    .await?;
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        ranged.bytes().await?.as_ref(),
+        &expected[range_start..=range_end]
+    );
 
     let abandoned = signed_s3_success_with_retry(
         &client,
@@ -447,6 +464,224 @@ async fn s3_multipart_upload_http_contract() -> TestResult<()> {
     .text()
     .await?;
     assert!(!uploads.contains("<Upload>"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_s3_config(temp.path(), "s3-load-1", p2p1, api1, &[])?;
+    let config2 = write_s3_config(
+        temp.path(),
+        "s3-load-2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_s3_config(
+        temp.path(),
+        "s3-load-3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let mut node1 = spawn_agent(agent, &config1)?;
+    let _node2 = spawn_agent(agent, &config2)?;
+    let _node3 = spawn_agent(agent, &config3)?;
+    for api in [api1, api2, api3] {
+        wait_health(api).await?;
+        wait_for_peer_count(api, 2).await?;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+
+    signed_s3_success_with_retry(&client, api1, Method::PUT, "/catalog-warmup", Vec::new()).await?;
+    let (left, right) = tokio::join!(
+        signed_s3_request(&client, api1, Method::PUT, "/catalog-race", Vec::new()),
+        signed_s3_request(&client, api2, Method::PUT, "/catalog-race", Vec::new())
+    );
+    let statuses = [left?.status(), right?.status()];
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1,
+        "exactly one concurrent CreateBucket must win: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "the losing CreateBucket must receive a stable conflict: {statuses:?}"
+    );
+
+    signed_s3_success_with_retry(&client, api1, Method::PUT, "/load-test", Vec::new()).await?;
+    signed_s3_success_with_retry(
+        &client,
+        api1,
+        Method::PUT,
+        "/load-test/read-target",
+        b"stable concurrent read target".to_vec(),
+    )
+    .await?;
+    signed_s3_success_with_retry(
+        &client,
+        api1,
+        Method::PUT,
+        "/load-test/read-after-write",
+        b"generation one".to_vec(),
+    )
+    .await?;
+    let generation_one = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::GET,
+        "/load-test/read-after-write",
+        Vec::new(),
+    )
+    .await?
+    .bytes()
+    .await?;
+    assert_eq!(generation_one.as_ref(), b"generation one");
+    signed_s3_success_with_retry(
+        &client,
+        api3,
+        Method::PUT,
+        "/load-test/read-after-write",
+        b"generation two".to_vec(),
+    )
+    .await?;
+    let generation_two = signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::GET,
+        "/load-test/read-after-write",
+        Vec::new(),
+    )
+    .await?
+    .bytes()
+    .await?;
+    assert_eq!(generation_two.as_ref(), b"generation two");
+    signed_s3_success_with_retry(
+        &client,
+        api2,
+        Method::DELETE,
+        "/load-test/read-after-write",
+        Vec::new(),
+    )
+    .await?;
+    for method in [Method::GET, Method::HEAD] {
+        let deleted = signed_s3_response_with_retry(
+            &client,
+            api3,
+            method,
+            "/load-test/read-after-write",
+            Vec::new(),
+        )
+        .await?;
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+    }
+    let initial_term = stable_namespace_term(&client, api1, "load-test").await?;
+    let ports = [api1, api2, api3];
+    let mut writes = tokio::task::JoinSet::new();
+    for index in 0..32usize {
+        let client = client.clone();
+        let api = ports[index % ports.len()];
+        let body = vec![index as u8; 4 * 1024];
+        writes.spawn(async move {
+            signed_s3_success_with_retry(
+                &client,
+                api,
+                Method::PUT,
+                &format!("/load-test/object-{index:02}"),
+                body,
+            )
+            .await
+            .map(|response| response.status())
+        });
+    }
+    let mut reads = tokio::task::JoinSet::new();
+    for request in 0..64usize {
+        let client = client.clone();
+        let api = ports[request % ports.len()];
+        reads.spawn(async move {
+            let response = signed_s3_success_with_retry(
+                &client,
+                api,
+                if request % 2 == 0 {
+                    Method::GET
+                } else {
+                    Method::HEAD
+                },
+                "/load-test/read-target",
+                Vec::new(),
+            )
+            .await?;
+            if request % 2 == 0 {
+                let bytes = response.bytes().await?;
+                if bytes.as_ref() != b"stable concurrent read target" {
+                    return Err("concurrent S3 GET returned incorrect bytes".into());
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+    }
+    while let Some(result) = writes.join_next().await {
+        assert!(result??.is_success());
+    }
+    while let Some(result) = reads.join_next().await {
+        result??;
+    }
+    let final_term = stable_namespace_term(&client, api2, "load-test").await?;
+    assert_eq!(
+        final_term, initial_term,
+        "healthy concurrent S3 traffic must not churn the bucket Raft term"
+    );
+
+    signed_s3_success_with_retry(
+        &client,
+        api1,
+        Method::PUT,
+        "/load-test/gateway-loss",
+        b"catalog remains quorum-readable".to_vec(),
+    )
+    .await?;
+    node1.kill_and_wait();
+    for api in [api2, api3] {
+        let buckets = signed_s3_success_with_retry(&client, api, Method::GET, "/", Vec::new())
+            .await?
+            .text()
+            .await?;
+        assert!(buckets.contains("<Name>load-test</Name>"));
+        assert!(
+            signed_s3_success_with_retry(&client, api, Method::HEAD, "/load-test", Vec::new())
+                .await?
+                .status()
+                .is_success()
+        );
+        let bytes = signed_s3_success_with_retry(
+            &client,
+            api,
+            Method::GET,
+            "/load-test/gateway-loss",
+            Vec::new(),
+        )
+        .await?
+        .bytes()
+        .await?;
+        assert_eq!(bytes.as_ref(), b"catalog remains quorum-readable");
+    }
     Ok(())
 }
 
@@ -518,7 +753,9 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
     wait_health(api).await?;
 
     let client = reqwest::Client::new();
-    let payload = b"erasure-coded object payload".repeat(1024);
+    let payload = (0..25 * 1024 * 1024)
+        .map(|index| ((index * 31 + index / 4093) & 0xff) as u8)
+        .collect::<Vec<_>>();
     let put: DurabilityReceipt = client
         .post(format!(
             "http://127.0.0.1:{api}/v1/objects?erasure_data_shards=3&erasure_parity_shards=2"
@@ -540,7 +777,11 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
         .error_for_status()?
         .json()
         .await?;
-    let missing_shard = manifest.shards[0].cid.clone();
+    assert_eq!(manifest.stripes.len(), 3);
+    assert_eq!(manifest.stripes[0].offset, 0);
+    assert_eq!(manifest.stripes[1].offset, 12 * 1024 * 1024);
+    assert_eq!(manifest.stripes[2].offset, 24 * 1024 * 1024);
+    let missing_shard = manifest.stripes[0].shards[0].cid.clone();
     let missing_shard_path = block_file_path(temp.path(), "ec-node", &missing_shard);
     fs::remove_file(&missing_shard_path)?;
 
@@ -573,6 +814,268 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
     assert_eq!(erasure["manifests"], 1);
     assert_eq!(erasure["missing_shards"], 0);
     assert_eq!(erasure["unrecoverable_manifests"], 0);
+
+    for shard in manifest.stripes[0].shards.iter().take(3) {
+        fs::remove_file(block_file_path(temp.path(), "ec-node", &shard.cid))?;
+    }
+    let unavailable = client
+        .get(format!(
+            "http://127.0.0.1:{api}/v1/objects/{}",
+            encode_path_segment(&put.cid.to_string())
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable.status().as_u16(), 500);
+    let error: serde_json::Value = unavailable.json().await?;
+    assert_eq!(error["code"], "internal");
+    Ok(())
+}
+
+#[tokio::test]
+async fn s3_streaming_six_plus_three_survives_three_missing_shards() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p_ports = (0..9)
+        .map(|_| free_port())
+        .collect::<TestResult<Vec<_>>>()?;
+    let api_ports = (0..9)
+        .map(|_| free_port())
+        .collect::<TestResult<Vec<_>>>()?;
+    let peer_addresses = p2p_ports
+        .iter()
+        .map(|port| format!("127.0.0.1:{port}"))
+        .collect::<Vec<_>>();
+    let mut configs = Vec::new();
+    let mut node_names = Vec::new();
+    for index in 0..9 {
+        let name = format!("ec-s3-node-{}", index + 1);
+        let bootstrap = peer_addresses
+            .iter()
+            .enumerate()
+            .filter(|(peer_index, _)| *peer_index != index)
+            .map(|(_, address)| address.clone())
+            .collect::<Vec<_>>();
+        configs.push(write_s3_erasure_config(
+            temp.path(),
+            &name,
+            &format!("rack-{}", index + 1),
+            p2p_ports[index],
+            api_ports[index],
+            &bootstrap,
+        )?);
+        node_names.push(name);
+    }
+
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in &configs {
+        run_init(agent, config)?;
+    }
+    let mut nodes = Vec::new();
+    let mut logs = Vec::new();
+    for (index, config) in configs.iter().enumerate() {
+        let log = temp.path().join(format!("ec-node-{}.log", index + 1));
+        nodes.push(spawn_agent_with_log(agent, config, &log)?);
+        logs.push(log);
+    }
+    for api in &api_ports {
+        wait_health(*api).await?;
+    }
+    wait_for_peer_count(api_ports[0], 8).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()?;
+    signed_s3_success_with_retry(
+        &client,
+        api_ports[0],
+        Method::PUT,
+        "/ec-streaming",
+        Vec::new(),
+    )
+    .await?;
+    let payload = (0..25 * 1024 * 1024)
+        .map(|index| ((index * 17 + index / 8191) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    let put = signed_s3_success_with_retry(
+        &client,
+        api_ports[0],
+        Method::PUT,
+        "/ec-streaming/large.bin",
+        payload.clone(),
+    )
+    .await;
+    let put = match put {
+        Ok(response) => response,
+        Err(error) => {
+            for log in &logs {
+                eprintln!("===== {} =====", log.display());
+                eprintln!("{}", fs::read_to_string(log).unwrap_or_default());
+            }
+            return Err(error);
+        }
+    };
+    let manifest_cid = put
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_matches('"').to_string())
+        .ok_or("S3 erasure PUT omitted ETag")?;
+    let manifest: ErasureManifest = client
+        .get(format!(
+            "http://127.0.0.1:{}/v1/blocks/{}",
+            api_ports[0],
+            encode_path_segment(&manifest_cid)
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(manifest.data_shards, 6);
+    assert_eq!(manifest.parity_shards, 3);
+    assert_eq!(manifest.stripes.len(), 2);
+    assert!(
+        manifest
+            .stripes
+            .iter()
+            .all(|stripe| stripe.encoding == ErasureStripeEncoding::Zstd)
+    );
+
+    let mut removed_shards = Vec::new();
+    for shard in manifest.stripes[0].shards.iter().take(3) {
+        let path = node_names
+            .iter()
+            .map(|name| block_file_path(temp.path(), name, &shard.cid))
+            .find(|path| path.exists())
+            .ok_or("could not locate placed erasure shard")?;
+        fs::remove_file(path)?;
+        removed_shards.push(shard.cid.clone());
+    }
+
+    let full_response = signed_s3_success_with_retry(
+        &client,
+        api_ports[1],
+        Method::GET,
+        "/ec-streaming/large.bin",
+        Vec::new(),
+    )
+    .await;
+    let full_response = match full_response {
+        Ok(response) => response,
+        Err(error) => {
+            for log in &logs {
+                let relevant = fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| {
+                        let lowercase = line.to_ascii_lowercase();
+                        lowercase.contains("erasure")
+                            || lowercase.contains("error")
+                            || lowercase.contains("warn")
+                            || lowercase.contains("panic")
+                    })
+                    .rev()
+                    .take(200)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                eprintln!("===== {} =====\n{relevant}", log.display());
+            }
+            return Err(error);
+        }
+    };
+    let full = match full_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            for log in &logs {
+                eprintln!("===== {} =====", log.display());
+                eprintln!("{}", fs::read_to_string(log).unwrap_or_default());
+            }
+            return Err(error.into());
+        }
+    };
+    assert_eq!(&full[..], &payload[..]);
+
+    let range_start = 8 * 1024 * 1024usize;
+    let range_end = 16 * 1024 * 1024usize - 1;
+    let range_header = format!("bytes={range_start}-{range_end}");
+    let range_response = signed_s3_request_with_headers(
+        &client,
+        api_ports[2],
+        Method::GET,
+        "/ec-streaming/large.bin",
+        Vec::new(),
+        &[("range", &range_header)],
+    )
+    .await;
+    let range_response = match range_response {
+        Ok(response) => response,
+        Err(error) => {
+            for log in &logs {
+                let relevant = fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| {
+                        let lowercase = line.to_ascii_lowercase();
+                        lowercase.contains("erasure")
+                            || lowercase.contains("error")
+                            || lowercase.contains("warn")
+                            || lowercase.contains("panic")
+                    })
+                    .rev()
+                    .take(200)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                eprintln!("===== {} =====\n{relevant}", log.display());
+            }
+            return Err(error);
+        }
+    };
+    let range = s3_success(range_response).await?.bytes().await?;
+    assert_eq!(&range[..], &payload[range_start..=range_end]);
+
+    for shard in manifest.stripes.iter().flat_map(|stripe| &stripe.shards) {
+        let copies = node_names
+            .iter()
+            .map(|name| block_file_path(temp.path(), name, &shard.cid))
+            .filter(|path| path.exists())
+            .count();
+        let expected = usize::from(!removed_shards.contains(&shard.cid));
+        assert_eq!(
+            copies, expected,
+            "ordinary reads changed durable placement for shard {}",
+            shard.cid
+        );
+    }
+
+    for api in &api_ports {
+        client
+            .post(format!("http://127.0.0.1:{api}/v1/admin/repair"))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    let erasure: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{}/v1/admin/erasure",
+            api_ports[0]
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(erasure["missing_shards"], 0);
+    assert_eq!(erasure["unrecoverable_manifests"], 0);
+    for cid in removed_shards {
+        assert!(
+            node_names
+                .iter()
+                .map(|name| block_file_path(temp.path(), name, &cid))
+                .any(|path| path.exists()),
+            "repair did not restore shard {cid}"
+        );
+    }
+
+    drop(nodes);
     Ok(())
 }
 
@@ -662,10 +1165,14 @@ async fn erasure_repair_proactively_rebalances_after_nodes_join() -> TestResult<
             .error_for_status()?
             .json()
             .await?;
-        let copied_to_new_node = manifest.shards.iter().any(|shard| {
-            block_file_path(temp.path(), "node2", &shard.cid).exists()
-                || block_file_path(temp.path(), "node3", &shard.cid).exists()
-        });
+        let copied_to_new_node = manifest
+            .stripes
+            .iter()
+            .flat_map(|stripe| &stripe.shards)
+            .any(|shard| {
+                block_file_path(temp.path(), "node2", &shard.cid).exists()
+                    || block_file_path(temp.path(), "node3", &shard.cid).exists()
+            });
         if erasure["metrics"]["shard_rebalances_total"]
             .as_u64()
             .unwrap_or(0)
@@ -1629,9 +2136,10 @@ async fn two_node_replicated_write_and_remote_read() -> TestResult<()> {
     wait_for_peer(api2).await?;
 
     let client = reqwest::Client::new();
+    let payload = vec![b'a'; 1024 * 1024];
     let put: DurabilityReceipt = client
         .post(format!("http://127.0.0.1:{api2}/v1/blocks"))
-        .body("hello from node2")
+        .body(payload.clone())
         .send()
         .await?
         .error_for_status()?
@@ -1651,7 +2159,7 @@ async fn two_node_replicated_write_and_remote_read() -> TestResult<()> {
         .error_for_status()?
         .bytes()
         .await?;
-    assert_eq!(&bytes[..], b"hello from node2");
+    assert_eq!(&bytes[..], payload);
 
     let status: NodeStatus = client
         .get(format!("http://127.0.0.1:{api1}/v1/node/status"))
@@ -1670,6 +2178,17 @@ async fn signed_s3_request(
     method: Method,
     path_and_query: &str,
     body: Vec<u8>,
+) -> TestResult<reqwest::Response> {
+    signed_s3_request_with_headers(client, api_port, method, path_and_query, body, &[]).await
+}
+
+async fn signed_s3_request_with_headers(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+    extra_headers: &[(&str, &str)],
 ) -> TestResult<reqwest::Response> {
     let (path, query) = path_and_query
         .split_once('?')
@@ -1703,14 +2222,15 @@ async fn signed_s3_request(
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=pepper-test/{scope},SignedHeaders={signed_headers},Signature={signature}"
     );
-    Ok(client
+    let mut request = client
         .request(method, format!("http://{host}{path_and_query}"))
         .header("x-amz-date", amz_date)
         .header("x-amz-content-sha256", payload_hash)
-        .header("authorization", authorization)
-        .body(body)
-        .send()
-        .await?)
+        .header("authorization", authorization);
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    Ok(request.body(body).send().await?)
 }
 
 fn test_hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -1747,7 +2267,7 @@ async fn signed_s3_response_with_retry(
     body: Vec<u8>,
 ) -> TestResult<reqwest::Response> {
     let mut last_error = String::new();
-    for _ in 0..40 {
+    for _ in 0..240 {
         let response = signed_s3_request(
             client,
             api_port,
@@ -1815,6 +2335,31 @@ fn write_s3_config(
         "\n[s3]\nenabled = true\nregion = \"us-east-1\"\naccess_key_id = \"pepper-test\"\nsecret_access_key_path = \"{}\"\n",
         secret_path.display()
     ));
+    fs::write(&config, contents)?;
+    Ok(config)
+}
+
+fn write_s3_erasure_config(
+    root: &Path,
+    name: &str,
+    failure_domain: &str,
+    p2p_port: u16,
+    api_port: u16,
+    bootstrap: &[String],
+) -> TestResult<PathBuf> {
+    let config = write_s3_config(root, name, p2p_port, api_port, bootstrap)?;
+    let mut contents = fs::read_to_string(&config)?;
+    contents = contents.replace(
+        "repair_interval_seconds = 5",
+        "repair_interval_seconds = 3600",
+    );
+    contents = contents.replace(
+        &format!("listen_addr = \"127.0.0.1:{p2p_port}\""),
+        &format!("listen_addr = \"127.0.0.1:{p2p_port}\"\nfailure_domain = \"{failure_domain}\""),
+    );
+    contents.push_str(
+        "\n[erasure]\nenabled = true\nmin_size_bytes = 1\ndata_shards = 6\nparity_shards = 3\n",
+    );
     fs::write(&config, contents)?;
     Ok(config)
 }
@@ -1971,6 +2516,18 @@ fn spawn_agent(agent: &str, config: &Path) -> TestResult<ChildGuard> {
     spawn_agent_with_env(agent, config, &[])
 }
 
+fn spawn_agent_with_log(agent: &str, config: &Path, log: &Path) -> TestResult<ChildGuard> {
+    let output = fs::File::create(log)?;
+    let mut command = Command::new(agent);
+    command
+        .arg("--config")
+        .arg(config)
+        .env("TOKIO_WORKER_THREADS", "2")
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::from(output));
+    Ok(ChildGuard(command.spawn()?))
+}
+
 fn spawn_agent_with_env(
     agent: &str,
     config: &Path,
@@ -1984,9 +2541,8 @@ fn spawn_agent_with_env(
         // host CPU for every spawned agent. CI executes several agents and
         // consensus runtimes concurrently; two workers are sufficient for the
         // loopback transport while avoiding scheduler starvation.
-        .env("TOKIO_WORKER_THREADS", "2")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("TOKIO_WORKER_THREADS", "2");
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2220,6 +2776,49 @@ async fn wait_for_namespace_quorum(api_ports: &[u16], namespace: &str) -> TestRe
         errors.join("; ")
     )
     .into())
+}
+
+async fn stable_namespace_term(
+    client: &reqwest::Client,
+    api_port: u16,
+    namespace: &str,
+) -> TestResult<u64> {
+    let url = format!("http://127.0.0.1:{api_port}/v1/namespaces/{namespace}/status");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut previous = None;
+    let mut stable = 0usize;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                let status: serde_json::Value = response.json().await?;
+                let term = status["term"]
+                    .as_u64()
+                    .ok_or("namespace status has no term")?;
+                if !status["quorum_available"].as_bool().unwrap_or(false) {
+                    stable = 0;
+                } else if previous == Some(term) {
+                    stable += 1;
+                    if stable >= 3 {
+                        return Ok(term);
+                    }
+                } else {
+                    previous = Some(term);
+                    stable = 1;
+                }
+            }
+            Ok(response) => {
+                last = format!("HTTP {}: {}", response.status(), response.text().await?);
+                stable = 0;
+            }
+            Err(error) => {
+                last = error.to_string();
+                stable = 0;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("namespace {namespace} did not reach a stable term: {last}").into())
 }
 
 async fn wait_compute_finished(api_port: u16, job_id: &str) -> TestResult<ComputeJobStatus> {
