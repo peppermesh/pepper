@@ -22,9 +22,9 @@ bootstrap_peers = ["172.30.43.11:9000", "172.30.43.12:9000"]
 [namespace]
 enabled = true
 consensus_enabled = true
-heartbeat_interval_ms = 250
-election_timeout_min_ms = 1500
-election_timeout_max_ms = 3000
+heartbeat_interval_ms = 500
+election_timeout_min_ms = 3000
+election_timeout_max_ms = 6000
 [replication]
 default_factor = 3
 repair_interval_seconds = 3600

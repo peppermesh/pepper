@@ -26,6 +26,7 @@ getrandom = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 md5 = { workspace = true }
+memmap2 = { workspace = true }
 multer = { workspace = true }
 pepper-bucket = { version = "0.3.0", path = "../pepper-bucket" }
 pepper-compute = { version = "0.3.0", path = "../pepper-compute" }
@@ -55,6 +56,8 @@ tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zstd = { workspace = true }
+zstd-safe = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

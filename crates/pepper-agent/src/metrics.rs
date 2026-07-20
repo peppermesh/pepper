@@ -23,6 +23,20 @@ pub(super) static ERASURE_OBJECT_READS: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_SHARD_REPAIRS: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_SHARD_REBALANCES: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_RECONSTRUCTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_REPAIR_THROTTLE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STRIPES_ENCODED: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STRIPES_COMPRESSED: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STRIPE_LOGICAL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STRIPE_ENCODED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STRIPE_ENCODING_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_SHARD_READ_HEDGES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_SHARD_FETCH_EWMA_MICROS: AtomicU64 = AtomicU64::new(10_000);
+pub(super) static ERASURE_ACTIVE_STRIPE_READS: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_READ_ADMISSION_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_READ_ADMISSION_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_ZERO_COPY_STREAMED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_STREAMED_DECOMPRESSION_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static ERASURE_SYSTEMATIC_RANGE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(super) static NAMESPACE_COMMITS: AtomicU64 = AtomicU64::new(0);
 pub(super) static NAMESPACE_COMMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(super) static NAMESPACE_CONFLICTS: AtomicU64 = AtomicU64::new(0);
@@ -37,10 +51,34 @@ pub(super) static S3_BLOCK_HASH_STORAGE_PHASES: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_BLOCK_HASH_STORAGE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_REPLICA_TRANSFER_PHASES: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_REPLICA_TRANSFER_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_WRITE_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_WRITE_ADMISSION_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_HTTP_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_LIST_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_LIST_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_LIST_CACHE_COALESCED: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn observe_phase(counter: &AtomicU64, total_micros: &AtomicU64, elapsed: Duration) {
     counter.fetch_add(1, Ordering::Relaxed);
     total_micros.fetch_add(
+        elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+pub(super) fn record_erasure_stripe_encoding(
+    logical_bytes: u64,
+    encoded_bytes: u64,
+    encoding: ErasureStripeEncoding,
+    elapsed: Duration,
+) {
+    ERASURE_STRIPES_ENCODED.fetch_add(1, Ordering::Relaxed);
+    if encoding == ErasureStripeEncoding::Zstd {
+        ERASURE_STRIPES_COMPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+    ERASURE_STRIPE_LOGICAL_BYTES.fetch_add(logical_bytes, Ordering::Relaxed);
+    ERASURE_STRIPE_ENCODED_BYTES.fetch_add(encoded_bytes, Ordering::Relaxed);
+    ERASURE_STRIPE_ENCODING_MICROS.fetch_add(
         elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
     );
@@ -133,7 +171,49 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          pepper_erasure_shard_rebalances_total {}\n\
          # HELP pepper_erasure_reconstruction_failures_total Erasure reconstruction failures.\n\
          # TYPE pepper_erasure_reconstruction_failures_total counter\n\
-         pepper_erasure_reconstruction_failures_total {}\n",
+         pepper_erasure_reconstruction_failures_total {}\n\
+         # HELP pepper_erasure_repair_throttle_microseconds_total Time deliberately reserved for foreground work by the repair bandwidth limiter.\n\
+         # TYPE pepper_erasure_repair_throttle_microseconds_total counter\n\
+         pepper_erasure_repair_throttle_microseconds_total {}\n\
+         # HELP pepper_erasure_stripes_encoded_total Erasure stripes encoded.\n\
+         # TYPE pepper_erasure_stripes_encoded_total counter\n\
+         pepper_erasure_stripes_encoded_total {}\n\
+         # HELP pepper_erasure_stripes_compressed_total Erasure stripes compressed before Reed-Solomon encoding.\n\
+         # TYPE pepper_erasure_stripes_compressed_total counter\n\
+         pepper_erasure_stripes_compressed_total {}\n\
+         # HELP pepper_erasure_stripe_logical_bytes_total Logical bytes entering erasure stripe encoding.\n\
+         # TYPE pepper_erasure_stripe_logical_bytes_total counter\n\
+         pepper_erasure_stripe_logical_bytes_total {}\n\
+         # HELP pepper_erasure_stripe_encoded_bytes_total Bytes entering Reed-Solomon after optional compression.\n\
+         # TYPE pepper_erasure_stripe_encoded_bytes_total counter\n\
+         pepper_erasure_stripe_encoded_bytes_total {}\n\
+         # HELP pepper_erasure_stripe_encoding_microseconds_total Time spent probing, compressing, and erasure encoding stripes.\n\
+         # TYPE pepper_erasure_stripe_encoding_microseconds_total counter\n\
+         pepper_erasure_stripe_encoding_microseconds_total {}\n\
+         # HELP pepper_erasure_shard_read_hedges_total Speculative parity fetches issued after the dynamic shard delay.\n\
+         # TYPE pepper_erasure_shard_read_hedges_total counter\n\
+         pepper_erasure_shard_read_hedges_total {}\n\
+         # HELP pepper_erasure_shard_fetch_ewma_microseconds Dynamic shard-fetch latency estimate used for hedging.\n\
+         # TYPE pepper_erasure_shard_fetch_ewma_microseconds gauge\n\
+         pepper_erasure_shard_fetch_ewma_microseconds {}\n\
+         # HELP pepper_erasure_active_stripe_reads Current cache-miss stripe reads.\n\
+         # TYPE pepper_erasure_active_stripe_reads gauge\n\
+         pepper_erasure_active_stripe_reads {}\n\
+         # HELP pepper_erasure_read_admission_queue_microseconds_total Time stripe reads waited for bounded data-plane admission.\n\
+         # TYPE pepper_erasure_read_admission_queue_microseconds_total counter\n\
+         pepper_erasure_read_admission_queue_microseconds_total {}\n\
+         # HELP pepper_erasure_read_admission_observations_total Stripe reads admitted by the bounded data-plane scheduler.\n\
+         # TYPE pepper_erasure_read_admission_observations_total counter\n\
+         pepper_erasure_read_admission_observations_total {}\n\
+         # HELP pepper_erasure_zero_copy_streamed_bytes_total Verified raw systematic bytes streamed without stripe concatenation.\n\
+         # TYPE pepper_erasure_zero_copy_streamed_bytes_total counter\n\
+         pepper_erasure_zero_copy_streamed_bytes_total {}\n\
+         # HELP pepper_erasure_streamed_decompression_bytes_total Verified logical bytes decompressed from shard slices into response frames.\n\
+         # TYPE pepper_erasure_streamed_decompression_bytes_total counter\n\
+         pepper_erasure_streamed_decompression_bytes_total {}\n\
+         # HELP pepper_erasure_systematic_range_bytes_total Raw range bytes served directly from systematic shards without full-stripe reconstruction.\n\
+         # TYPE pepper_erasure_systematic_range_bytes_total counter\n\
+         pepper_erasure_systematic_range_bytes_total {}\n",
         state.status.schema_version,
         COMPUTE_SCHEDULED_LOCAL.load(Ordering::Relaxed),
         COMPUTE_SCHEDULED_REMOTE.load(Ordering::Relaxed),
@@ -153,12 +233,30 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         ERASURE_OBJECT_READS.load(Ordering::Relaxed),
         ERASURE_SHARD_REPAIRS.load(Ordering::Relaxed),
         ERASURE_SHARD_REBALANCES.load(Ordering::Relaxed),
-        ERASURE_RECONSTRUCTION_FAILURES.load(Ordering::Relaxed)
+        ERASURE_RECONSTRUCTION_FAILURES.load(Ordering::Relaxed),
+        ERASURE_REPAIR_THROTTLE_MICROS.load(Ordering::Relaxed),
+        ERASURE_STRIPES_ENCODED.load(Ordering::Relaxed),
+        ERASURE_STRIPES_COMPRESSED.load(Ordering::Relaxed),
+        ERASURE_STRIPE_LOGICAL_BYTES.load(Ordering::Relaxed),
+        ERASURE_STRIPE_ENCODED_BYTES.load(Ordering::Relaxed),
+        ERASURE_STRIPE_ENCODING_MICROS.load(Ordering::Relaxed),
+        ERASURE_SHARD_READ_HEDGES.load(Ordering::Relaxed),
+        ERASURE_SHARD_FETCH_EWMA_MICROS.load(Ordering::Relaxed),
+        ERASURE_ACTIVE_STRIPE_READS.load(Ordering::Relaxed),
+        ERASURE_READ_ADMISSION_QUEUE_MICROS.load(Ordering::Relaxed),
+        ERASURE_READ_ADMISSION_OBSERVATIONS.load(Ordering::Relaxed),
+        ERASURE_ZERO_COPY_STREAMED_BYTES.load(Ordering::Relaxed),
+        ERASURE_STREAMED_DECOMPRESSION_BYTES.load(Ordering::Relaxed),
+        ERASURE_SYSTEMATIC_RANGE_BYTES.load(Ordering::Relaxed)
     );
     let commit_count = NAMESPACE_COMMITS.load(Ordering::Relaxed);
     let read_count = NAMESPACE_READS.load(Ordering::Relaxed);
     let (merkle, merkle_mutations) = pepper_merkle::process_io_stats();
     let storage = pepper_storage::process_io_stats();
+    let storage_encoding = pepper_storage::process_encoding_stats();
+    let consensus_io = pepper_consensus::process_io_stats();
+    let normal_block_batches = block_batch_stats(false);
+    let replica_block_batches = block_batch_stats(true);
     let publication_phases = pepper_publication::process_phase_stats();
     let publication = state
         .publication_repository
@@ -181,6 +279,8 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          # TYPE pepper_namespace_reads_total counter\npepper_namespace_reads_total {read_count}\n\
          # HELP pepper_namespace_read_latency_microseconds_avg Process-lifetime average namespace read latency.\n\
          # TYPE pepper_namespace_read_latency_microseconds_avg gauge\npepper_namespace_read_latency_microseconds_avg {}\n\
+         # HELP pepper_namespace_read_latency_microseconds_total Cumulative namespace read latency.\n\
+         # TYPE pepper_namespace_read_latency_microseconds_total counter\npepper_namespace_read_latency_microseconds_total {}\n\
          # HELP pepper_namespace_group_admission_failures_total Namespace group admission failures.\n\
          # TYPE pepper_namespace_group_admission_failures_total counter\npepper_namespace_group_admission_failures_total {}\n\
          # HELP pepper_merkle_nodes_read_total Merkle nodes decoded by this process.\n\
@@ -191,8 +291,86 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          # TYPE pepper_merkle_mutations_total counter\npepper_merkle_mutations_total {merkle_mutations}\n\
          # HELP pepper_storage_block_reads_total Successful block-store reads by this process.\n\
          # TYPE pepper_storage_block_reads_total counter\npepper_storage_block_reads_total {}\n\
-         # HELP pepper_storage_block_read_bytes_total Bytes returned by successful block-store reads.\n\
+         # HELP pepper_storage_block_read_bytes_total Physical envelope and payload bytes read or materialized by successful block-store reads.\n\
          # TYPE pepper_storage_block_read_bytes_total counter\npepper_storage_block_read_bytes_total {}\n\
+         # HELP pepper_storage_last_accessed_updates_total Durable block access-time updates.\n\
+         # TYPE pepper_storage_last_accessed_updates_total counter\npepper_storage_last_accessed_updates_total {}\n\
+         # HELP pepper_storage_last_accessed_updates_skipped_total Block access-time updates coalesced in memory or by the persisted timestamp.\n\
+         # TYPE pepper_storage_last_accessed_updates_skipped_total counter\npepper_storage_last_accessed_updates_skipped_total {}\n\
+         # HELP pepper_storage_inline_block_writes_total Small internal blocks committed inline with block metadata.\n\
+         # TYPE pepper_storage_inline_block_writes_total counter\npepper_storage_inline_block_writes_total {}\n\
+         # HELP pepper_storage_inline_block_write_bytes_total Encoded bytes committed in inline internal blocks.\n\
+         # TYPE pepper_storage_inline_block_write_bytes_total counter\npepper_storage_inline_block_write_bytes_total {}\n\
+         # HELP pepper_storage_data_durability_barriers_total Filesystem data and metadata durability barriers completed by block batches.\n\
+         # TYPE pepper_storage_data_durability_barriers_total counter\npepper_storage_data_durability_barriers_total {}\n\
+         # HELP pepper_storage_data_files_durable_total File-backed blocks covered by data durability barriers.\n\
+         # TYPE pepper_storage_data_files_durable_total counter\npepper_storage_data_files_durable_total {}\n\
+         # HELP pepper_storage_directory_durability_barriers_total Directory durability barriers completed after block renames.\n\
+         # TYPE pepper_storage_directory_durability_barriers_total counter\npepper_storage_directory_durability_barriers_total {}\n\
+         # HELP pepper_storage_block_encoding_attempts_total Blocks evaluated for physical encoding.\n\
+         # TYPE pepper_storage_block_encoding_attempts_total counter\npepper_storage_block_encoding_attempts_total {}\n\
+         # HELP pepper_storage_block_encoding_blocks_total Selected physical block encodings.\n\
+         # TYPE pepper_storage_block_encoding_blocks_total counter\n\
+         pepper_storage_block_encoding_blocks_total{{encoding=\"raw\"}} {}\n\
+         pepper_storage_block_encoding_blocks_total{{encoding=\"zstd\"}} {}\n\
+         # HELP pepper_storage_block_encoding_bytes_total Logical and encoded bytes produced by block encoding attempts.\n\
+         # TYPE pepper_storage_block_encoding_bytes_total counter\n\
+         pepper_storage_block_encoding_bytes_total{{kind=\"logical\"}} {}\n\
+         pepper_storage_block_encoding_bytes_total{{kind=\"stored\"}} {}\n\
+         # HELP pepper_storage_block_encoding_microseconds_total Time spent choosing and producing block encodings.\n\
+         # TYPE pepper_storage_block_encoding_microseconds_total counter\npepper_storage_block_encoding_microseconds_total {}\n\
+         # HELP pepper_block_write_batch_requests_total Block writes submitted to the group-commit coordinator.\n\
+         # TYPE pepper_block_write_batch_requests_total counter\n\
+         pepper_block_write_batch_requests_total{{intent=\"normal\"}} {}\n\
+         pepper_block_write_batch_requests_total{{intent=\"replica\"}} {}\n\
+         # HELP pepper_block_write_batches_total Durable block-store batch executions.\n\
+         # TYPE pepper_block_write_batches_total counter\n\
+         pepper_block_write_batches_total{{intent=\"normal\"}} {}\n\
+         pepper_block_write_batches_total{{intent=\"replica\"}} {}\n\
+         # TYPE pepper_block_write_coalesced_batches_total counter\n\
+         pepper_block_write_coalesced_batches_total{{intent=\"normal\"}} {}\n\
+         pepper_block_write_coalesced_batches_total{{intent=\"replica\"}} {}\n\
+         # TYPE pepper_block_write_batch_size_max gauge\n\
+         pepper_block_write_batch_size_max{{intent=\"normal\"}} {}\n\
+         pepper_block_write_batch_size_max{{intent=\"replica\"}} {}\n\
+         # TYPE pepper_block_write_queue_microseconds_total counter\n\
+         pepper_block_write_queue_microseconds_total{{intent=\"normal\"}} {}\n\
+         pepper_block_write_queue_microseconds_total{{intent=\"replica\"}} {}\n\
+         # TYPE pepper_block_write_execution_microseconds_total counter\n\
+         pepper_block_write_execution_microseconds_total{{intent=\"normal\"}} {}\n\
+         pepper_block_write_execution_microseconds_total{{intent=\"replica\"}} {}\n\
+         # HELP pepper_raft_storage_operations_total Durable Raft storage operations by phase.\n\
+         # TYPE pepper_raft_storage_operations_total counter\n\
+         pepper_raft_storage_operations_total{{phase=\"log_append\"}} {}\n\
+         pepper_raft_storage_operations_total{{phase=\"state_apply\"}} {}\n\
+         # HELP pepper_raft_storage_entries_total Raft entries handled by durable storage phase.\n\
+         # TYPE pepper_raft_storage_entries_total counter\n\
+         pepper_raft_storage_entries_total{{phase=\"log_append\"}} {}\n\
+         pepper_raft_storage_entries_total{{phase=\"state_apply\"}} {}\n\
+         # HELP pepper_raft_storage_queue_microseconds_total Time awaiting the namespace Raft I/O lock.\n\
+         # TYPE pepper_raft_storage_queue_microseconds_total counter\n\
+         pepper_raft_storage_queue_microseconds_total{{phase=\"log_append\"}} {}\n\
+         pepper_raft_storage_queue_microseconds_total{{phase=\"state_apply\"}} {}\n\
+         # HELP pepper_raft_storage_execution_microseconds_total Time executing durable Raft storage work after admission.\n\
+         # TYPE pepper_raft_storage_execution_microseconds_total counter\n\
+         pepper_raft_storage_execution_microseconds_total{{phase=\"log_append\"}} {}\n\
+         pepper_raft_storage_execution_microseconds_total{{phase=\"state_apply\"}} {}\n\
+         # HELP pepper_raft_proposal_requests_total Namespace commands submitted to the ordered proposal batcher.\n\
+         # TYPE pepper_raft_proposal_requests_total counter\n\
+         pepper_raft_proposal_requests_total {}\n\
+         # HELP pepper_raft_proposal_batches_total Raft proposals emitted by the ordered proposal batcher.\n\
+         # TYPE pepper_raft_proposal_batches_total counter\n\
+         pepper_raft_proposal_batches_total {}\n\
+         # TYPE pepper_raft_proposal_batch_size_max gauge\n\
+         pepper_raft_proposal_batch_size_max {}\n\
+         # TYPE pepper_raft_proposal_queue_microseconds_total counter\n\
+         pepper_raft_proposal_queue_microseconds_total {}\n\
+         # TYPE pepper_raft_proposal_execution_microseconds_total counter\n\
+         pepper_raft_proposal_execution_microseconds_total {}\n\
+         # HELP pepper_namespace_linearizable_reads_total Linearizable namespace reads by confirmation path.\n\
+         # TYPE pepper_namespace_linearizable_reads_total counter\n\
+         pepper_namespace_linearizable_reads_total{{path=\"leader_lease\"}} {}\n\
+         pepper_namespace_linearizable_reads_total{{path=\"quorum_proof\"}} {}\n\
          # HELP pepper_s3_put_phase_duration_microseconds_total Cumulative S3 PUT phase time.\n\
          # TYPE pepper_s3_put_phase_duration_microseconds_total counter\n\
          pepper_s3_put_phase_duration_microseconds_total{{phase=\"request_streaming\"}} {}\n\
@@ -208,18 +386,67 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          pepper_s3_put_phase_observations_total{{phase=\"replica_transfer\"}} {}\n\
          pepper_s3_put_phase_observations_total{{phase=\"durability_fsync_barrier\"}} {}\n\
          pepper_s3_put_phase_observations_total{{phase=\"merkle_update\"}} {}\n\
-         pepper_s3_put_phase_observations_total{{phase=\"raft_namespace_publication\"}} {}\n",
+         pepper_s3_put_phase_observations_total{{phase=\"raft_namespace_publication\"}} {}\n\
+         # HELP pepper_namespace_durability_receipt_sources_total Durability receipts by verification source.\n\
+         # TYPE pepper_namespace_durability_receipt_sources_total counter\n\
+         pepper_namespace_durability_receipt_sources_total{{source=\"preverified\"}} {}\n\
+         pepper_namespace_durability_receipt_sources_total{{source=\"cache\"}} {}\n\
+         pepper_namespace_durability_receipt_sources_total{{source=\"backend\"}} {}\n\
+         # TYPE pepper_namespace_durability_preverified_rejections_total counter\n\
+         pepper_namespace_durability_preverified_rejections_total{{reason=\"missing\"}} {}\n\
+         pepper_namespace_durability_preverified_rejections_total{{reason=\"invalid\"}} {}\n",
         NAMESPACE_COMMIT_FAILURES.load(Ordering::Relaxed),
         NAMESPACE_CONFLICTS.load(Ordering::Relaxed),
         NAMESPACE_DURABILITY_FAILURES.load(Ordering::Relaxed),
         NAMESPACE_COMMIT_LATENCY_MICROS.load(Ordering::Relaxed),
         NAMESPACE_COMMIT_LATENCY_MICROS.load(Ordering::Relaxed) / commit_count.max(1),
         NAMESPACE_READ_LATENCY_MICROS.load(Ordering::Relaxed) / read_count.max(1),
+        NAMESPACE_READ_LATENCY_MICROS.load(Ordering::Relaxed),
         NAMESPACE_GROUP_ADMISSION_FAILURES.load(Ordering::Relaxed),
         merkle.nodes_read,
         merkle.nodes_written,
         storage.block_reads,
         storage.block_read_bytes,
+        storage.last_accessed_updates,
+        storage.last_accessed_updates_skipped,
+        storage.inline_block_writes,
+        storage.inline_block_write_bytes,
+        storage.data_durability_barriers,
+        storage.data_files_durable,
+        storage.directory_durability_barriers,
+        storage_encoding.attempts,
+        storage_encoding.raw_blocks,
+        storage_encoding.zstd_blocks,
+        storage_encoding.logical_bytes,
+        storage_encoding.stored_bytes,
+        storage_encoding.encoding_micros,
+        normal_block_batches.requests,
+        replica_block_batches.requests,
+        normal_block_batches.batches,
+        replica_block_batches.batches,
+        normal_block_batches.coalesced_batches,
+        replica_block_batches.coalesced_batches,
+        normal_block_batches.max_batch_size,
+        replica_block_batches.max_batch_size,
+        normal_block_batches.queue_micros,
+        replica_block_batches.queue_micros,
+        normal_block_batches.execution_micros,
+        replica_block_batches.execution_micros,
+        consensus_io.log_append_observations,
+        consensus_io.state_apply_observations,
+        consensus_io.log_append_entries,
+        consensus_io.state_apply_entries,
+        consensus_io.log_append_queue_micros,
+        consensus_io.state_apply_queue_micros,
+        consensus_io.log_append_execution_micros,
+        consensus_io.state_apply_execution_micros,
+        consensus_io.proposal_requests,
+        consensus_io.proposal_batches,
+        consensus_io.proposal_batch_size_max,
+        consensus_io.proposal_queue_micros,
+        consensus_io.proposal_execution_micros,
+        consensus_io.linearizable_read_lease_hits,
+        consensus_io.linearizable_read_proofs,
         S3_REQUEST_STREAMING_MICROS.load(Ordering::Relaxed),
         S3_BLOCK_HASH_STORAGE_MICROS.load(Ordering::Relaxed),
         S3_REPLICA_TRANSFER_MICROS.load(Ordering::Relaxed),
@@ -232,7 +459,71 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         publication_phases.durability_observations,
         publication_phases.merkle_update_observations,
         publication_phases.raft_publication_observations,
+        publication_phases.durability_preverified_receipts,
+        publication_phases.durability_cached_receipts,
+        publication_phases.durability_backend_receipts,
+        publication_phases.durability_missing_preverified_receipts,
+        publication_phases.durability_invalid_preverified_receipts,
     ));
+    let cache = reconstructed_cache::process_stats();
+    body.push_str(&format!(
+        "# HELP pepper_reconstructed_cache_requests_total Reconstructed stripe cache lookups by result.\n\
+         # TYPE pepper_reconstructed_cache_requests_total counter\n\
+         pepper_reconstructed_cache_requests_total{{result=\"hit\"}} {}\n\
+         pepper_reconstructed_cache_requests_total{{result=\"miss\"}} {}\n\
+         # HELP pepper_reconstructed_cache_admissions_total Verified reconstructed stripes admitted to the cache.\n\
+         # TYPE pepper_reconstructed_cache_admissions_total counter\n\
+         pepper_reconstructed_cache_admissions_total {}\n\
+         # HELP pepper_reconstructed_cache_evictions_total Reconstructed cache capacity evictions.\n\
+         # TYPE pepper_reconstructed_cache_evictions_total counter\n\
+         pepper_reconstructed_cache_evictions_total {}\n\
+         # HELP pepper_reconstructed_cache_bypasses_total Reconstructed stripes bypassed by admission or capacity policy.\n\
+         # TYPE pepper_reconstructed_cache_bypasses_total counter\n\
+         pepper_reconstructed_cache_bypasses_total {}\n\
+         # HELP pepper_reconstructed_cache_integrity_failures_total Invalid cached stripes removed.\n\
+         # TYPE pepper_reconstructed_cache_integrity_failures_total counter\n\
+         pepper_reconstructed_cache_integrity_failures_total {}\n\
+         # HELP pepper_reconstructed_cache_bytes_total Reconstructed cache data-plane bytes.\n\
+         # TYPE pepper_reconstructed_cache_bytes_total counter\n\
+         pepper_reconstructed_cache_bytes_total{{direction=\"read\"}} {}\n\
+         pepper_reconstructed_cache_bytes_total{{direction=\"write\"}} {}\n\
+         # HELP pepper_s3_write_admission_rejections_total S3 writes rejected before work because the bounded admission wait expired.\n\
+         # TYPE pepper_s3_write_admission_rejections_total counter\n\
+         pepper_s3_write_admission_rejections_total {}\n\
+         # HELP pepper_s3_write_admission_queue_microseconds_total Time admitted S3 writes spent waiting for a pipeline slot.\n\
+         # TYPE pepper_s3_write_admission_queue_microseconds_total counter\n\
+         pepper_s3_write_admission_queue_microseconds_total {}\n\
+         # HELP pepper_s3_write_service_ewma_microseconds Current S3 write-pipeline service-time EWMA used for Retry-After.\n\
+         # TYPE pepper_s3_write_service_ewma_microseconds gauge\n\
+         pepper_s3_write_service_ewma_microseconds {}\n\
+         # HELP pepper_s3_http_admission_rejections_total S3 requests rejected before dispatch because the response-lifetime concurrency bound was full.\n\
+         # TYPE pepper_s3_http_admission_rejections_total counter\n\
+         pepper_s3_http_admission_rejections_total {}\n\
+         # HELP pepper_s3_list_cache_hits_total S3 LIST results served from the immutable namespace-root cache.\n\
+         # TYPE pepper_s3_list_cache_hits_total counter\n\
+         pepper_s3_list_cache_hits_total {}\n\
+         # HELP pepper_s3_list_cache_misses_total S3 LIST results built for a new namespace-root and query.\n\
+         # TYPE pepper_s3_list_cache_misses_total counter\n\
+         pepper_s3_list_cache_misses_total {}\n\
+         # HELP pepper_s3_list_cache_coalesced_total S3 LIST requests joined to an in-flight identical immutable scan.\n\
+         # TYPE pepper_s3_list_cache_coalesced_total counter\n\
+         pepper_s3_list_cache_coalesced_total {}\n",
+        cache.hits,
+        cache.misses,
+        cache.admissions,
+        cache.evictions,
+        cache.bypasses,
+        cache.integrity_failures,
+        cache.read_bytes,
+        cache.write_bytes,
+        S3_WRITE_ADMISSION_REJECTIONS.load(Ordering::Relaxed),
+        S3_WRITE_ADMISSION_QUEUE_MICROS.load(Ordering::Relaxed),
+        state.s3_write_service_micros.load(Ordering::Relaxed),
+        S3_HTTP_ADMISSION_REJECTIONS.load(Ordering::Relaxed),
+        S3_LIST_CACHE_HITS.load(Ordering::Relaxed),
+        S3_LIST_CACHE_MISSES.load(Ordering::Relaxed),
+        S3_LIST_CACHE_COALESCED.load(Ordering::Relaxed),
+        ));
     if let Some(publication) = publication {
         body.push_str(&format!(
             "# TYPE pepper_namespace_staging_leases gauge\npepper_namespace_staging_leases {}\n\

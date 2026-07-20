@@ -52,6 +52,7 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 rcgen = "0.14"
 redb = "2.6"
 reed-solomon-erasure = "6.0"
+rustix = { version = "1.1", features = ["fs"] }
 rustls = "0.23"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -59,6 +60,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 sha1 = "0.10"
 md5 = { package = "md-5", version = "0.10" }
+memmap2 = "0.9"
 multer = "3.1"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
@@ -72,5 +74,7 @@ tikv-jemallocator = "0.7"
 async-trait = "0.1"
 futures-util = "0.3"
 fs2 = "0.4"
+zstd = "0.13"
+zstd-safe = "7.2"
 prost-build = "0.14"
 protoc-bin-vendored = "3.2"

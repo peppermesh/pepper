@@ -226,33 +226,6 @@ pub(super) fn namespace_alias(state: &AppState, value: &str) -> Result<Namespace
     NamespaceId::new(cid).map_err(namespace_error)
 }
 
-pub(super) fn namespace_aliases(state: &AppState) -> Result<Vec<(String, NamespaceId)>, ApiError> {
-    let read = state
-        .metadata
-        .database()
-        .begin_read()
-        .map_err(ApiError::redb_transaction)?;
-    let table = match read.open_table(NAMESPACE_ALIASES) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(ApiError::redb_table(error)),
-    };
-    let mut aliases = Vec::new();
-    for entry in table.iter().map_err(ApiError::redb_storage)? {
-        let (alias, namespace) = entry.map_err(ApiError::redb_storage)?;
-        let cid = namespace
-            .value()
-            .parse::<Cid>()
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        aliases.push((
-            alias.value().to_string(),
-            NamespaceId::new(cid).map_err(namespace_error)?,
-        ));
-    }
-    aliases.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(aliases)
-}
-
 pub(super) fn persist_alias(
     state: &AppState,
     alias: &str,
@@ -294,6 +267,12 @@ pub(super) fn cache_alias(
 ) -> Result<(), ApiError> {
     if alias.is_empty() || alias.len() > 256 {
         return Err(ApiError::bad_request("alias must contain 1 to 256 bytes"));
+    }
+    match namespace_alias(state, alias) {
+        Ok(existing) if existing == *namespace_id => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.code == ErrorCode::NotFound => {}
+        Err(error) => return Err(error),
     }
     let write = state
         .metadata
@@ -337,7 +316,9 @@ pub(super) async fn bootstrap_namespace_group(
         &created.root_cid,
         &created.checkpoint_cid,
     ] {
-        let block = state.block_store.get(cid)?;
+        let encoded = state.block_store.get_encoded(cid)?;
+        let logical_size = encoded.logical_size_bytes();
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
         let mut accepted = 0;
         for replica in &replicas {
             if replica == &state.status.node_id {
@@ -351,7 +332,13 @@ pub(super) async fn bootstrap_namespace_group(
             for _ in 0..5 {
                 if let Ok(response) = state
                     .network
-                    .block_put_replica(address, cid.codec, block.payload.clone())
+                    .block_put_replica_stream(
+                        address,
+                        cid.codec,
+                        cid,
+                        logical_size,
+                        encoded_payload.clone(),
+                    )
                     .await
                     && response.cid == cid.to_string()
                 {
@@ -645,6 +632,7 @@ pub(super) async fn apply_command(
     namespace_id: NamespaceId,
     command: CommandEnvelope,
     uploaded_roots: Vec<Cid>,
+    preverified_durability: Vec<DurabilityReceipt>,
     staged_bytes: u64,
     retain_uploaded_on_conflict: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -685,6 +673,7 @@ pub(super) async fn apply_command(
                 namespace_id: namespace_id.clone(),
                 command,
                 uploaded_roots,
+                preverified_durability,
                 staged_bytes,
                 staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
                 retain_uploaded_on_conflict,
@@ -778,6 +767,7 @@ pub(super) async fn kv_put(
         id,
         command,
         request.uploaded_roots,
+        Vec::new(),
         request.staged_bytes,
         request.retain_uploaded_on_conflict,
     )
@@ -812,7 +802,7 @@ pub(super) async fn kv_delete(
             },
         },
     };
-    apply_command(&state, id, command, Vec::new(), 0, false).await
+    apply_command(&state, id, command, Vec::new(), Vec::new(), 0, false).await
 }
 
 pub(super) async fn kv_transaction(
@@ -842,6 +832,7 @@ pub(super) async fn kv_transaction(
         id,
         command,
         request.uploaded_roots,
+        Vec::new(),
         request.staged_bytes,
         request.retain_uploaded_on_conflict,
     )
@@ -1132,6 +1123,7 @@ pub(super) async fn namespace_rollback(
             },
         },
         Vec::new(),
+        Vec::new(),
         0,
         false,
     )
@@ -1180,6 +1172,7 @@ pub(super) async fn namespace_snapshot_mutate(
             signature_hex: request.signature_hex,
             command,
         },
+        Vec::new(),
         Vec::new(),
         0,
         false,

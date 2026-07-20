@@ -23,6 +23,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::form
 use tokio::task::JoinSet;
 
 const STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+const MULTIPART_PART_BYTES: u64 = 256 * 1024 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
@@ -36,11 +37,38 @@ pub enum BackendKind {
 #[serde(rename_all = "kebab-case")]
 pub enum Operation {
     Put,
+    MultipartPut,
     Get,
     RangeGet,
     Head,
     List,
     Mixed,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadProfile {
+    Incompressible,
+    #[value(name = "compressible-2x")]
+    Compressible2x,
+    #[value(name = "compressible-4x")]
+    Compressible4x,
+    #[value(name = "compressible-10x")]
+    Compressible10x,
+    #[value(name = "compressible-20x")]
+    Compressible20x,
+}
+
+impl PayloadProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incompressible => "incompressible",
+            Self::Compressible2x => "compressible-2x",
+            Self::Compressible4x => "compressible-4x",
+            Self::Compressible10x => "compressible-10x",
+            Self::Compressible20x => "compressible-20x",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -83,12 +111,18 @@ pub struct LoadgenArgs {
     pub region: String,
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
-    #[arg(long, default_value = "/tmp/pepper-s3-throughput/raw")]
-    pub raw_root: PathBuf,
+    /// Maximum retries for transient S3 transport and service failures.
+    #[arg(long, default_value_t = 3)]
+    pub retries: u32,
+    /// Raw-backend data root; required when --backend raw is selected.
+    #[arg(long)]
+    pub raw_root: Option<PathBuf>,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub raw_fsync: bool,
     #[arg(long)]
     pub quiet: bool,
+    #[arg(long, value_enum, default_value = "incompressible")]
+    pub payload_profile: PayloadProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +130,24 @@ struct RequestResult {
     success: bool,
     status: u16,
     transferred: u64,
+    retries: u64,
+    retry_after: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GeneratedRequest {
+    size: u64,
+    range_bytes: u64,
+    seed: u64,
+    payload_profile: PayloadProfile,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkerConfig {
+    operation: Operation,
+    request: GeneratedRequest,
+    object_count: u64,
+    deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -112,6 +164,7 @@ struct S3Backend {
     access_key: String,
     secret_key: String,
     region: String,
+    retries: u32,
     route_counter: AtomicU64,
 }
 
@@ -124,6 +177,7 @@ struct RawBackend {
 #[derive(Debug, Default)]
 struct WorkerResult {
     attempts: u64,
+    retries: u64,
     failures: u64,
     logical_bytes: u64,
     latencies_micros: Vec<u64>,
@@ -147,6 +201,8 @@ struct ReportConfig {
     requested_duration_seconds: u64,
     object_count: u64,
     range_bytes: u64,
+    payload_profile: PayloadProfile,
+    max_retries: u32,
     endpoints: Vec<String>,
     raw_fsync: Option<bool>,
 }
@@ -157,6 +213,7 @@ struct ReportResults {
     attempts: u64,
     successes: u64,
     failures: u64,
+    retries: u64,
     failure_rate: f64,
     logical_bytes: u64,
     logical_mb_per_second: f64,
@@ -192,16 +249,17 @@ impl Backend {
         size: u64,
         range_bytes: u64,
         seed: u64,
+        payload_profile: PayloadProfile,
     ) -> RequestResult {
         match self {
             Self::S3(backend) => {
                 backend
-                    .request(operation, &key, size, range_bytes, seed)
+                    .request(operation, &key, size, range_bytes, seed, payload_profile)
                     .await
             }
             Self::Raw(backend) => {
                 backend
-                    .request(operation, key, size, range_bytes, seed)
+                    .request(operation, key, size, range_bytes, seed, payload_profile)
                     .await
             }
         }
@@ -256,7 +314,40 @@ impl S3Backend {
         size: u64,
         range_bytes: u64,
         seed: u64,
+        payload_profile: PayloadProfile,
     ) -> RequestResult {
+        let mut retries = 0u64;
+        loop {
+            let mut result = self
+                .request_once(operation, key, size, range_bytes, seed, payload_profile)
+                .await;
+            result.retries = retries;
+            if result.success || retries >= u64::from(self.retries) || !retryable_s3_result(&result)
+            {
+                return result;
+            }
+            let delay = result.retry_after.unwrap_or_else(|| {
+                Duration::from_millis(25u64.saturating_mul(1u64 << retries.min(6)))
+            });
+            let jitter =
+                Duration::from_millis(seed.wrapping_add(retries.wrapping_mul(0x9e37_79b9)) % 251);
+            tokio::time::sleep(delay.saturating_add(jitter)).await;
+            retries += 1;
+        }
+    }
+
+    async fn request_once(
+        &self,
+        operation: Operation,
+        key: &str,
+        size: u64,
+        range_bytes: u64,
+        seed: u64,
+        payload_profile: PayloadProfile,
+    ) -> RequestResult {
+        if operation == Operation::MultipartPut {
+            return self.multipart_put(key, size, seed, payload_profile).await;
+        }
         let endpoint = self.endpoint();
         let mut path = format!("/{}", aws_encode(&self.bucket, false));
         if !key.is_empty() {
@@ -268,7 +359,9 @@ impl S3Backend {
             Operation::Get | Operation::RangeGet => (Method::GET, ""),
             Operation::Head => (Method::HEAD, ""),
             Operation::List => (Method::GET, "list-type=2&max-keys=1000"),
-            Operation::Mixed => unreachable!("mixed is resolved before backend dispatch"),
+            Operation::MultipartPut | Operation::Mixed => {
+                unreachable!("multipart and mixed are resolved before single-request dispatch")
+            }
         };
         let target = if query.is_empty() {
             format!("{endpoint}{path}")
@@ -289,9 +382,10 @@ impl S3Backend {
             ));
         if operation == Operation::Put {
             request = request
+                .header(header::EXPECT, "100-continue")
                 .header(header::CONTENT_LENGTH, size)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(generated_body(size, seed));
+                .body(generated_body(size, seed, payload_profile));
         }
         if operation == Operation::RangeGet {
             let requested = range_bytes.min(size);
@@ -305,9 +399,17 @@ impl S3Backend {
                 success: false,
                 status: 0,
                 transferred: 0,
+                retries: 0,
+                retry_after: None,
             };
         };
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
         let mut transferred = 0u64;
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
@@ -318,6 +420,8 @@ impl S3Backend {
                         success: false,
                         status: status.as_u16(),
                         transferred,
+                        retries: 0,
+                        retry_after,
                     };
                 }
             }
@@ -326,8 +430,191 @@ impl S3Backend {
             success: status.is_success(),
             status: status.as_u16(),
             transferred,
+            retries: 0,
+            retry_after,
         }
     }
+
+    async fn multipart_put(
+        &self,
+        key: &str,
+        size: u64,
+        seed: u64,
+        payload_profile: PayloadProfile,
+    ) -> RequestResult {
+        let endpoint = self.endpoint();
+        let path = format!(
+            "/{}/{}",
+            aws_encode(&self.bucket, false),
+            aws_encode(key, true)
+        );
+        let initiate_query = "uploads=";
+        let initiate = self
+            .client
+            .post(format!("{endpoint}{path}?{initiate_query}"))
+            .headers(signed_headers(
+                Method::POST,
+                endpoint,
+                &path,
+                initiate_query,
+                &self.access_key,
+                &self.secret_key,
+                &self.region,
+            ))
+            .send()
+            .await;
+        let Ok(initiate) = initiate else {
+            return failed_request(0);
+        };
+        let initiate_status = initiate.status();
+        let Ok(initiate_body) = initiate.text().await else {
+            return failed_request(initiate_status.as_u16());
+        };
+        let Some(upload_id) = xml_element(&initiate_body, "UploadId") else {
+            return failed_request(initiate_status.as_u16());
+        };
+        if !initiate_status.is_success() {
+            return failed_request(initiate_status.as_u16());
+        }
+
+        let mut parts = Vec::new();
+        let mut offset = 0u64;
+        let mut part_number = 1u64;
+        while offset < size {
+            let part_size = (size - offset).min(MULTIPART_PART_BYTES);
+            let query = format!(
+                "partNumber={part_number}&uploadId={}",
+                aws_encode(&upload_id, false)
+            );
+            let request = self
+                .client
+                .put(format!("{endpoint}{path}?{query}"))
+                .headers(signed_headers(
+                    Method::PUT,
+                    endpoint,
+                    &path,
+                    &query,
+                    &self.access_key,
+                    &self.secret_key,
+                    &self.region,
+                ))
+                .header(header::CONTENT_LENGTH, part_size)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(generated_body_at(
+                    part_size,
+                    seed,
+                    offset / STREAM_CHUNK_BYTES as u64,
+                    payload_profile,
+                ))
+                .send()
+                .await;
+            let Ok(response) = request else {
+                self.abort_multipart(endpoint, &path, &upload_id).await;
+                return failed_request(0);
+            };
+            let status = response.status();
+            let etag = response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            if response.bytes().await.is_err() || !status.is_success() || etag.is_none() {
+                self.abort_multipart(endpoint, &path, &upload_id).await;
+                return failed_request(status.as_u16());
+            }
+            parts.push((part_number, etag.expect("successful part has an ETag")));
+            offset += part_size;
+            part_number += 1;
+        }
+
+        let complete_body = format!(
+            "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+            parts
+                .iter()
+                .map(|(number, etag)| format!(
+                    "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+                ))
+                .collect::<String>()
+        );
+        let query = format!("uploadId={}", aws_encode(&upload_id, false));
+        let complete = self
+            .client
+            .post(format!("{endpoint}{path}?{query}"))
+            .headers(signed_headers(
+                Method::POST,
+                endpoint,
+                &path,
+                &query,
+                &self.access_key,
+                &self.secret_key,
+                &self.region,
+            ))
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(complete_body)
+            .send()
+            .await;
+        let Ok(complete) = complete else {
+            self.abort_multipart(endpoint, &path, &upload_id).await;
+            return failed_request(0);
+        };
+        let status = complete.status();
+        let body_ok = complete.bytes().await.is_ok();
+        if status.is_success() && body_ok {
+            RequestResult {
+                success: true,
+                status: status.as_u16(),
+                transferred: size,
+                retries: 0,
+                retry_after: None,
+            }
+        } else {
+            self.abort_multipart(endpoint, &path, &upload_id).await;
+            failed_request(status.as_u16())
+        }
+    }
+
+    async fn abort_multipart(&self, endpoint: &str, path: &str, upload_id: &str) {
+        let query = format!("uploadId={}", aws_encode(upload_id, false));
+        let _ = self
+            .client
+            .delete(format!("{endpoint}{path}?{query}"))
+            .headers(signed_headers(
+                Method::DELETE,
+                endpoint,
+                path,
+                &query,
+                &self.access_key,
+                &self.secret_key,
+                &self.region,
+            ))
+            .send()
+            .await;
+    }
+}
+
+fn failed_request(status: u16) -> RequestResult {
+    RequestResult {
+        success: false,
+        status,
+        transferred: 0,
+        retries: 0,
+        retry_after: None,
+    }
+}
+
+fn xml_element(body: &str, name: &str) -> Option<String> {
+    let start_tag = format!("<{name}>");
+    let end_tag = format!("</{name}>");
+    let start = body.find(&start_tag)? + start_tag.len();
+    let end = body[start..].find(&end_tag)? + start;
+    Some(body[start..end].to_string())
+}
+
+fn retryable_s3_result(result: &RequestResult) -> bool {
+    !result.success
+        && (result.status == 0
+            || (200..300).contains(&result.status)
+            || matches!(result.status, 409 | 429 | 500 | 502 | 503 | 504))
 }
 
 impl RawBackend {
@@ -338,17 +625,31 @@ impl RawBackend {
         size: u64,
         range_bytes: u64,
         seed: u64,
+        payload_profile: PayloadProfile,
     ) -> RequestResult {
         let root = self.root.clone();
         let fsync = self.fsync;
         tokio::task::spawn_blocking(move || {
-            raw_request(&root, fsync, operation, &key, size, range_bytes, seed)
+            raw_request(
+                &root,
+                fsync,
+                operation,
+                &key,
+                GeneratedRequest {
+                    size,
+                    range_bytes,
+                    seed,
+                    payload_profile,
+                },
+            )
         })
         .await
         .unwrap_or(RequestResult {
             success: false,
             status: 0,
             transferred: 0,
+            retries: 0,
+            retry_after: None,
         })
     }
 }
@@ -358,19 +659,23 @@ fn raw_request(
     fsync: bool,
     operation: Operation,
     key: &str,
-    size: u64,
-    range_bytes: u64,
-    seed: u64,
+    request: GeneratedRequest,
 ) -> RequestResult {
+    let GeneratedRequest {
+        size,
+        range_bytes,
+        seed,
+        payload_profile,
+    } = request;
     let result = (|| -> Result<(u16, u64)> {
         let path = root.join(key);
         match operation {
-            Operation::Put => {
+            Operation::Put | Operation::MultipartPut => {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 let mut output = File::create(path)?;
-                write_generated(&mut output, size, seed)?;
+                write_generated(&mut output, size, seed, payload_profile)?;
                 if fsync {
                     output.sync_data()?;
                 }
@@ -426,11 +731,15 @@ fn raw_request(
             success: true,
             status,
             transferred,
+            retries: 0,
+            retry_after: None,
         },
         Err(_) => RequestResult {
             success: false,
             status: 0,
             transferred: 0,
+            retries: 0,
+            retry_after: None,
         },
     }
 }
@@ -451,40 +760,89 @@ fn count_files(root: &Path) -> Result<u64> {
     Ok(count)
 }
 
-fn generated_chunk(seed: u64) -> Vec<u8> {
-    let digest = Sha256::digest(seed.to_string().as_bytes());
-    digest
-        .iter()
-        .copied()
-        .cycle()
-        .take(STREAM_CHUNK_BYTES)
-        .collect()
+fn generated_chunk(
+    seed: u64,
+    chunk_index: u64,
+    size: usize,
+    payload_profile: PayloadProfile,
+) -> Vec<u8> {
+    // SplitMix64 is deterministic and fast enough to keep the load generator
+    // out of the storage hot path. Including the chunk index prevents Pepper's
+    // content addressing from collapsing every block in a large object into a
+    // single physical block, while the pseudorandom output avoids compression.
+    let mut state = seed
+        .wrapping_add(chunk_index.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut chunk = vec![0u8; size];
+    for output in chunk.chunks_mut(std::mem::size_of::<u64>()) {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        output.copy_from_slice(&value.to_le_bytes()[..output.len()]);
+    }
+    let (period, random_bytes) = match payload_profile {
+        PayloadProfile::Incompressible => return chunk,
+        PayloadProfile::Compressible2x => (16, 8),
+        PayloadProfile::Compressible4x => (32, 8),
+        PayloadProfile::Compressible10x => (80, 8),
+        PayloadProfile::Compressible20x => (160, 8),
+    };
+    for group in chunk.chunks_mut(period) {
+        let zero_bytes = group.len().saturating_sub(random_bytes.min(group.len()));
+        group[..zero_bytes].fill(0);
+    }
+    chunk
 }
 
-fn write_generated(output: &mut File, mut remaining: u64, seed: u64) -> Result<()> {
-    let chunk = generated_chunk(seed);
+fn write_generated(
+    output: &mut File,
+    mut remaining: u64,
+    seed: u64,
+    payload_profile: PayloadProfile,
+) -> Result<()> {
+    let mut chunk_index = 0u64;
     while remaining > 0 {
-        let take = remaining.min(chunk.len() as u64) as usize;
-        output.write_all(&chunk[..take])?;
+        let take = remaining.min(STREAM_CHUNK_BYTES as u64) as usize;
+        let chunk = generated_chunk(seed, chunk_index, take, payload_profile);
+        output.write_all(&chunk)?;
         remaining -= take as u64;
+        chunk_index += 1;
     }
     Ok(())
 }
 
-fn generated_body(size: u64, seed: u64) -> reqwest::Body {
-    let chunk = Arc::new(generated_chunk(seed));
-    let body = stream::unfold((size, chunk), |(remaining, chunk)| async move {
-        if remaining == 0 {
-            None
-        } else {
-            let take = remaining.min(chunk.len() as u64) as usize;
-            let bytes = Bytes::copy_from_slice(&chunk[..take]);
-            Some((
-                Ok::<_, std::io::Error>(bytes),
-                (remaining - take as u64, chunk),
-            ))
-        }
-    });
+fn generated_body(size: u64, seed: u64, payload_profile: PayloadProfile) -> reqwest::Body {
+    generated_body_at(size, seed, 0, payload_profile)
+}
+
+fn generated_body_at(
+    size: u64,
+    seed: u64,
+    first_chunk_index: u64,
+    payload_profile: PayloadProfile,
+) -> reqwest::Body {
+    let body = stream::unfold(
+        (size, seed, first_chunk_index, payload_profile),
+        |(remaining, seed, chunk_index, payload_profile)| async move {
+            if remaining == 0 {
+                None
+            } else {
+                let take = remaining.min(STREAM_CHUNK_BYTES as u64) as usize;
+                let bytes = Bytes::from(generated_chunk(seed, chunk_index, take, payload_profile));
+                Some((
+                    Ok::<_, std::io::Error>(bytes),
+                    (
+                        remaining - take as u64,
+                        seed,
+                        chunk_index + 1,
+                        payload_profile,
+                    ),
+                ))
+            }
+        },
+    );
     reqwest::Body::wrap_stream(body)
 }
 
@@ -573,8 +931,11 @@ pub(crate) fn signed_headers(
     headers
 }
 
-fn object_key(size: u64, index: u64) -> String {
-    format!("objects/{size}/{index:012}.bin")
+fn object_key(size: u64, index: u64, payload_profile: PayloadProfile) -> String {
+    format!(
+        "objects/{}/{size}/{index:012}.bin",
+        payload_profile.as_str()
+    )
 }
 
 async fn prepare(
@@ -583,13 +944,21 @@ async fn prepare(
     count: u64,
     concurrency: usize,
     quiet: bool,
+    payload_profile: PayloadProfile,
 ) -> Result<()> {
     let mut writes = stream::iter(0..count)
         .map(|index| {
             let backend = backend.clone();
             async move {
                 let result = backend
-                    .request(Operation::Put, object_key(size, index), size, 0, index)
+                    .request(
+                        Operation::Put,
+                        object_key(size, index, payload_profile),
+                        size,
+                        0,
+                        index,
+                        payload_profile,
+                    )
                     .await;
                 ensure!(
                     result.success,
@@ -619,15 +988,19 @@ fn percentile(sorted: &[u64], numerator: usize) -> f64 {
     sorted[index.min(sorted.len() - 1)] as f64 / 1000.0
 }
 
-async fn worker(
-    worker_id: usize,
-    backend: Backend,
-    operation: Operation,
-    size: u64,
-    range_bytes: u64,
-    object_count: u64,
-    deadline: Instant,
-) -> WorkerResult {
+async fn worker(worker_id: usize, backend: Backend, config: WorkerConfig) -> WorkerResult {
+    let WorkerConfig {
+        operation,
+        request,
+        object_count,
+        deadline,
+    } = config;
+    let GeneratedRequest {
+        size,
+        range_bytes,
+        payload_profile,
+        ..
+    } = request;
     let mut result = WorkerResult::default();
     let mut iteration = 0u64;
     let mut random = worker_id as u64 + 1;
@@ -646,18 +1019,28 @@ async fn worker(
         let key = if selected == Operation::List {
             String::new()
         } else {
-            object_key(size, index)
+            object_key(size, index, payload_profile)
         };
         let started = Instant::now();
-        let mut request = backend
-            .request(
+        let Ok(mut request) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            backend.request(
                 selected,
                 key,
                 size,
                 range_bytes,
                 ((worker_id as u64) << 32) | iteration,
-            )
-            .await;
+                payload_profile,
+            ),
+        )
+        .await
+        else {
+            // A duration benchmark measures operations completed inside its
+            // window. Cancel and exclude the final in-flight operation rather
+            // than letting its request timeout and retry budget extend the cell
+            // by minutes under deliberate overload.
+            break;
+        };
         request.success &= match selected {
             Operation::Get => request.transferred == size,
             Operation::RangeGet => request.transferred == range_bytes.min(size),
@@ -668,9 +1051,10 @@ async fn worker(
             .push(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
         *result.statuses.entry(request.status).or_default() += 1;
         result.attempts += 1;
+        result.retries = result.retries.saturating_add(request.retries);
         if !request.success {
             result.failures += 1;
-        } else if selected == Operation::Put {
+        } else if matches!(selected, Operation::Put | Operation::MultipartPut) {
             result.logical_bytes = result.logical_bytes.saturating_add(size);
         } else if matches!(selected, Operation::Get | Operation::RangeGet) {
             result.logical_bytes = result.logical_bytes.saturating_add(request.transferred);
@@ -711,13 +1095,20 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
                 access_key: args.access_key.clone(),
                 secret_key: args.secret_key.clone(),
                 region: args.region.clone(),
+                retries: args.retries,
                 route_counter: AtomicU64::new(0),
             }))
         }
-        BackendKind::Raw => Backend::Raw(Arc::new(RawBackend {
-            root: args.raw_root.clone(),
-            fsync: args.raw_fsync,
-        })),
+        BackendKind::Raw => {
+            let root = args
+                .raw_root
+                .clone()
+                .context("--raw-root is required when --backend raw is selected")?;
+            Backend::Raw(Arc::new(RawBackend {
+                root,
+                fsync: args.raw_fsync,
+            }))
+        }
     };
     backend.ensure_bucket().await?;
     if args.prepare {
@@ -727,6 +1118,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
             args.object_count,
             args.concurrency,
             args.quiet,
+            args.payload_profile,
         )
         .await?;
     }
@@ -742,17 +1134,24 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
         workers.spawn(worker(
             worker_id,
             backend.clone(),
-            args.operation,
-            args.size,
-            args.range_bytes,
-            args.object_count,
-            deadline,
+            WorkerConfig {
+                operation: args.operation,
+                request: GeneratedRequest {
+                    size: args.size,
+                    range_bytes: args.range_bytes,
+                    seed: 0,
+                    payload_profile: args.payload_profile,
+                },
+                object_count: args.object_count,
+                deadline,
+            },
         ));
     }
     let mut combined = WorkerResult::default();
     while let Some(result) = workers.join_next().await {
         let result = result?;
         combined.attempts += result.attempts;
+        combined.retries = combined.retries.saturating_add(result.retries);
         combined.failures += result.failures;
         combined.logical_bytes = combined.logical_bytes.saturating_add(result.logical_bytes);
         combined.latencies_micros.extend(result.latencies_micros);
@@ -763,7 +1162,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
     let elapsed = started.elapsed().as_secs_f64();
     combined.latencies_micros.sort_unstable();
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         started_at,
         config: ReportConfig {
             backend: args.backend,
@@ -773,6 +1172,12 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
             requested_duration_seconds: args.duration,
             object_count: args.object_count,
             range_bytes: args.range_bytes,
+            payload_profile: args.payload_profile,
+            max_retries: if args.backend == BackendKind::S3 {
+                args.retries
+            } else {
+                0
+            },
             endpoints: if args.backend == BackendKind::S3 {
                 args.endpoints.clone()
             } else {
@@ -785,6 +1190,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
             attempts: combined.attempts,
             successes: combined.attempts.saturating_sub(combined.failures),
             failures: combined.failures,
+            retries: combined.retries,
             failure_rate: combined.failures as f64 / combined.attempts.max(1) as f64,
             logical_bytes: combined.logical_bytes,
             logical_mb_per_second: combined.logical_bytes as f64 / 1_000_000.0 / elapsed,
@@ -809,4 +1215,78 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
         print!("{encoded}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_result(success: bool, status: u16) -> RequestResult {
+        RequestResult {
+            success,
+            status,
+            transferred: 0,
+            retries: 0,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn retries_only_transient_s3_outcomes() {
+        for status in [0, 200, 206, 409, 429, 500, 502, 503, 504] {
+            assert!(retryable_s3_result(&request_result(false, status)));
+        }
+        for status in [400, 403, 404, 412, 501] {
+            assert!(!retryable_s3_result(&request_result(false, status)));
+        }
+        assert!(!retryable_s3_result(&request_result(true, 200)));
+    }
+
+    #[test]
+    fn generated_chunks_are_deterministic_unique_and_nonrepeating() {
+        let first = generated_chunk(7, 0, STREAM_CHUNK_BYTES, PayloadProfile::Incompressible);
+        assert_eq!(
+            first,
+            generated_chunk(7, 0, STREAM_CHUNK_BYTES, PayloadProfile::Incompressible)
+        );
+        assert_ne!(
+            first,
+            generated_chunk(7, 1, STREAM_CHUNK_BYTES, PayloadProfile::Incompressible)
+        );
+        assert_ne!(
+            first,
+            generated_chunk(8, 0, STREAM_CHUNK_BYTES, PayloadProfile::Incompressible)
+        );
+        assert_ne!(&first[..64 * 1024], &first[64 * 1024..128 * 1024]);
+    }
+
+    #[test]
+    fn compressible_profiles_remain_unique() {
+        for profile in [
+            PayloadProfile::Compressible2x,
+            PayloadProfile::Compressible4x,
+            PayloadProfile::Compressible10x,
+            PayloadProfile::Compressible20x,
+        ] {
+            let first = generated_chunk(7, 0, STREAM_CHUNK_BYTES, profile);
+            assert_ne!(first, generated_chunk(7, 1, STREAM_CHUNK_BYTES, profile));
+            assert_ne!(first, generated_chunk(8, 0, STREAM_CHUNK_BYTES, profile));
+            assert!(first.iter().filter(|byte| **byte == 0).count() > first.len() / 3);
+        }
+    }
+
+    #[test]
+    fn high_compression_profiles_have_expected_sparse_shape() {
+        for (profile, minimum_zero_fraction) in [
+            (PayloadProfile::Compressible10x, 0.85),
+            (PayloadProfile::Compressible20x, 0.92),
+        ] {
+            let chunk = generated_chunk(7, 0, STREAM_CHUNK_BYTES, profile);
+            let other = generated_chunk(7, 1, STREAM_CHUNK_BYTES, profile);
+            assert_ne!(chunk, other);
+            let zero_fraction =
+                chunk.iter().filter(|byte| **byte == 0).count() as f64 / chunk.len() as f64;
+            assert!(zero_fraction >= minimum_zero_fraction);
+        }
+    }
 }

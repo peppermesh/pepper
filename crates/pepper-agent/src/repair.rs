@@ -22,7 +22,18 @@ pub(super) fn record_repair(state: &AppState, mut record: RepairDiagnosticRecord
 
 pub(super) fn spawn_repair_loop(state: AppState) {
     tokio::spawn(async move {
-        let mut interval = time::interval(state.repair_interval);
+        let digest = blake3::hash(state.status.node_id.as_bytes());
+        let jitter_slots = u64::from_le_bytes(
+            digest.as_bytes()[..8]
+                .try_into()
+                .expect("BLAKE3 digest contains eight bytes"),
+        );
+        let interval_millis = state.repair_interval.as_millis().max(1) as u64;
+        let first_tick = time::Instant::now()
+            + state.repair_interval
+            + Duration::from_millis(jitter_slots % interval_millis);
+        let mut interval = time::interval_at(first_tick, state.repair_interval);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if let Err(error) = run_repair_once(&state).await {
@@ -141,6 +152,29 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
         }
     }
 
+    // Erasure shards are independently sufficient at one healthy placement;
+    // replicating every shard at the namespace replication factor defeats the
+    // 6+3 layout and creates a repair storm. The manifest itself remains
+    // replicated according to the enclosing pin policy.
+    let erasure_manifests = pinned_replication
+        .keys()
+        .filter(|cid| cid.codec == CODEC_ERASURE_MANIFEST)
+        .cloned()
+        .collect::<Vec<_>>();
+    for cid in erasure_manifests {
+        let block = get_block_resolved(state, &cid).await?;
+        let manifest: ErasureManifest = serde_json::from_slice(&block.payload)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        validate_erasure_resource_limits(state, &manifest)?;
+        for shard in manifest
+            .stripes
+            .iter()
+            .flat_map(|stripe| stripe.shards.iter())
+        {
+            pinned_replication.insert(shard.cid.clone(), 1);
+        }
+    }
+
     for stat in state.block_store.list_blocks()? {
         let desired_replication = pinned_replication.get(&stat.cid).copied().unwrap_or(0);
         if desired_replication == 0 {
@@ -163,6 +197,36 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
                 .await;
         }
 
+        // A locally present one-copy shard is already healthy. Avoid a DHT
+        // lookup for every shard on every cycle.
+        if desired_replication == 1 && stat.codec != CODEC_ERASURE_MANIFEST {
+            continue;
+        }
+
+        let cached_providers = state.network.local_provider_records(&stat.cid)?;
+        let mut healthy_nodes = healthy_provider_node_ids(state, &stat.cid, cached_providers).await;
+        if healthy_nodes.len() < desired_replication {
+            let providers = match time::timeout(
+                Duration::from_secs(1),
+                state.network.find_providers(&stat.cid),
+            )
+            .await
+            {
+                Ok(Ok(providers)) => providers,
+                Ok(Err(error)) => {
+                    warn!(%error, cid = %stat.cid, "provider lookup failed during repair");
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!(cid = %stat.cid, "provider lookup timed out during repair");
+                    Vec::new()
+                }
+            };
+            healthy_nodes.extend(healthy_provider_node_ids(state, &stat.cid, providers).await);
+            healthy_nodes.sort();
+            healthy_nodes.dedup();
+        }
+        let repair_coordinator = healthy_nodes.first();
         if stat.codec == CODEC_ERASURE_MANIFEST {
             match state.block_store.get(&stat.cid) {
                 Ok(block) => match serde_json::from_slice::<ErasureManifest>(&block.payload) {
@@ -182,33 +246,18 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
                 }
             }
         }
-
-        let providers = match time::timeout(
-            Duration::from_secs(1),
-            state.network.find_providers(&stat.cid),
-        )
-        .await
-        {
-            Ok(Ok(providers)) => providers,
-            Ok(Err(error)) => {
-                warn!(%error, cid = %stat.cid, "provider lookup failed during repair");
-                state.network.local_provider_records(&stat.cid)?
-            }
-            Err(_) => {
-                warn!(cid = %stat.cid, "provider lookup timed out during repair");
-                state.network.local_provider_records(&stat.cid)?
-            }
-        };
-        let mut healthy_provider_node_ids =
-            healthy_provider_node_ids(state, &stat.cid, providers).await;
-        if healthy_provider_node_ids.len() >= desired_replication {
+        if healthy_nodes.len() >= desired_replication {
+            continue;
+        }
+        if repair_coordinator != Some(&state.status.node_id) {
             continue;
         }
 
-        let block = state.block_store.get(&stat.cid)?;
+        let encoded = state.block_store.get_encoded(&stat.cid)?;
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
         let selected = select_replicas(&stat.cid, &candidates, candidates.len());
         for node in selected {
-            if node.is_local || healthy_provider_node_ids.contains(&node.node_id) {
+            if node.is_local || healthy_nodes.contains(&node.node_id) {
                 continue;
             }
             let Some(address) = node
@@ -220,9 +269,13 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
             };
             match time::timeout(
                 Duration::from_secs(1),
-                state
-                    .network
-                    .block_put_replica(address, stat.codec, block.payload.clone()),
+                state.network.block_put_replica_stream(
+                    address,
+                    stat.codec,
+                    &stat.cid,
+                    stat.size,
+                    encoded_payload.clone(),
+                ),
             )
             .await
             {
@@ -231,11 +284,11 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
                     &node.node_id,
                     &stat.cid,
                     stat.codec,
-                    block.size,
+                    stat.size,
                     &ack,
                 ) {
                     Ok(record) => {
-                        healthy_provider_node_ids.push(node.node_id.clone());
+                        healthy_nodes.push(node.node_id.clone());
                         state.network.announce_provider_to_peers(&record).await;
                         record_repair(
                             state,
@@ -261,9 +314,9 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
                 }
                 Err(_) => warn!(node_id = %node.node_id, "repair replica write timed out"),
             }
-            healthy_provider_node_ids.sort();
-            healthy_provider_node_ids.dedup();
-            if healthy_provider_node_ids.len() >= desired_replication {
+            healthy_nodes.sort();
+            healthy_nodes.dedup();
+            if healthy_nodes.len() >= desired_replication {
                 break;
             }
         }
@@ -277,9 +330,21 @@ pub(super) async fn repair_erasure_manifest(
     manifest: &ErasureManifest,
 ) -> Result<(), ApiError> {
     validate_erasure_resource_limits(state, manifest)?;
+    for stripe in &manifest.stripes {
+        repair_erasure_stripe(state, candidates, manifest, stripe).await?;
+    }
+    Ok(())
+}
+
+async fn repair_erasure_stripe(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    manifest: &ErasureManifest,
+    stripe: &ErasureStripe,
+) -> Result<(), ApiError> {
     let mut missing = Vec::new();
     let mut healthy_by_index = HashMap::new();
-    for shard in &manifest.shards {
+    for shard in &stripe.shards {
         let healthy = healthy_providers_for_cid(state, &shard.cid).await;
         if healthy.is_empty() {
             missing.push(shard.index);
@@ -288,13 +353,17 @@ pub(super) async fn repair_erasure_manifest(
     }
 
     if !missing.is_empty() {
-        let mut reconstructed = reconstruct_erasure_shards(state, manifest).await?;
+        let repair_bytes = usize::try_from(stripe.shard_size)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(manifest.data_shards as usize + missing.len());
+        throttle_erasure_repair(state, repair_bytes).await;
+        let mut reconstructed = reconstruct_erasure_shards(state, manifest, stripe).await?;
         for index in missing {
             let shard_payload = reconstructed
                 .get_mut(index as usize)
                 .and_then(Option::take)
                 .ok_or_else(|| ApiError::internal("erasure repair missing reconstructed shard"))?;
-            let shard_cid = manifest
+            let shard_cid = stripe
                 .shards
                 .iter()
                 .find(|shard| shard.index == index)
@@ -305,9 +374,8 @@ pub(super) async fn repair_erasure_manifest(
                 .acquire()
                 .await
                 .map_err(|error| ApiError::internal(error.to_string()))?;
-            throttle_erasure_repair(state, shard_payload.len()).await;
             let verified_bytes = shard_payload.len() as u64;
-            let (destination, _) = store_erasure_shard(
+            let (destination, _, _) = store_erasure_shard(
                 state,
                 candidates,
                 shard_cid.clone(),
@@ -333,7 +401,7 @@ pub(super) async fn repair_erasure_manifest(
             ERASURE_SHARD_REPAIRS.fetch_add(1, Ordering::Relaxed);
         }
         healthy_by_index.clear();
-        for shard in &manifest.shards {
+        for shard in &stripe.shards {
             healthy_by_index.insert(
                 shard.index,
                 healthy_providers_for_cid(state, &shard.cid).await,
@@ -341,18 +409,18 @@ pub(super) async fn repair_erasure_manifest(
         }
     }
 
-    rebalance_erasure_manifest(state, candidates, manifest, &healthy_by_index).await
+    rebalance_erasure_stripe(state, candidates, stripe, &healthy_by_index).await
 }
 
-pub(super) async fn rebalance_erasure_manifest(
+async fn rebalance_erasure_stripe(
     state: &AppState,
     candidates: &[PlacementNode],
-    manifest: &ErasureManifest,
+    stripe: &ErasureStripe,
     healthy_by_index: &HashMap<u16, Vec<ProviderRecord>>,
 ) -> Result<(), ApiError> {
     let mut used_nodes = HashSet::new();
     let mut used_constraint_values = HashSet::new();
-    let mut shards = manifest.shards.clone();
+    let mut shards = stripe.shards.clone();
     shards.sort_by_key(|shard| shard.index);
 
     for shard in shards {
@@ -428,15 +496,24 @@ pub(super) async fn rebalance_erasure_manifest(
 }
 
 pub(super) async fn throttle_erasure_repair(state: &AppState, bytes: usize) {
-    if let Some(bytes_per_second) = state.erasure_repair_bytes_per_second {
-        let millis = ((bytes as u128) * 1000).div_ceil(bytes_per_second as u128) as u64;
-        if millis > 0 {
-            time::sleep(Duration::from_millis(millis)).await;
-        }
+    let millis =
+        ((bytes as u128) * 1000).div_ceil(state.erasure_repair_bytes_per_second as u128) as u64;
+    if millis > 0 {
+        metrics::ERASURE_REPAIR_THROTTLE_MICROS
+            .fetch_add(millis.saturating_mul(1_000), Ordering::Relaxed);
+        time::sleep(Duration::from_millis(millis)).await;
     }
 }
 
 pub(super) async fn healthy_providers_for_cid(state: &AppState, cid: &Cid) -> Vec<ProviderRecord> {
+    let cached = state
+        .network
+        .local_provider_records(cid)
+        .unwrap_or_default();
+    let mut healthy = verified_healthy_providers(state, cid, cached).await;
+    if !healthy.is_empty() {
+        return healthy;
+    }
     let providers =
         match time::timeout(Duration::from_secs(1), state.network.find_providers(cid)).await {
             Ok(Ok(providers)) => providers,
@@ -455,6 +532,15 @@ pub(super) async fn healthy_providers_for_cid(state: &AppState, cid: &Cid) -> Ve
                     .unwrap_or_default()
             }
         };
+    healthy = verified_healthy_providers(state, cid, providers).await;
+    healthy
+}
+
+async fn verified_healthy_providers(
+    state: &AppState,
+    cid: &Cid,
+    providers: Vec<ProviderRecord>,
+) -> Vec<ProviderRecord> {
     let mut healthy = Vec::new();
     let mut seen = HashSet::new();
     if state.block_store.get(cid).is_ok() {
@@ -504,15 +590,17 @@ pub(super) async fn has_healthy_provider(state: &AppState, cid: &Cid) -> bool {
 pub(super) async fn reconstruct_erasure_shards(
     state: &AppState,
     manifest: &ErasureManifest,
+    stripe: &ErasureStripe,
 ) -> Result<Vec<Option<Vec<u8>>>, ApiError> {
+    let _read_slot = acquire_erasure_stripe_read_slot(state).await?;
     let data_shards = manifest.data_shards as usize;
     let parity_shards = manifest.parity_shards as usize;
     let total_shards = data_shards + parity_shards;
-    let shard_size = manifest.shard_size as usize;
+    let shard_size = stripe.shard_size as usize;
     let mut shards = vec![None::<Vec<u8>>; total_shards];
     let mut available = 0usize;
-    for shard in &manifest.shards {
-        match get_block_resolved(state, &shard.cid).await {
+    for shard in &stripe.shards {
+        match get_block_resolved_transient(state, &shard.cid).await {
             Ok(block) if block.payload.len() == shard_size => {
                 let slot = &mut shards[shard.index as usize];
                 if slot.is_none() {

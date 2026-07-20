@@ -24,6 +24,14 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .await
             .map_err(|error| PublicationError::Storage(error.message))?;
         let payload = block.payload;
+        let encoded = self
+            .0
+            .block_store
+            .get_encoded(cid)
+            .or_else(|_| self.0.block_store.encode(cid.codec, &payload))
+            .map_err(|error| PublicationError::Storage(error.to_string()))?;
+        let encoded_size = encoded.logical_size_bytes();
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
 
         // Object ingestion already persists signed provider records for every
         // acknowledged replica. Confirm those replicas with a cheap authenticated
@@ -39,7 +47,8 @@ impl DurabilityBackend for AgentDurabilityBackend {
         let provider_records = if replication_factor > 1 {
             self.0
                 .network
-                .local_provider_records(cid)
+                .find_providers(cid)
+                .await
                 .map_err(|error| PublicationError::Protection(error.to_string()))?
         } else {
             Vec::new()
@@ -115,7 +124,7 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .map(|peer| {
                 let state = self.0.clone();
                 let cid = cid.clone();
-                let payload = payload.clone();
+                let encoded_payload = encoded_payload.clone();
                 async move {
                     let transfer = async {
                         for address in &peer.addresses {
@@ -124,7 +133,13 @@ impl DurabilityBackend for AgentDurabilityBackend {
                             };
                             let Ok(ack) = state
                                 .network
-                                .block_put_replica(address, cid.codec, payload.clone())
+                                .block_put_replica_stream(
+                                    address,
+                                    cid.codec,
+                                    &cid,
+                                    encoded_size,
+                                    encoded_payload.clone(),
+                                )
                                 .await
                             else {
                                 continue;
@@ -134,7 +149,7 @@ impl DurabilityBackend for AgentDurabilityBackend {
                                 &peer.node_id,
                                 &cid,
                                 cid.codec,
-                                payload.len() as u64,
+                                encoded_size,
                                 &ack,
                             ) {
                                 return Some(provider);
@@ -302,6 +317,87 @@ impl ProtectionBackend for AgentProtectionBackend {
             .replace(&pins)
             .map_err(|error| PublicationError::Protection(error.to_string()))?;
         Ok(())
+    }
+
+    async fn protect_many(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<(), PublicationError> {
+        let active_pin_ids = self
+            .metadata
+            .pins()
+            .all()
+            .map_err(|error| PublicationError::Protection(error.to_string()))?
+            .into_iter()
+            .filter(|pin| pin.owner == self.node_id && pin.status == "active")
+            .map(|pin| pin.pin_id)
+            .collect::<HashSet<_>>();
+        let created_at_unix_seconds = unix_seconds();
+        let mut pins = Vec::with_capacity(cids.len());
+        for cid in cids {
+            let prefix = self.pin_prefix(namespace_id, cid, reason);
+            let pin_id = format!(
+                "{}-{}-{}",
+                prefix,
+                expires_at_unix_seconds
+                    .map_or_else(|| "permanent".to_string(), |value| value.to_string()),
+                self.node_id
+            );
+            if active_pin_ids.contains(&pin_id) {
+                continue;
+            }
+            let mut pin = PinRecord {
+                pin_id,
+                root_cid: cid.clone(),
+                owner: self.node_id.clone(),
+                replication_factor: self.replication_factor,
+                created_at_unix_seconds,
+                expires_at_unix_seconds,
+                status: "active".to_string(),
+                signature_hex: String::new(),
+            };
+            self.sign(&mut pin)?;
+            pins.push(pin);
+        }
+        self.metadata
+            .pins()
+            .replace(&pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
+    }
+
+    async fn release_many(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+    ) -> Result<(), PublicationError> {
+        let prefixes = cids
+            .iter()
+            .map(|cid| format!("{}-", self.pin_prefix(namespace_id, cid, reason)))
+            .collect::<HashSet<_>>();
+        let mut pins = self
+            .metadata
+            .pins()
+            .all()
+            .map_err(|error| PublicationError::Protection(error.to_string()))?
+            .into_iter()
+            .filter(|pin| {
+                pin.owner == self.node_id
+                    && pin.status == "active"
+                    && prefixes.iter().any(|prefix| pin.pin_id.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        for pin in &mut pins {
+            pin.status = "deleted".to_string();
+            self.sign(pin)?;
+        }
+        self.metadata
+            .pins()
+            .replace(&pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
     }
 }
 

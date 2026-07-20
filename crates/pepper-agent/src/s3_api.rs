@@ -26,7 +26,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 static S3_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 const S3_MULTIPART_CONTROL_KEY: &[u8] = b"\xffs3/multipart-control";
-const S3_BUCKET_NAME_KEY: &[u8] = b"\xffs3/bucket-name";
 const S3_BUCKET_DELETED_KEY: &[u8] = b"\xffs3/deleted";
 const S3_BUCKET_TAGGING_KEY: &[u8] = b"\xffs3/tagging";
 const S3_BUCKET_CORS_KEY: &[u8] = b"\xffs3/cors";
@@ -38,9 +37,75 @@ const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 const S3_MAX_MULTIPART_PARTS: u32 = 10_000;
 const S3_MULTIPART_CLEANUP_BATCH: usize = 9_000;
 const S3_MAX_DISCOVERED_BUCKETS: usize = 10_000;
+const S3_LIST_CACHE_MAX_ENTRIES: usize = 128;
+const S3_LIST_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const S3_BUCKET_CATALOG_ALIAS: &str = "__pepper_s3_bucket_catalog_v1";
 const S3_BUCKET_CATALOG_CREATOR: &str = "pepper.s3.bucket.catalog.v1";
 const S3_BUCKET_CATALOG_KEY_PREFIX: &[u8] = b"bucket/";
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct S3ListCacheKey {
+    bucket: String,
+    root: String,
+    prefix: Vec<u8>,
+    delimiter: Option<Vec<u8>>,
+    start_after: Option<String>,
+    continuation_token: Option<String>,
+    max_keys: usize,
+    encoding_url: bool,
+    fetch_owner: bool,
+}
+
+#[derive(Default)]
+struct S3ListCacheState {
+    entries: HashMap<S3ListCacheKey, Bytes>,
+    order: VecDeque<S3ListCacheKey>,
+    bytes: usize,
+    flights: HashMap<S3ListCacheKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+}
+
+#[derive(Default)]
+pub(super) struct S3ListCache {
+    state: tokio::sync::Mutex<S3ListCacheState>,
+}
+
+impl S3ListCache {
+    async fn get(&self, key: &S3ListCacheKey) -> Option<Bytes> {
+        self.state.lock().await.entries.get(key).cloned()
+    }
+
+    async fn flight(&self, key: &S3ListCacheKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut state = self.state.lock().await;
+        if let Some(flight) = state.flights.get(key).and_then(std::sync::Weak::upgrade) {
+            return flight;
+        }
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        state.flights.insert(key.clone(), Arc::downgrade(&flight));
+        flight
+    }
+
+    async fn insert(&self, key: S3ListCacheKey, body: Bytes) {
+        let mut state = self.state.lock().await;
+        if let Some(previous) = state.entries.remove(&key) {
+            state.bytes = state.bytes.saturating_sub(previous.len());
+            state.order.retain(|existing| existing != &key);
+        }
+        state.bytes = state.bytes.saturating_add(body.len());
+        state.order.push_back(key.clone());
+        state.entries.insert(key.clone(), body);
+        state.flights.remove(&key);
+        while state.entries.len() > S3_LIST_CACHE_MAX_ENTRIES
+            || state.bytes > S3_LIST_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = state.entries.remove(&oldest) {
+                state.bytes = state.bytes.saturating_sub(removed.len());
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct S3RuntimeConfig {
@@ -83,10 +148,11 @@ pub(super) struct S3Error {
     message: String,
     resource: String,
     request_id: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl S3Error {
-    fn new(
+    pub(super) fn new(
         status: StatusCode,
         code: &'static str,
         message: impl Into<String>,
@@ -98,7 +164,13 @@ impl S3Error {
             message: message.into(),
             resource: resource.into(),
             request_id: request_id(),
+            retry_after_seconds: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds.max(1));
+        self
     }
 
     fn invalid(message: impl Into<String>, resource: impl Into<String>) -> Self {
@@ -163,6 +235,12 @@ impl IntoResponse for S3Error {
         );
         if let Ok(value) = HeaderValue::from_str(&self.request_id) {
             response.headers_mut().insert("x-amz-request-id", value);
+        }
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            let seconds = self.retry_after_seconds.unwrap_or(1).to_string();
+            if let Ok(value) = HeaderValue::from_str(&seconds) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
         }
         response
     }
@@ -233,7 +311,9 @@ struct S3MultipartPart {
     content_cid: Cid,
     size: u64,
     etag: String,
+    durability_status: String,
     uploaded_at_unix_seconds: i64,
+    durability: Vec<DurabilityReceipt>,
 }
 
 struct StoredMultipartUpload {
@@ -361,9 +441,7 @@ pub(super) fn spawn_s3_lifecycle_reconciler(state: AppState) {
 
 async fn reconcile_s3_lifecycle(state: &AppState) -> Result<(), S3Error> {
     reconcile_completed_multipart_uploads(state).await?;
-    let aliases = local_s3_bucket_aliases(state)
-        .await
-        .map_err(|error| map_api_error(error, "/"))?;
+    let aliases = catalog_s3_buckets(state, "/").await?;
     for (bucket, namespace_id) in aliases {
         let Some(body) = get_bucket_internal_raw(state, &namespace_id, S3_BUCKET_LIFECYCLE_KEY)
             .await
@@ -418,9 +496,7 @@ async fn reconcile_s3_lifecycle(state: &AppState) -> Result<(), S3Error> {
 }
 
 async fn reconcile_completed_multipart_uploads(state: &AppState) -> Result<(), S3Error> {
-    let aliases = local_s3_bucket_aliases(state)
-        .await
-        .map_err(|error| map_api_error(error, "/"))?;
+    let aliases = catalog_s3_buckets(state, "/").await?;
     for (bucket, namespace_id) in aliases {
         let resource = format!("/{bucket}");
         let Some(control_namespace_id) =
@@ -752,9 +828,9 @@ pub(super) async fn s3_list_buckets(
     verify_empty_payload(&auth, uri.path())?;
     let manager = namespace_manager(&state).map_err(|error| map_api_error(error, uri.path()))?;
     let mut buckets = Vec::new();
-    for (alias, namespace_id) in distributed_s3_bucket_aliases(&state, uri.path()).await? {
+    for (alias, namespace_id) in catalog_s3_buckets(&state, uri.path()).await? {
         let namespace = manager
-            .linearizable_namespace_state(&namespace_id)
+            .linearizable_namespace_head(&namespace_id)
             .await
             .map_err(|error| {
                 S3Error::new(
@@ -809,29 +885,12 @@ pub(super) async fn s3_create_bucket(
     let _create_guard = create_lock.lock().await;
 
     let catalog_namespace_id = ensure_s3_bucket_catalog(&state, uri.path()).await?;
-    let catalog_existing =
-        s3_catalog_lookup(&state, &catalog_namespace_id, &bucket, uri.path()).await?;
-    let catalog_had_entry = catalog_existing.is_some();
-    let existing = match catalog_existing {
-        Some(namespace_id) => Some(namespace_id),
-        None => legacy_resolve_s3_bucket_namespace(&state, &bucket, uri.path()).await?,
-    };
-    if let Some(namespace_id) = existing {
-        let namespace_id = if !catalog_had_entry {
-            claim_s3_catalog_entry(
-                &state,
-                &catalog_namespace_id,
-                &bucket,
-                &namespace_id,
-                uri.path(),
-            )
-            .await?
-        } else {
-            namespace_id
-        };
+    if let Some(namespace_id) =
+        s3_catalog_lookup(&state, &catalog_namespace_id, &bucket, uri.path()).await?
+    {
         let namespace = namespace_manager(&state)
             .map_err(|error| map_api_error(error, uri.path()))?
-            .linearizable_namespace_state(&namespace_id)
+            .linearizable_namespace_head(&namespace_id)
             .await
             .map_err(|error| {
                 S3Error::new(
@@ -847,8 +906,6 @@ pub(super) async fn s3_create_bucket(
                 .map_err(|error| map_api_error(error, uri.path()))?
         {
             clear_bucket_deleted(&state, &namespace_id, uri.path()).await?;
-            cache_alias(&state, &bucket, &namespace_id)
-                .map_err(|error| map_api_error(error, uri.path()))?;
             let mut response = StatusCode::OK.into_response();
             response.headers_mut().insert(
                 header::LOCATION,
@@ -879,7 +936,6 @@ pub(super) async fn s3_create_bucket(
     .await
     .map_err(|error| map_api_error(error, uri.path()))?
     .0;
-    put_bucket_name_marker(&state, &created.namespace_id, &bucket, uri.path()).await?;
     let winner = claim_s3_catalog_entry(
         &state,
         &catalog_namespace_id,
@@ -897,9 +953,6 @@ pub(super) async fn s3_create_bucket(
             uri.path(),
         ));
     }
-    cache_alias(&state, &bucket, &created.namespace_id)
-        .map_err(|error| map_api_error(error, uri.path()))?;
-
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -1072,9 +1125,11 @@ pub(super) async fn s3_post_form_upload(
             }
             item
         });
-        let receipt = put_object_stream_receipt(&state, Body::from_stream(stream))
-            .await
-            .map_err(|error| map_api_error(error, uri.path()))?;
+        let receipt =
+            put_policy_object_stream_receipts(&state, Body::from_stream(stream), None, false)
+                .await
+                .map_err(|error| map_api_error(error, uri.path()))?
+                .receipt;
         let size = byte_count.load(Ordering::Relaxed);
         if size < policy.min_content_length || size > policy.max_content_length {
             return Err(S3Error::new(
@@ -1112,6 +1167,7 @@ pub(super) async fn s3_post_form_upload(
             if_generation: None,
             if_cid: None,
             request_id: request_id(),
+            preverified_durability: vec![receipt.clone()],
         }),
     )
     .await
@@ -1710,6 +1766,50 @@ pub(super) async fn s3_put_object(
         return s3_copy_object(&state, &bucket, &key, &uri, &headers, &auth).await;
     }
     reject_unsupported_put_headers(&headers, uri.path())?;
+    // Bound complete object pipelines, not individual HTTP connections. Excess
+    // writers backpressure at the body stream instead of each retaining four
+    // multi-megabyte chunks while waiting for replica publication slots.
+    let admission_started = time::Instant::now();
+    let retry_after_seconds = s3_write_retry_after_seconds(&state);
+    let queue_permit = state.s3_write_queue_slots.try_acquire().map_err(|_| {
+        metrics::S3_WRITE_ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "the bounded S3 write admission queue is full",
+            uri.path(),
+        )
+        .with_retry_after(retry_after_seconds)
+    })?;
+    let _write_permit = time::timeout(state.s3_write_queue_timeout, state.s3_write_slots.acquire())
+        .await
+        .map_err(|_| {
+            metrics::S3_WRITE_ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SlowDown",
+                "the bounded S3 write admission queue is full",
+                uri.path(),
+            )
+            .with_retry_after(retry_after_seconds)
+        })?
+        .map_err(|_| {
+            S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "the S3 write admission queue is unavailable",
+                uri.path(),
+            )
+        })?;
+    drop(queue_permit);
+    let _service_sample = S3WriteServiceSample::new(&state);
+    metrics::S3_WRITE_ADMISSION_QUEUE_MICROS.fetch_add(
+        admission_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
     let namespace_id = bucket_namespace(&state, &bucket).await?;
 
     let current = current_bucket_descriptor(&state, &bucket, key.as_bytes()).await?;
@@ -1749,7 +1849,8 @@ pub(super) async fn s3_put_object(
         .unwrap_or("application/octet-stream")
         .to_string();
     let metadata = user_metadata(&headers, uri.path())?;
-    let (receipt, logical_size) = upload_s3_body(&state, body, &headers, &auth, uri.path()).await?;
+    let (receipt, logical_size, preverified_durability) =
+        upload_s3_body(&state, body, &headers, &auth, false, uri.path()).await?;
     let conditional = if_cid.is_some();
     let mut published = None;
     let mut last_conflict = None;
@@ -1766,6 +1867,7 @@ pub(super) async fn s3_put_object(
                 if_generation: None,
                 if_cid: if_cid.clone(),
                 request_id: request_id(),
+                preverified_durability: preverified_durability.clone(),
             }),
         )
         .await
@@ -1826,6 +1928,52 @@ pub(super) async fn s3_put_object(
     )?;
     add_s3_headers(&mut response, &auth.request_id, Some(&state));
     Ok(response)
+}
+
+struct S3WriteServiceSample {
+    started: time::Instant,
+    service_micros: Arc<AtomicU64>,
+}
+
+impl S3WriteServiceSample {
+    fn new(state: &AppState) -> Self {
+        Self {
+            started: time::Instant::now(),
+            service_micros: Arc::clone(&state.s3_write_service_micros),
+        }
+    }
+}
+
+impl Drop for S3WriteServiceSample {
+    fn drop(&mut self) {
+        let sample = self
+            .started
+            .elapsed()
+            .as_micros()
+            .clamp(1, u128::from(u64::MAX)) as u64;
+        let mut current = self.service_micros.load(Ordering::Relaxed);
+        loop {
+            let next = ((u128::from(current) * 7 + u128::from(sample)) / 8)
+                .min(u128::from(u64::MAX)) as u64;
+            match self.service_micros.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+fn s3_write_retry_after_seconds(state: &AppState) -> u64 {
+    state
+        .s3_write_service_micros
+        .load(Ordering::Relaxed)
+        .div_ceil(1_000_000)
+        .clamp(1, 30)
 }
 
 pub(super) async fn s3_post_object(
@@ -1957,14 +2105,17 @@ async fn s3_upload_part(
     }
     reject_unsupported_put_headers(&headers, uri.path())?;
 
-    let (receipt, size) = upload_s3_body(&state, body, &headers, &auth, uri.path()).await?;
+    let (receipt, size, preverified_durability) =
+        upload_s3_body(&state, body, &headers, &auth, true, uri.path()).await?;
     let part = S3MultipartPart {
         upload_id: stored_upload.upload.upload_id.clone(),
         part_number,
         content_cid: receipt.cid.clone(),
         size,
         etag: receipt.cid.to_string(),
+        durability_status: receipt.status,
         uploaded_at_unix_seconds: unix_seconds(),
+        durability: preverified_durability,
     };
     put_multipart_part(&state, &stored_upload, &part, uri.path()).await?;
     let mut response = StatusCode::OK.into_response();
@@ -2034,6 +2185,7 @@ async fn s3_copy_object(
             if_generation: None,
             if_cid: None,
             request_id: request_id(),
+            preverified_durability: Vec::new(),
         }),
     )
     .await
@@ -2077,21 +2229,41 @@ async fn s3_upload_part_copy(
     let requested_range = header_text(headers, "x-amz-copy-source-range")?
         .map(|value| parse_byte_range(value, source.logical_size, uri.path()))
         .transpose()?;
-    let (content_cid, size) = if let Some(range) = requested_range {
-        let bytes = object_bytes(state, &source_cid)
-            .await
-            .map_err(|error| map_api_error(error, uri.path()))?;
-        let start = usize::try_from(range.start)
-            .map_err(|_| S3Error::invalid("copy range start is too large", uri.path()))?;
-        let end = usize::try_from(range.end)
-            .map_err(|_| S3Error::invalid("copy range end is too large", uri.path()))?;
-        let receipt = put_object_stream_receipt(state, Body::from(bytes[start..=end].to_vec()))
-            .await
-            .map_err(|error| map_api_error(error, uri.path()))?;
-        (receipt.cid, range.len())
-    } else {
-        (source_cid, source.logical_size)
-    };
+    let (content_cid, size, durability_status, durability) =
+        if requested_range.is_none() && !state.erasure_enabled {
+            (
+                source_cid,
+                source.logical_size,
+                "durable".to_string(),
+                Vec::new(),
+            )
+        } else {
+            let range = requested_range.unwrap_or(S3ByteRange {
+                start: 0,
+                end: source.logical_size.saturating_sub(1),
+            });
+            let size = if source.logical_size == 0 {
+                0
+            } else {
+                range.len()
+            };
+            let body = if size == 0 {
+                Body::empty()
+            } else {
+                object_range_body(state.clone(), &source_cid, range)
+                    .await
+                    .map_err(|error| map_api_error(error, uri.path()))?
+            };
+            let receipts = put_policy_object_stream_receipts(state, body, Some(size), true)
+                .await
+                .map_err(|error| map_api_error(error, uri.path()))?;
+            (
+                receipts.receipt.cid,
+                size,
+                receipts.receipt.status,
+                receipts.blocks,
+            )
+        };
     let part = S3MultipartPart {
         upload_id: upload.upload.upload_id.clone(),
         part_number,
@@ -2099,6 +2271,8 @@ async fn s3_upload_part_copy(
         content_cid,
         size,
         uploaded_at_unix_seconds: unix_seconds(),
+        durability_status,
+        durability,
     };
     put_multipart_part(state, upload, &part, uri.path()).await?;
     let xml = format!(
@@ -2209,8 +2383,8 @@ async fn object_response(
     validate_object_route(&bucket, &key, &query, uri.path())?;
     reject_object_query(uri.query(), uri.path())?;
     verify_empty_payload(&auth, uri.path())?;
-    let (value, descriptor) = current_bucket_descriptor(&state, &bucket, key.as_bytes())
-        .await?
+    let (_, current) = current_bucket_descriptor_snapshot(&state, &bucket, key.as_bytes()).await?;
+    let (value, descriptor) = current
         .filter(|(_, descriptor)| !descriptor.tombstone)
         .ok_or_else(|| S3Error::no_key(&bucket, &key))?;
     let content_cid = descriptor
@@ -2283,11 +2457,10 @@ async fn object_response(
             uri.path(),
         )?;
     }
-    let timestamp = descriptor_timestamp(&state, &bucket, descriptor.creation_revision).await?;
     insert_header(
         &mut response,
         header::LAST_MODIFIED,
-        &http_timestamp(timestamp),
+        &http_timestamp(descriptor.committed_at_unix_seconds),
         uri.path(),
     )?;
     add_s3_headers(&mut response, &auth.request_id, Some(&state));
@@ -2349,12 +2522,68 @@ async fn object_range_body(
 ) -> Result<Body, ApiError> {
     let guard = Arc::new(state.operation_lock.clone().read_owned().await);
     if cid.codec == CODEC_ERASURE_MANIFEST {
-        let bytes = erasure_object_bytes(&state, cid).await?;
-        let start = usize::try_from(range.start)
-            .map_err(|_| ApiError::bad_request("object range start is too large"))?;
-        let end = usize::try_from(range.end)
-            .map_err(|_| ApiError::bad_request("object range end is too large"))?;
-        return Ok(Body::from(bytes[start..=end].to_vec()));
+        let manifest_block = get_block_resolved(&state, cid).await?;
+        let manifest: ErasureManifest =
+            serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
+        validate_erasure_resource_limits(&state, &manifest)?;
+        let range_end = range
+            .end
+            .checked_add(1)
+            .ok_or_else(|| ApiError::bad_request("object range end overflow"))?;
+        let selected = manifest
+            .stripes
+            .iter()
+            .filter_map(|stripe| {
+                let stripe_end = stripe.offset.checked_add(stripe.size)?;
+                let overlap_start = stripe.offset.max(range.start);
+                let overlap_end = stripe_end.min(range_end);
+                (overlap_start < overlap_end).then(|| {
+                    (
+                        stripe.clone(),
+                        (overlap_start - stripe.offset) as usize,
+                        (overlap_end - stripe.offset) as usize,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if let [(stripe, start, end)] = selected.as_slice() {
+            let bytes = erasure_stripe_range_bytes(
+                &state,
+                manifest.data_shards,
+                manifest.parity_shards,
+                stripe,
+                *start..*end,
+            )
+            .await?;
+            return Ok(Body::from(bytes));
+        }
+        let body_stream = stream::iter(selected.into_iter().map(move |(stripe, start, end)| {
+            let state = state.clone();
+            let manifest = manifest.clone();
+            let guard = guard.clone();
+            async move {
+                let _guard = guard;
+                let bytes = erasure_stripe_range_bytes(
+                    &state,
+                    manifest.data_shards,
+                    manifest.parity_shards,
+                    &stripe,
+                    start..end,
+                )
+                .await
+                .map_err(|error| {
+                    warn!(
+                        ?error,
+                        offset = stripe.offset,
+                        "erasure range stripe failed"
+                    );
+                    std::io::Error::other(error.message)
+                })?;
+                Ok::<Bytes, std::io::Error>(bytes)
+            }
+        }))
+        .buffered(4);
+        return Ok(Body::from_stream(body_stream));
     }
     if cid.codec != CODEC_OBJECT_MANIFEST {
         return Err(ApiError::bad_request("CID is not an object manifest"));
@@ -2369,15 +2598,15 @@ async fn object_range_body(
         let guard = guard.clone();
         async move {
             let _guard = guard;
-            let block = get_block_resolved(&state, &selected.chunk.cid)
-                .await
-                .map_err(|error| std::io::Error::other(error.message))?;
-            if block.payload.len() as u64 != selected.chunk.size {
-                return Err(std::io::Error::other("object chunk size mismatch"));
-            }
-            Ok::<Bytes, std::io::Error>(
-                Bytes::from(block.payload).slice(selected.start..selected.end),
+            let payload = get_block_range_resolved(
+                &state,
+                &selected.chunk.cid,
+                selected.start as u64,
+                selected.end as u64,
             )
+            .await
+            .map_err(|error| std::io::Error::other(error.message))?;
+            Ok::<Bytes, std::io::Error>(Bytes::from(payload))
         }
     }))
     .buffered(16);
@@ -2798,19 +3027,9 @@ pub(super) async fn s3_list_objects_v2(
             uri.path(),
         ));
     }
-    let namespace_id = bucket_namespace(&state, &bucket).await?;
-    let namespace = namespace_manager(&state)
-        .map_err(|error| map_api_error(error, uri.path()))?
-        .linearizable_namespace_state(&namespace_id)
-        .await
-        .map_err(|error| {
-            S3Error::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                error.to_string(),
-                uri.path(),
-            )
-        })?;
+    let resolved = bucket_namespace_state(&state, &bucket).await?;
+    let namespace_id = resolved.namespace_id;
+    let namespace = resolved.namespace;
     if max_keys == 0 {
         let encode_key = |value: &str| {
             if query.encoding_type.as_deref() == Some("url") {
@@ -2882,6 +3101,35 @@ pub(super) async fn s3_list_objects_v2(
         .transpose()
         .map_err(|_| S3Error::invalid("invalid continuation token prefix", uri.path()))?;
     let start = initial_after.as_deref().and_then(exclusive_start);
+
+    let list_cache_key = S3ListCacheKey {
+        bucket: bucket.clone(),
+        root: root.to_string(),
+        prefix: prefix.clone(),
+        delimiter: delimiter.clone(),
+        start_after: query.start_after.clone(),
+        continuation_token: query.continuation_token.clone(),
+        max_keys,
+        encoding_url: query.encoding_type.as_deref() == Some("url"),
+        fetch_owner: query.fetch_owner == Some(true),
+    };
+    if let Some(body) = state.s3_list_cache.get(&list_cache_key).await {
+        S3_LIST_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(xml_bytes_response(StatusCode::OK, body, &auth.request_id));
+    }
+    let flight = state.s3_list_cache.flight(&list_cache_key).await;
+    let list_guard = match flight.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            S3_LIST_CACHE_COALESCED.fetch_add(1, Ordering::Relaxed);
+            flight.lock_owned().await
+        }
+    };
+    if let Some(body) = state.s3_list_cache.get(&list_cache_key).await {
+        S3_LIST_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(xml_bytes_response(StatusCode::OK, body, &auth.request_id));
+    }
+    S3_LIST_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
     let mut cursor = None;
     let mut contents = Vec::new();
@@ -3013,15 +3261,10 @@ pub(super) async fn s3_list_objects_v2(
     }
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     for (key, _descriptor_cid, descriptor) in contents {
-        let timestamp = namespace
-            .history
-            .get(&descriptor.creation_revision)
-            .map(|record| iso_timestamp(record.committed_at_unix_seconds))
-            .unwrap_or_else(|| iso_timestamp(namespace.descriptor.created_at_unix_seconds));
         xml.push_str("<Contents><Key>");
         xml.push_str(&encode_key(&key));
         xml.push_str("</Key><LastModified>");
-        xml.push_str(&timestamp);
+        xml.push_str(&iso_timestamp(descriptor.committed_at_unix_seconds));
         xml.push_str("</LastModified><ETag>");
         xml.push_str(&xml_escape(&quoted_etag(&descriptor_etag(&descriptor))));
         xml.push_str("</ETag><Size>");
@@ -3043,7 +3286,13 @@ pub(super) async fn s3_list_objects_v2(
         xml.push_str("</NextContinuationToken>");
     }
     xml.push_str("</ListBucketResult>");
-    Ok(xml_response(StatusCode::OK, xml, &auth.request_id))
+    let body = Bytes::from(xml);
+    state
+        .s3_list_cache
+        .insert(list_cache_key, body.clone())
+        .await;
+    drop(list_guard);
+    Ok(xml_bytes_response(StatusCode::OK, body, &auth.request_id))
 }
 
 async fn complete_multipart_upload(
@@ -3132,54 +3381,120 @@ async fn complete_multipart_upload(
         selected.push(part.clone());
     }
     validate_multipart_part_sizes(&selected, resource)?;
+    if selected
+        .iter()
+        .any(|part| part.durability_status != "durable")
+    {
+        return Err(S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "one or more multipart parts have not reached their storage durability policy",
+            resource,
+        ));
+    }
 
     let mut chunks = Vec::new();
+    let mut stripes = Vec::new();
+    let mut erasure_layout = None::<(u16, u16, u64)>;
+    let mut replicated_layout = false;
     let mut total = 0u64;
     let mut chunk_size = 1u64;
     for part in &selected {
         let block = get_block_resolved(state, &part.content_cid)
             .await
             .map_err(|error| map_api_error(error, resource))?;
-        if block.codec != CODEC_OBJECT_MANIFEST {
-            return Err(S3Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                "multipart part is not an object manifest",
-                resource,
-            ));
-        }
-        let manifest: ObjectManifest = serde_json::from_slice(&block.payload).map_err(|error| {
-            S3Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                error.to_string(),
-                resource,
-            )
-        })?;
-        validate_object_resource_limits(state, &manifest)
-            .map_err(|error| map_api_error(error, resource))?;
-        if manifest.size != part.size {
-            return Err(S3Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                "multipart part size does not match its object manifest",
-                resource,
-            ));
-        }
-        chunk_size = chunk_size.max(manifest.chunk_size);
-        for chunk in manifest.chunks {
-            chunks.push(ObjectChunk {
-                offset: total.checked_add(chunk.offset).ok_or_else(|| {
-                    S3Error::new(
-                        StatusCode::BAD_REQUEST,
-                        "EntityTooLarge",
-                        "completed object size overflow",
+        match block.codec {
+            CODEC_OBJECT_MANIFEST if erasure_layout.is_none() => {
+                replicated_layout = true;
+                let manifest: ObjectManifest =
+                    serde_json::from_slice(&block.payload).map_err(|error| {
+                        S3Error::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "InternalError",
+                            error.to_string(),
+                            resource,
+                        )
+                    })?;
+                validate_object_resource_limits(state, &manifest)
+                    .map_err(|error| map_api_error(error, resource))?;
+                if manifest.size != part.size {
+                    return Err(S3Error::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "multipart part size does not match its object manifest",
                         resource,
-                    )
-                })?,
-                size: chunk.size,
-                cid: chunk.cid,
-            });
+                    ));
+                }
+                chunk_size = chunk_size.max(manifest.chunk_size);
+                for chunk in manifest.chunks {
+                    chunks.push(ObjectChunk {
+                        offset: total.checked_add(chunk.offset).ok_or_else(|| {
+                            S3Error::new(
+                                StatusCode::BAD_REQUEST,
+                                "EntityTooLarge",
+                                "completed object size overflow",
+                                resource,
+                            )
+                        })?,
+                        size: chunk.size,
+                        cid: chunk.cid,
+                    });
+                }
+            }
+            CODEC_ERASURE_MANIFEST if !replicated_layout => {
+                let manifest: ErasureManifest =
+                    serde_json::from_slice(&block.payload).map_err(|error| {
+                        S3Error::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "InternalError",
+                            error.to_string(),
+                            resource,
+                        )
+                    })?;
+                validate_erasure_resource_limits(state, &manifest)
+                    .map_err(|error| map_api_error(error, resource))?;
+                if manifest.size != part.size {
+                    return Err(S3Error::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "multipart part size does not match its erasure manifest",
+                        resource,
+                    ));
+                }
+                let layout = (
+                    manifest.data_shards,
+                    manifest.parity_shards,
+                    manifest.stripe_size,
+                );
+                if erasure_layout.is_some_and(|existing| existing != layout) {
+                    return Err(S3Error::new(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "multipart parts use different erasure layouts",
+                        resource,
+                    ));
+                }
+                erasure_layout = Some(layout);
+                for mut stripe in manifest.stripes {
+                    stripe.offset = total.checked_add(stripe.offset).ok_or_else(|| {
+                        S3Error::new(
+                            StatusCode::BAD_REQUEST,
+                            "EntityTooLarge",
+                            "completed object size overflow",
+                            resource,
+                        )
+                    })?;
+                    stripes.push(stripe);
+                }
+            }
+            _ => {
+                return Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    "multipart parts use incompatible storage layouts",
+                    resource,
+                ));
+            }
         }
         total = total.checked_add(part.size).ok_or_else(|| {
             S3Error::new(
@@ -3192,27 +3507,59 @@ async fn complete_multipart_upload(
         enforce_size_limit(state.max_object_bytes, total, "multipart object")
             .map_err(|error| map_api_error(error, resource))?;
     }
-    let manifest = ObjectManifest::new(total, chunk_size, chunks);
-    validate_object_resource_limits(state, &manifest)
-        .map_err(|error| map_api_error(error, resource))?;
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
-        S3Error::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalError",
-            error.to_string(),
-            resource,
+    let (manifest_codec, manifest_bytes) = if let Some((data, parity, stripe_size)) = erasure_layout
+    {
+        let manifest = ErasureManifest::new(total, data, parity, stripe_size, stripes);
+        validate_erasure_resource_limits(state, &manifest)
+            .map_err(|error| map_api_error(error, resource))?;
+        (
+            CODEC_ERASURE_MANIFEST,
+            serde_json::to_vec(&manifest).map_err(|error| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    error.to_string(),
+                    resource,
+                )
+            })?,
         )
-    })?;
-    let receipt = put_replicated_block(state, CODEC_OBJECT_MANIFEST, manifest_bytes)
+    } else {
+        let manifest = ObjectManifest::new(total, chunk_size, chunks);
+        validate_object_resource_limits(state, &manifest)
+            .map_err(|error| map_api_error(error, resource))?;
+        (
+            CODEC_OBJECT_MANIFEST,
+            serde_json::to_vec(&manifest).map_err(|error| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    error.to_string(),
+                    resource,
+                )
+            })?,
+        )
+    };
+    let receipt = put_replicated_block(state, manifest_codec, manifest_bytes)
         .await
         .map_err(|error| map_api_error(error, resource))?;
+    let mut completion_durability = selected
+        .iter()
+        .flat_map(|part| part.durability.iter().cloned())
+        .collect::<Vec<_>>();
+    completion_durability.push(receipt.clone());
     if stored_upload.upload.status == "open" {
         let mut completing = stored_upload.upload.clone();
         completing.status = "completing".to_string();
         completing.completion_hash = Some(completion_hash.clone());
         completing.final_content_cid = Some(receipt.cid.clone());
-        stored_upload =
-            replace_multipart_upload(state, &stored_upload, completing, resource).await?;
+        stored_upload = replace_multipart_upload(
+            state,
+            &stored_upload,
+            completing,
+            completion_durability.clone(),
+            resource,
+        )
+        .await?;
     } else if stored_upload.upload.final_content_cid.as_ref() != Some(&receipt.cid) {
         return Err(S3Error::new(
             StatusCode::CONFLICT,
@@ -3252,6 +3599,7 @@ async fn complete_multipart_upload(
                         format!("{upload_id}:{completion_hash}").as_bytes()
                     ))
                 ),
+                preverified_durability: completion_durability,
             }),
         )
         .await
@@ -3379,8 +3727,14 @@ async fn upload_s3_body(
     body: Body,
     headers: &HeaderMap,
     auth: &S3AuthContext,
+    force_erasure: bool,
     resource: &str,
-) -> Result<(DurabilityReceipt, u64), S3Error> {
+) -> Result<(DurabilityReceipt, u64, Vec<DurabilityReceipt>), S3Error> {
+    let content_length = headers
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let has_aws_chunked_encoding = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -3412,7 +3766,8 @@ async fn upload_s3_body(
         }
         item
     });
-    let receipt = put_object_stream_receipt(state, Body::from_stream(stream))
+    let body = Body::from_stream(stream);
+    let receipts = put_policy_object_stream_receipts(state, body, content_length, force_erasure)
         .await
         .map_err(|error| map_api_error(error, resource))?;
     if let PayloadHash::Sha256(expected) = &auth.payload_hash {
@@ -3487,7 +3842,7 @@ async fn upload_s3_body(
             ));
         }
     }
-    Ok((receipt, size))
+    Ok((receipts.receipt, size, receipts.blocks))
 }
 
 struct AwsChunkedDecoder {
@@ -3899,9 +4254,30 @@ async fn apply_multipart_transaction(
     staged_bytes: u64,
     resource: &str,
 ) -> Result<(), S3Error> {
+    apply_multipart_transaction_preverified(
+        state,
+        namespace_id,
+        mutations,
+        uploaded_roots,
+        Vec::new(),
+        staged_bytes,
+        resource,
+    )
+    .await
+}
+
+async fn apply_multipart_transaction_preverified(
+    state: &AppState,
+    namespace_id: &NamespaceId,
+    mutations: Vec<NamespaceMutation>,
+    uploaded_roots: Vec<Cid>,
+    preverified_durability: Vec<DurabilityReceipt>,
+    staged_bytes: u64,
+    resource: &str,
+) -> Result<(), S3Error> {
     let base = namespace_manager(state)
         .map_err(|error| map_api_error(error, resource))?
-        .linearizable_namespace_state(namespace_id)
+        .linearizable_namespace_head(namespace_id)
         .await
         .map_err(|error| {
             S3Error::new(
@@ -3930,6 +4306,7 @@ async fn apply_multipart_transaction(
         namespace_id.clone(),
         command,
         uploaded_roots,
+        preverified_durability,
         staged_bytes,
         false,
     )
@@ -3946,7 +4323,7 @@ async fn scan_namespace_prefix(
 ) -> Result<Vec<(Vec<u8>, MerkleValue)>, S3Error> {
     let namespace = namespace_manager(state)
         .map_err(|error| map_api_error(error, resource))?
-        .linearizable_namespace_state(namespace_id)
+        .linearizable_namespace_head(namespace_id)
         .await
         .map_err(|error| {
             S3Error::new(
@@ -4018,7 +4395,7 @@ async fn multipart_control_namespace(
     })?;
     let namespace = namespace_manager(state)
         .map_err(|error| map_api_error(error, resource))?
-        .linearizable_namespace_state(&namespace_id)
+        .linearizable_namespace_head(&namespace_id)
         .await
         .map_err(|error| {
             S3Error::new(
@@ -4037,59 +4414,6 @@ async fn multipart_control_namespace(
         ));
     }
     Ok(Some(namespace_id))
-}
-
-async fn put_bucket_name_marker(
-    state: &AppState,
-    bucket_namespace_id: &NamespaceId,
-    bucket: &str,
-    resource: &str,
-) -> Result<(), S3Error> {
-    if let Some(existing) = bucket_name_marker(state, bucket_namespace_id)
-        .await
-        .map_err(|error| map_api_error(error, resource))?
-    {
-        if existing == bucket {
-            return Ok(());
-        }
-        return Err(S3Error::new(
-            StatusCode::CONFLICT,
-            "BucketAlreadyExists",
-            "the bucket namespace already has a different S3 name",
-            resource,
-        ));
-    }
-    let receipt = put_replicated_block(state, CODEC_RAW, bucket.as_bytes().to_vec())
-        .await
-        .map_err(|error| map_api_error(error, resource))?;
-    let mutation = NamespaceMutation::Put {
-        key_hex: hex::encode(S3_BUCKET_NAME_KEY),
-        value_cid: receipt.cid.clone(),
-        value_kind: "s3_bucket_name".to_string(),
-        metadata: BTreeMap::new(),
-        precondition: KeyPrecondition::Absent,
-    };
-    if let Err(error) = apply_multipart_transaction(
-        state,
-        bucket_namespace_id,
-        vec![mutation],
-        vec![receipt.cid],
-        0,
-        resource,
-    )
-    .await
-    {
-        if bucket_name_marker(state, bucket_namespace_id)
-            .await
-            .map_err(|lookup| map_api_error(lookup, resource))?
-            .as_deref()
-            == Some(bucket)
-        {
-            return Ok(());
-        }
-        return Err(error);
-    }
-    Ok(())
 }
 
 async fn bucket_deleted(state: &AppState, namespace_id: &NamespaceId) -> Result<bool, ApiError> {
@@ -4268,7 +4592,7 @@ async fn ensure_bucket_empty(
 ) -> Result<(), S3Error> {
     let namespace = namespace_manager(state)
         .map_err(|error| map_api_error(error, resource))?
-        .linearizable_namespace_state(namespace_id)
+        .linearizable_namespace_head(namespace_id)
         .await
         .map_err(|error| {
             S3Error::new(
@@ -4367,7 +4691,7 @@ async fn ensure_multipart_control_namespace(
     for _ in 0..20 {
         if namespace_manager(state)
             .map_err(|error| map_api_error(error, resource))?
-            .linearizable_namespace_state(&created.namespace_id)
+            .linearizable_namespace_head(&created.namespace_id)
             .await
             .is_ok()
         {
@@ -4449,6 +4773,7 @@ async fn replace_multipart_upload(
     state: &AppState,
     stored: &StoredMultipartUpload,
     upload: S3MultipartUpload,
+    mut preverified_durability: Vec<DurabilityReceipt>,
     resource: &str,
 ) -> Result<StoredMultipartUpload, S3Error> {
     let bytes = serde_json::to_vec(&upload).map_err(|error| {
@@ -4462,6 +4787,7 @@ async fn replace_multipart_upload(
     let record = put_replicated_block(state, CODEC_RAW, bytes)
         .await
         .map_err(|error| map_api_error(error, resource))?;
+    preverified_durability.push(record.clone());
     let mut mutations = Vec::new();
     let mut uploaded_roots = vec![record.cid.clone()];
     if let Some(final_content_cid) = &upload.final_content_cid {
@@ -4491,11 +4817,12 @@ async fn replace_multipart_upload(
         metadata: BTreeMap::new(),
         precondition: value_precondition(&stored.value),
     });
-    apply_multipart_transaction(
+    apply_multipart_transaction_preverified(
         state,
         &stored.control_namespace_id,
         mutations,
         uploaded_roots,
+        preverified_durability,
         0,
         resource,
     )
@@ -4662,6 +4989,22 @@ async fn put_multipart_part(
         "uploaded_at".to_string(),
         part.uploaded_at_unix_seconds.to_string(),
     );
+    part_metadata.insert("durability".to_string(), part.durability_status.clone());
+    let durability_bytes = serde_json::to_vec(&part.durability).map_err(|error| {
+        S3Error::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            error.to_string(),
+            resource,
+        )
+    })?;
+    let durability_record = put_replicated_block(state, CODEC_RAW, durability_bytes)
+        .await
+        .map_err(|error| map_api_error(error, resource))?;
+    part_metadata.insert(
+        "durability_receipts_cid".to_string(),
+        durability_record.cid.to_string(),
+    );
     let mutations = vec![
         NamespaceMutation::Put {
             key_hex: hex::encode(part_key),
@@ -4680,11 +5023,14 @@ async fn put_multipart_part(
             precondition: value_precondition(&stored_upload.value),
         },
     ];
-    apply_multipart_transaction(
+    let mut preverified_durability = part.durability.clone();
+    preverified_durability.push(durability_record.clone());
+    apply_multipart_transaction_preverified(
         state,
         &stored_upload.control_namespace_id,
         mutations,
-        vec![part.content_cid.clone()],
+        vec![part.content_cid.clone(), durability_record.cid],
+        preverified_durability,
         part.size,
         resource,
     )
@@ -4749,13 +5095,65 @@ async fn multipart_parts(
                     "/",
                 )
             })?;
+        let durability_status = value.metadata.get("durability").cloned().ok_or_else(|| {
+            S3Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "multipart part durability metadata is missing",
+                "/",
+            )
+        })?;
+        let durability_cid = value
+            .metadata
+            .get("durability_receipts_cid")
+            .ok_or_else(|| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "multipart part durability receipt metadata is missing",
+                    "/",
+                )
+            })?
+            .parse::<Cid>()
+            .map_err(|_| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "multipart part durability receipt CID is invalid",
+                    "/",
+                )
+            })?;
+        let durability_block = get_block_resolved(state, &durability_cid)
+            .await
+            .map_err(|error| map_api_error(error, "/"))?;
+        if durability_block.codec != CODEC_RAW {
+            return Err(S3Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "multipart part durability receipt block is not raw",
+                "/",
+            ));
+        }
+        let durability = serde_json::from_slice::<Vec<DurabilityReceipt>>(
+            &durability_block.payload,
+        )
+        .map_err(|error| {
+            S3Error::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                error.to_string(),
+                "/",
+            )
+        })?;
         parts.push(S3MultipartPart {
             upload_id: upload_id.to_string(),
             part_number,
             content_cid: value.cid.clone(),
             size,
             etag: value.cid.to_string(),
+            durability_status,
             uploaded_at_unix_seconds,
+            durability,
         });
     }
     parts.sort_by_key(|part| part.part_number);
@@ -4856,11 +5254,9 @@ pub(super) async fn local_s3_bucket_catalog_namespace(
     match namespace_alias(state, S3_BUCKET_CATALOG_ALIAS) {
         Ok(namespace_id) => {
             let namespace = manager
-                .group(&namespace_id)
+                .linearizable_namespace_head(&namespace_id)
                 .await
-                .map_err(consensus_error)?
-                .namespace_state()
-                .await;
+                .map_err(consensus_error)?;
             if is_s3_catalog_descriptor(&namespace.descriptor) {
                 return Ok(Some(namespace_id));
             }
@@ -4934,7 +5330,7 @@ async fn ensure_s3_bucket_catalog(
             })?;
             let namespace = namespace_manager(state)
                 .map_err(|error| map_api_error(error, resource))?
-                .linearizable_namespace_state(&namespace_id)
+                .linearizable_namespace_head(&namespace_id)
                 .await
                 .map_err(|error| {
                     S3Error::new(
@@ -4986,7 +5382,7 @@ async fn ensure_s3_bucket_catalog(
     let deadline = time::Instant::now() + Duration::from_secs(10);
     loop {
         if manager
-            .linearizable_namespace_state(&created.namespace_id)
+            .linearizable_namespace_head(&created.namespace_id)
             .await
             .is_ok()
         {
@@ -5182,137 +5578,16 @@ async fn s3_catalog_aliases(
     Ok(aliases)
 }
 
-async fn bucket_name_marker(
-    state: &AppState,
-    namespace_id: &NamespaceId,
-) -> Result<Option<String>, ApiError> {
-    let Some(value) = current_value(state, namespace_id, &hex::encode(S3_BUCKET_NAME_KEY)).await?
-    else {
-        return Ok(None);
-    };
-    let block = get_block_resolved(state, &value.cid).await?;
-    if block.codec != CODEC_RAW {
-        return Err(ApiError::internal(
-            "S3 bucket-name marker is not a raw block",
-        ));
-    }
-    let name = String::from_utf8(block.payload)
-        .map_err(|_| ApiError::internal("S3 bucket-name marker is not UTF-8"))?;
-    if validate_bucket_name(&name).is_err() {
-        return Err(ApiError::internal("S3 bucket-name marker is invalid"));
-    }
-    Ok(Some(name))
-}
-
-pub(super) async fn local_s3_bucket_aliases(
-    state: &AppState,
-) -> Result<Vec<(String, NamespaceId)>, ApiError> {
-    let manager = namespace_manager(state)?;
-    let mut aliases = BTreeMap::<String, NamespaceId>::new();
-    for (alias, namespace_id) in namespace_aliases(state)? {
-        if alias == S3_BUCKET_CATALOG_ALIAS {
-            continue;
-        }
-        let namespace = manager
-            .linearizable_namespace_state(&namespace_id)
-            .await
-            .map_err(consensus_error)?;
-        if namespace.descriptor.kind == NamespaceKind::Bucket
-            && !bucket_deleted(state, &namespace_id).await?
-        {
-            aliases.insert(alias, namespace_id);
-        }
-    }
-    for status in manager.operational_statuses().await {
-        let namespace_id = status.namespace_id;
-        let group = match manager.group(&namespace_id).await {
-            Ok(group) => group,
-            Err(_) => continue,
-        };
-        if group.namespace_state().await.descriptor.kind != NamespaceKind::Bucket {
-            continue;
-        }
-        if bucket_deleted(state, &namespace_id).await? {
-            continue;
-        }
-        let Some(alias) = bucket_name_marker(state, &namespace_id).await? else {
-            continue;
-        };
-        if let Some(existing) = aliases.get(&alias)
-            && existing != &namespace_id
-        {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                ErrorCode::Conflict,
-                format!("S3 bucket alias {alias} resolves to multiple namespaces"),
-            ));
-        }
-        aliases.insert(alias, namespace_id);
-    }
-    if aliases.len() > S3_MAX_DISCOVERED_BUCKETS {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::CapacityExceeded,
-            "local S3 bucket catalog exceeded its bounded size",
-        ));
-    }
-    Ok(aliases.into_iter().collect())
-}
-
-pub(super) async fn local_s3_bucket_namespace(
-    state: &AppState,
-    bucket: &str,
-) -> Result<Option<NamespaceId>, ApiError> {
-    if validate_bucket_name(bucket).is_err() {
-        return Ok(None);
-    }
-    match namespace_alias(state, bucket) {
-        Ok(namespace_id) => {
-            let namespace = namespace_manager(state)?
-                .linearizable_namespace_state(&namespace_id)
-                .await
-                .map_err(consensus_error)?;
-            return Ok((namespace.descriptor.kind == NamespaceKind::Bucket
-                && !bucket_deleted(state, &namespace_id).await?)
-                .then_some(namespace_id));
-        }
-        Err(error) if error.code == ErrorCode::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    Ok(local_s3_bucket_aliases(state)
-        .await?
-        .into_iter()
-        .find_map(|(alias, namespace_id)| (alias == bucket).then_some(namespace_id)))
-}
-
-async fn distributed_s3_bucket_aliases(
+async fn catalog_s3_buckets(
     state: &AppState,
     resource: &str,
 ) -> Result<Vec<(String, NamespaceId)>, S3Error> {
     let catalog_namespace_id = ensure_s3_bucket_catalog(state, resource).await?;
-    for (alias, namespace_id) in legacy_distributed_s3_bucket_aliases(state, resource).await? {
-        let winner = claim_s3_catalog_entry(
-            state,
-            &catalog_namespace_id,
-            &alias,
-            &namespace_id,
-            resource,
-        )
-        .await?;
-        if winner != namespace_id {
-            warn!(
-                bucket = alias,
-                catalog_namespace = %winner,
-                legacy_namespace = %namespace_id,
-                "ignored conflicting legacy S3 bucket alias during catalog reconciliation"
-            );
-        }
-    }
     let mut aliases = Vec::new();
     for (alias, namespace_id) in s3_catalog_aliases(state, &catalog_namespace_id, resource).await? {
         let namespace = namespace_manager(state)
             .map_err(|error| map_api_error(error, resource))?
-            .linearizable_namespace_state(&namespace_id)
+            .linearizable_namespace_head(&namespace_id)
             .await
             .map_err(|error| {
                 S3Error::new(
@@ -5327,88 +5602,10 @@ async fn distributed_s3_bucket_aliases(
                 .await
                 .map_err(|error| map_api_error(error, resource))?
         {
-            cache_alias(state, &alias, &namespace_id)
-                .map_err(|error| map_api_error(error, resource))?;
             aliases.push((alias, namespace_id));
         }
     }
     Ok(aliases)
-}
-
-async fn legacy_distributed_s3_bucket_aliases(
-    state: &AppState,
-    resource: &str,
-) -> Result<Vec<(String, NamespaceId)>, S3Error> {
-    let mut aliases = local_s3_bucket_aliases(state)
-        .await
-        .map_err(|error| map_api_error(error, resource))?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    for peer in state.network.peers().await {
-        let mut response = None;
-        for address in peer.addresses {
-            let Ok(address) = address.parse() else {
-                continue;
-            };
-            if let Ok(found) = state.network.namespace_alias_list(address).await {
-                response = Some(found);
-                break;
-            }
-        }
-        let Some(response) = response else {
-            continue;
-        };
-        if response.aliases.len() > S3_MAX_DISCOVERED_BUCKETS {
-            return Err(S3Error::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "SlowDown",
-                "peer S3 bucket catalog exceeded its bounded size",
-                resource,
-            ));
-        }
-        for record in response.aliases {
-            validate_bucket_name(&record.alias)?;
-            let cid = record.namespace_id.parse::<Cid>().map_err(|_| {
-                S3Error::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    "peer returned an invalid bucket namespace ID",
-                    resource,
-                )
-            })?;
-            let namespace_id = NamespaceId::new(cid).map_err(|_| {
-                S3Error::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    "peer returned a non-namespace bucket ID",
-                    resource,
-                )
-            })?;
-            if let Some(existing) = aliases.get(&record.alias)
-                && existing != &namespace_id
-            {
-                return Err(S3Error::new(
-                    StatusCode::CONFLICT,
-                    "BucketAlreadyExists",
-                    "the bucket name resolves to conflicting namespaces",
-                    resource,
-                ));
-            }
-            aliases.insert(record.alias, namespace_id);
-            if aliases.len() > S3_MAX_DISCOVERED_BUCKETS {
-                return Err(S3Error::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "SlowDown",
-                    "S3 bucket catalog exceeded its bounded size",
-                    resource,
-                ));
-            }
-        }
-    }
-    for (alias, namespace_id) in &aliases {
-        cache_alias(state, alias, namespace_id).map_err(|error| map_api_error(error, resource))?;
-    }
-    Ok(aliases.into_iter().collect())
 }
 
 async fn resolve_s3_bucket_namespace(
@@ -5417,132 +5614,29 @@ async fn resolve_s3_bucket_namespace(
     resource: &str,
 ) -> Result<Option<NamespaceId>, S3Error> {
     let catalog_namespace_id = ensure_s3_bucket_catalog(state, resource).await?;
-    if let Some(namespace_id) =
-        s3_catalog_lookup(state, &catalog_namespace_id, bucket, resource).await?
-    {
-        cache_alias(state, bucket, &namespace_id)
-            .map_err(|error| map_api_error(error, resource))?;
-        return Ok(Some(namespace_id));
-    }
-    let Some(legacy_namespace_id) =
-        legacy_resolve_s3_bucket_namespace(state, bucket, resource).await?
-    else {
-        return Ok(None);
-    };
-    let winner = claim_s3_catalog_entry(
-        state,
-        &catalog_namespace_id,
-        bucket,
-        &legacy_namespace_id,
-        resource,
-    )
-    .await?;
-    if winner != legacy_namespace_id {
-        warn!(
-            bucket,
-            catalog_namespace = %winner,
-            legacy_namespace = %legacy_namespace_id,
-            "S3 bucket catalog overrode a conflicting legacy alias"
-        );
-    }
-    cache_alias(state, bucket, &winner).map_err(|error| map_api_error(error, resource))?;
-    Ok(Some(winner))
-}
-
-async fn legacy_resolve_s3_bucket_namespace(
-    state: &AppState,
-    bucket: &str,
-    resource: &str,
-) -> Result<Option<NamespaceId>, S3Error> {
-    if let Some(namespace_id) = local_s3_bucket_namespace(state, bucket)
-        .await
-        .map_err(|error| map_api_error(error, resource))?
-    {
-        return Ok(Some(namespace_id));
-    }
-    let mut found = None;
-    for peer in state.network.peers().await {
-        let mut response = None;
-        for address in peer.addresses {
-            let Ok(address) = address.parse() else {
-                continue;
-            };
-            if let Ok(resolved) = state
-                .network
-                .namespace_alias_resolve(address, bucket.to_string())
-                .await
-            {
-                response = Some(resolved);
-                break;
-            }
-        }
-        let Some(response) = response.filter(|response| response.found) else {
-            continue;
-        };
-        let cid = response.namespace_id.parse::<Cid>().map_err(|_| {
-            S3Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                "peer returned an invalid bucket namespace ID",
-                resource,
-            )
-        })?;
-        let namespace_id = NamespaceId::new(cid).map_err(|_| {
-            S3Error::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalError",
-                "peer returned a non-namespace bucket ID",
-                resource,
-            )
-        })?;
-        if found
-            .as_ref()
-            .is_some_and(|existing| existing != &namespace_id)
-        {
-            return Err(S3Error::new(
-                StatusCode::CONFLICT,
-                "BucketAlreadyExists",
-                "the bucket name resolves to conflicting namespaces",
-                resource,
-            ));
-        }
-        found = Some(namespace_id);
-    }
-    if let Some(namespace_id) = &found {
-        let namespace = namespace_manager(state)
-            .map_err(|error| map_api_error(error, resource))?
-            .linearizable_namespace_state(namespace_id)
-            .await
-            .map_err(|error| {
-                S3Error::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailable",
-                    error.to_string(),
-                    resource,
-                )
-            })?;
-        if namespace.descriptor.kind != NamespaceKind::Bucket {
-            return Err(S3Error::no_bucket(bucket));
-        }
-        if bucket_deleted(state, namespace_id)
-            .await
-            .map_err(|error| map_api_error(error, resource))?
-        {
-            return Ok(None);
-        }
+    let namespace_id = s3_catalog_lookup(state, &catalog_namespace_id, bucket, resource).await?;
+    if let Some(namespace_id) = &namespace_id {
         cache_alias(state, bucket, namespace_id).map_err(|error| map_api_error(error, resource))?;
     }
-    Ok(found)
+    Ok(namespace_id)
 }
 
-async fn bucket_namespace(state: &AppState, bucket: &str) -> Result<NamespaceId, S3Error> {
+struct ResolvedS3Bucket {
+    namespace_id: NamespaceId,
+    namespace: NamespaceState,
+}
+
+async fn bucket_namespace_state(
+    state: &AppState,
+    bucket: &str,
+) -> Result<ResolvedS3Bucket, S3Error> {
     validate_bucket_name(bucket)?;
     let namespace_id = resolve_s3_bucket_namespace(state, bucket, &format!("/{bucket}"))
         .await?
         .ok_or_else(|| S3Error::no_bucket(bucket))?;
     let namespace = namespace_manager(state)
         .map_err(|error| map_api_error(error, &format!("/{bucket}")))?
-        .linearizable_namespace_state(&namespace_id)
+        .linearizable_namespace_head(&namespace_id)
         .await
         .map_err(|error| {
             S3Error::new(
@@ -5567,7 +5661,14 @@ async fn bucket_namespace(state: &AppState, bucket: &str) -> Result<NamespaceId,
     {
         return Err(S3Error::no_bucket(bucket));
     }
-    Ok(namespace_id)
+    Ok(ResolvedS3Bucket {
+        namespace_id,
+        namespace,
+    })
+}
+
+async fn bucket_namespace(state: &AppState, bucket: &str) -> Result<NamespaceId, S3Error> {
+    Ok(bucket_namespace_state(state, bucket).await?.namespace_id)
 }
 
 async fn current_bucket_descriptor(
@@ -5575,10 +5676,44 @@ async fn current_bucket_descriptor(
     bucket: &str,
     key: &[u8],
 ) -> Result<Option<(pepper_merkle::MerkleValue, BucketObjectDescriptor)>, S3Error> {
-    let namespace_id = bucket_namespace(state, bucket).await?;
-    current_bucket_descriptor_by_namespace(state, &namespace_id, key)
-        .await
-        .map_err(|error| map_api_error(error, &format!("/{bucket}")))
+    Ok(current_bucket_descriptor_snapshot(state, bucket, key)
+        .await?
+        .1)
+}
+
+async fn current_bucket_descriptor_snapshot(
+    state: &AppState,
+    bucket: &str,
+    key: &[u8],
+) -> Result<
+    (
+        ResolvedS3Bucket,
+        Option<(pepper_merkle::MerkleValue, BucketObjectDescriptor)>,
+    ),
+    S3Error,
+> {
+    let resolved = bucket_namespace_state(state, bucket).await?;
+    let current =
+        current_bucket_descriptor_at_root(state, &resolved.namespace.current_root_cid, key)
+            .await
+            .map_err(|error| map_api_error(error, &format!("/{bucket}")))?;
+    Ok((resolved, current))
+}
+
+async fn current_bucket_descriptor_at_root(
+    state: &AppState,
+    root: &Cid,
+    key: &[u8],
+) -> Result<Option<(MerkleValue, BucketObjectDescriptor)>, ApiError> {
+    let value = pepper_merkle::get(
+        &state.namespace_data_store,
+        root,
+        key,
+        MerkleLimits::default(),
+    )
+    .await
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    decode_current_bucket_descriptor(state, value).await
 }
 
 async fn current_bucket_descriptor_by_namespace(
@@ -5587,6 +5722,13 @@ async fn current_bucket_descriptor_by_namespace(
     key: &[u8],
 ) -> Result<Option<(MerkleValue, BucketObjectDescriptor)>, ApiError> {
     let value = current_value(state, namespace_id, &hex::encode(key)).await?;
+    decode_current_bucket_descriptor(state, value).await
+}
+
+async fn decode_current_bucket_descriptor(
+    state: &AppState,
+    value: Option<MerkleValue>,
+) -> Result<Option<(MerkleValue, BucketObjectDescriptor)>, ApiError> {
     match value {
         Some(value) => {
             let descriptor = get_descriptor(
@@ -5600,31 +5742,6 @@ async fn current_bucket_descriptor_by_namespace(
         }
         None => Ok(None),
     }
-}
-
-async fn descriptor_timestamp(
-    state: &AppState,
-    bucket: &str,
-    revision: u64,
-) -> Result<i64, S3Error> {
-    let namespace_id = bucket_namespace(state, bucket).await?;
-    let namespace = namespace_manager(state)
-        .map_err(|error| map_api_error(error, &format!("/{bucket}")))?
-        .linearizable_namespace_state(&namespace_id)
-        .await
-        .map_err(|error| {
-            S3Error::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                error.to_string(),
-                format!("/{bucket}"),
-            )
-        })?;
-    Ok(namespace
-        .history
-        .get(&revision)
-        .map(|record| record.committed_at_unix_seconds)
-        .unwrap_or(namespace.descriptor.created_at_unix_seconds))
 }
 
 fn validate_object_route(
@@ -6748,6 +6865,10 @@ fn map_api_error(error: ApiError, resource: &str) -> S3Error {
 }
 
 fn xml_response(status: StatusCode, xml: String, request_id: &str) -> Response {
+    xml_bytes_response(status, Bytes::from(xml), request_id)
+}
+
+fn xml_bytes_response(status: StatusCode, xml: Bytes, request_id: &str) -> Response {
     let mut response = (status, xml).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -6811,6 +6932,71 @@ fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list_cache_key(bucket: &str) -> S3ListCacheKey {
+        S3ListCacheKey {
+            bucket: bucket.to_string(),
+            root: "root".to_string(),
+            prefix: Vec::new(),
+            delimiter: None,
+            start_after: None,
+            continuation_token: None,
+            max_keys: 1000,
+            encoding_url: false,
+            fetch_owner: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_cache_coalesces_and_bounds_immutable_results() {
+        let cache = S3ListCache::default();
+        let key = list_cache_key("bucket");
+        let first_flight = cache.flight(&key).await;
+        let second_flight = cache.flight(&key).await;
+        assert!(Arc::ptr_eq(&first_flight, &second_flight));
+
+        cache
+            .insert(key.clone(), Bytes::from_static(b"<result/>"))
+            .await;
+        assert_eq!(cache.get(&key).await.unwrap(), "<result/>");
+
+        for index in 0..=S3_LIST_CACHE_MAX_ENTRIES {
+            cache
+                .insert(
+                    list_cache_key(&format!("bucket-{index}")),
+                    Bytes::from_static(b"x"),
+                )
+                .await;
+        }
+        assert!(cache.get(&key).await.is_none());
+        assert_eq!(
+            cache.state.lock().await.entries.len(),
+            S3_LIST_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn retryable_s3_errors_include_retry_after() {
+        let response = S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "bounded queue is full",
+            "/bucket/key",
+        )
+        .into_response();
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "bounded queue is full",
+            "/bucket/key",
+        )
+        .with_retry_after(7)
+        .into_response();
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "7");
+    }
 
     #[test]
     fn canonical_query_sorts_and_encodes_values() {
@@ -7112,7 +7298,9 @@ mod tests {
             content_cid: Cid::new(CODEC_RAW, format!("part-{part_number}").as_bytes()),
             size,
             etag: format!("etag-{part_number}"),
+            durability_status: "durable".to_string(),
             uploaded_at_unix_seconds: 0,
+            durability: Vec::new(),
         };
         let final_part = part(2, 1);
 

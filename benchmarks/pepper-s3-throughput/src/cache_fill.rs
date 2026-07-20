@@ -18,10 +18,7 @@ use std::{
     fs::File,
     os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -43,8 +40,9 @@ const POSIX_FADV_DONTNEED: i32 = 4;
 
 #[derive(Debug, Args)]
 pub struct CacheFillArgs {
-    #[arg(long, default_value = "/var/tmp/pepper-s3-cache-fill")]
-    root: PathBuf,
+    /// Bulk-data root on a dedicated XFS filesystem (never the OS root filesystem).
+    #[arg(long)]
+    root: Option<PathBuf>,
     #[arg(long)]
     artifacts: Option<PathBuf>,
     #[arg(long, default_value = "three")]
@@ -138,7 +136,6 @@ impl Scenario {
 struct S3Client {
     client: Client,
     endpoints: Arc<Vec<String>>,
-    route: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -292,12 +289,12 @@ impl S3Client {
                 .timeout(Duration::from_secs(timeout))
                 .build()?,
             endpoints: Arc::new(endpoints),
-            route: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    fn endpoint(&self) -> &str {
-        let index = self.route.fetch_add(1, Ordering::Relaxed) as usize;
+    fn endpoint(&self, key: &str) -> &str {
+        let digest = Sha256::digest(key.as_bytes());
+        let index = u64::from_le_bytes(digest[..8].try_into().unwrap()) as usize;
         &self.endpoints[index % self.endpoints.len()]
     }
 
@@ -306,7 +303,7 @@ impl S3Client {
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
-        let endpoint = self.endpoint();
+        let endpoint = self.endpoint(key);
         let path = Self::object_path(key);
         let response = self
             .client
@@ -336,7 +333,7 @@ impl S3Client {
     async fn upload(&self, object: &ObjectManifest, retries: usize) -> Result<Vec<String>> {
         let mut last = None;
         for attempt in 0..=retries {
-            let endpoint = self.endpoint();
+            let endpoint = self.endpoint(&object.key);
             let path = Self::object_path(&object.key);
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let size = object.size_bytes;
@@ -405,7 +402,7 @@ impl S3Client {
     }
 
     async fn range(&self, object: &ObjectManifest, block: usize) -> Result<(u16, Bytes)> {
-        let endpoint = self.endpoint();
+        let endpoint = self.endpoint(&object.key);
         let path = Self::object_path(&object.key);
         let start = block as u64 * BLOCK_BYTES;
         let end = (start + BLOCK_BYTES).min(object.size_bytes) - 1;
@@ -827,6 +824,22 @@ where
         .sum()
 }
 
+fn raft_term_changes(before: &matrix::Scrape, after: &matrix::Scrape) -> u64 {
+    after
+        .iter()
+        .flat_map(|(endpoint, values)| {
+            matrix::family(values, "pepper_namespace_term").map(move |(key, value)| {
+                let before_value = before
+                    .get(endpoint)
+                    .and_then(|metrics| metrics.get(key))
+                    .copied()
+                    .unwrap_or(*value);
+                value.max(before_value) - before_value
+            })
+        })
+        .sum::<f64>() as u64
+}
+
 fn network_bytes(pids: &[u32]) -> (u64, u64) {
     pids.iter()
         .filter_map(|pid| fs::read_to_string(format!("/proc/{pid}/net/dev")).ok())
@@ -851,13 +864,9 @@ fn network_bytes(pids: &[u32]) -> (u64, u64) {
 }
 
 fn make_data_readable(root: &Path, topology: &str) -> Result<()> {
-    let services: &[&str] = if topology == "single" {
-        &["single", "single2", "single3"]
-    } else {
-        &["node1", "node2", "node3"]
-    };
-    for service in services {
-        matrix::run_command(matrix::docker(root).args([
+    for service in matrix::topology_services(topology) {
+        let mut command = matrix::docker(root);
+        command.args([
             "--profile",
             topology,
             "run",
@@ -872,24 +881,56 @@ fn make_data_readable(root: &Path, topology: &str) -> Result<()> {
             "a+rX",
             "/var/lib/pepper/metadata",
             "/var/lib/pepper/storage",
-        ]))?;
+        ]);
+        matrix::run_command(&mut command)?;
+        if topology == "nine-ec" {
+            matrix::run_command(matrix::docker(root).args([
+                "--profile",
+                topology,
+                "run",
+                "--rm",
+                "--no-deps",
+                "--user",
+                "0",
+                "--entrypoint",
+                "/bin/chmod",
+                service,
+                "-R",
+                "a+rwX",
+                "/var/lib/pepper/reconstructed-cache",
+            ]))?;
+        }
+    }
+    Ok(())
+}
+
+fn clear_reconstructed_cache(root: &Path, topology: &str) -> Result<()> {
+    if topology != "nine-ec" {
+        return Ok(());
+    }
+    for name in matrix::topology_services(topology) {
+        let path = root.join(name).join("reconstructed-cache");
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
     }
     Ok(())
 }
 
 fn evict_page_cache(root: &Path, topology: &str) -> Result<Value> {
-    let names: &[&str] = if topology == "single" {
-        &["single", "single2", "single3"]
-    } else {
-        &["node1", "node2", "node3"]
-    };
-    let mut pending = names
-        .iter()
+    let mut pending = matrix::topology_services(topology)
+        .into_iter()
         .flat_map(|name| {
-            [
+            let mut paths = vec![
                 root.join(name).join("metadata"),
                 root.join(name).join("storage"),
-            ]
+            ];
+            if topology == "nine-ec" {
+                paths.push(root.join(name).join("reconstructed-cache"));
+            }
+            paths
         })
         .collect::<Vec<_>>();
     let mut files = 0u64;
@@ -961,17 +1002,19 @@ async fn measured_cell(
     let successful = report.results["successful_reads"].as_u64().unwrap_or(0);
     let logical = report.results["logical_bytes"].as_u64().unwrap_or(0);
     let storage_bytes = metric_delta(&before, &after, "pepper_storage_block_read_bytes_total");
-    let namespace_rpcs = labelled_delta(&before, &after, "pepper_rpc_requests_total", |key| {
-        key.contains("direction=\"outbound\"")
-            && [
-                "/namespace/state",
-                "/namespace/discover",
-                "/namespace/alias/resolve",
-                "/namespace/alias/list",
-            ]
-            .iter()
-            .any(|method| key.contains(&format!("method=\"{method}\"")))
-    });
+    let namespace_rpc_delta = |method: &str| {
+        labelled_delta(&before, &after, "pepper_rpc_requests_total", |key| {
+            key.contains("direction=\"outbound\"") && key.contains(&format!("method=\"{method}\""))
+        })
+    };
+    let namespace_state_rpcs = namespace_rpc_delta("/namespace/state");
+    let namespace_discovery_rpcs = namespace_rpc_delta("/namespace/discover");
+    let namespace_alias_resolve_rpcs = namespace_rpc_delta("/namespace/alias/resolve");
+    let namespace_alias_list_rpcs = namespace_rpc_delta("/namespace/alias/list");
+    let namespace_rpcs = namespace_state_rpcs
+        + namespace_discovery_rpcs
+        + namespace_alias_resolve_rpcs
+        + namespace_alias_list_rpcs;
     let block_rpc_bytes =
         labelled_delta(&before, &after, "pepper_rpc_response_bytes_total", |key| {
             key.contains("direction=\"outbound\"")
@@ -981,6 +1024,58 @@ async fn measured_cell(
     let rpc_errors = labelled_delta(&before, &after, "pepper_rpc_errors_total", |key| {
         key.contains("direction=\"outbound\"")
     });
+    let cache_hits = labelled_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_requests_total",
+        |key| key.contains("result=\"hit\""),
+    );
+    let cache_misses = labelled_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_requests_total",
+        |key| key.contains("result=\"miss\""),
+    );
+    let cache_admissions = metric_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_admissions_total",
+    );
+    let cache_evictions = metric_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_evictions_total",
+    );
+    let cache_bypasses = metric_delta(&before, &after, "pepper_reconstructed_cache_bypasses_total");
+    let cache_integrity_failures = metric_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_integrity_failures_total",
+    );
+    let cache_read_bytes = labelled_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_bytes_total",
+        |key| key.contains("direction=\"read\""),
+    );
+    let cache_write_bytes = labelled_delta(
+        &before,
+        &after,
+        "pepper_reconstructed_cache_bytes_total",
+        |key| key.contains("direction=\"write\""),
+    );
+    let systematic_range_bytes = metric_delta(
+        &before,
+        &after,
+        "pepper_erasure_systematic_range_bytes_total",
+    );
+    let term_changes = raft_term_changes(&before, &after);
+    let max_log_lag = after
+        .values()
+        .flat_map(|values| matrix::family(values, "pepper_namespace_log_lag"))
+        .map(|(_, value)| *value)
+        .fold(0.0, f64::max);
+    let unhealthy_quorums = matrix::unhealthy_quorum_count(&after);
     let tick_rate = String::from_utf8(
         matrix::run_command(std::process::Command::new("getconf").arg("CLK_TCK"))?.stdout,
     )?
@@ -1006,9 +1101,28 @@ async fn measured_cell(
             "tx_mb_per_second": network_after.1.saturating_sub(network_before.1) as f64 / 1e6 / elapsed},
         "namespace_state_discovery_rpcs": namespace_rpcs,
         "namespace_state_discovery_rpcs_per_get": if successful > 0 { Some(namespace_rpcs / successful as f64) } else { None },
+        "namespace_state_rpcs": namespace_state_rpcs,
+        "namespace_discovery_rpcs": namespace_discovery_rpcs,
+        "namespace_alias_resolve_rpcs": namespace_alias_resolve_rpcs,
+        "namespace_alias_list_rpcs": namespace_alias_list_rpcs,
         "block_store_read_bytes": storage_bytes, "remote_block_rpc_response_bytes": block_rpc_bytes,
         "internal_read_bytes": storage_bytes + block_rpc_bytes,
         "logical_to_internal_byte_amplification": if logical > 0 { Some((storage_bytes + block_rpc_bytes) / logical as f64) } else { None },
+        "systematic_range_bytes": systematic_range_bytes,
+        "reconstructed_cache": {
+            "hits": cache_hits,
+            "misses": cache_misses,
+            "hit_rate": if cache_hits + cache_misses > 0.0 { Some(cache_hits / (cache_hits + cache_misses)) } else { None },
+            "admissions": cache_admissions,
+            "evictions": cache_evictions,
+            "bypasses": cache_bypasses,
+            "integrity_failures": cache_integrity_failures,
+            "read_bytes": cache_read_bytes,
+            "write_bytes": cache_write_bytes,
+        },
+        "raft_term_changes": term_changes,
+        "max_log_lag": max_log_lag,
+        "unhealthy_quorums_at_end": unhealthy_quorums,
         "rpc_errors": rpc_errors,
     });
     Ok(value)
@@ -1030,8 +1144,8 @@ fn scenario_selection(value: &str) -> Result<BTreeSet<String>> {
 
 pub async fn run(args: CacheFillArgs) -> Result<()> {
     ensure!(
-        ["single", "three"].contains(&args.topology.as_str()),
-        "topology must be single or three"
+        ["single", "three", "nine-ec"].contains(&args.topology.as_str()),
+        "topology must be single, three, or nine-ec"
     );
     ensure!(
         args.upload_concurrency > 0,
@@ -1087,12 +1201,16 @@ pub async fn run(args: CacheFillArgs) -> Result<()> {
         );
         return Ok(());
     }
-    fs::create_dir_all(&args.root)?;
+    let requested_root = args
+        .root
+        .as_deref()
+        .context("--root is required for a benchmark run; select a dedicated XFS data mount")?;
+    let root = matrix::prepare_benchmark_root(requested_root)?;
     let filesystem = String::from_utf8(
         matrix::run_command(
             std::process::Command::new("findmnt")
                 .args(["-n", "-o", "FSTYPE", "-T"])
-                .arg(&args.root),
+                .arg(&root),
         )?
         .stdout,
     )?
@@ -1103,30 +1221,31 @@ pub async fn run(args: CacheFillArgs) -> Result<()> {
         "benchmark root must be on XFS, found {filesystem:?}"
     );
     for name in [
-        "single", "single2", "single3", "node1", "node2", "node3", "control",
+        "single", "single2", "single3", "node1", "node2", "node3", "ec1", "ec2", "ec3", "ec4",
+        "ec5", "ec6", "ec7", "ec8", "ec9", "control",
     ] {
-        let path = args.root.join(name);
+        let path = root.join(name);
         fs::create_dir_all(&path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
     }
     let artifacts = args.artifacts.clone().unwrap_or_else(|| {
-        args.root
-            .join("artifacts")
+        root.join("artifacts")
             .join(time::OffsetDateTime::now_utc().unix_timestamp().to_string())
     });
     fs::create_dir_all(artifacts.join("cells"))?;
-    matrix::stop_topology(&args.root);
+    matrix::stop_topology(&root);
+    matrix::build_topology(&args.topology, &root)?;
     if args.fresh {
-        matrix::reset_data(&args.topology, &args.root)?;
+        matrix::reset_data(&args.topology, &root)?;
     }
     let http = Client::new();
     let result = async {
-        matrix::start_topology(&http, &args.topology, &args.root).await?;
+        matrix::start_topology(&http, &args.topology, &root).await?;
         let all_endpoints = matrix::topology_endpoints(&args.topology);
         matrix::ensure_bucket(&all_endpoints)?;
         matrix::wait_quorum(&http, &all_endpoints).await?;
         let upload_endpoints = matrix::routed_endpoints(&http, &args.topology, "leader", &all_endpoints).await;
-        let manifest_path = args.root.join("dataset-manifest.json");
+        let manifest_path = root.join("dataset-manifest.json");
         let manifest = prepare_dataset(S3Client::new(upload_endpoints, args.upload_concurrency, args.timeout)?, &manifest_path, &sizes, args.upload_concurrency, args.retries).await?;
         fs::copy(&manifest_path, artifacts.join("dataset-manifest.json"))?;
         fs::write(artifacts.join("query-manifest.json"), serde_json::to_string_pretty(queries)? + "\n")?;
@@ -1134,12 +1253,13 @@ pub async fn run(args: CacheFillArgs) -> Result<()> {
         fs::write(artifacts.join("manifest.json"), serde_json::to_string_pretty(&json!({"schema_version": 1,
             "git_commit": matrix::run_command(std::process::Command::new("git").args(["rev-parse", "HEAD"])) .ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default(),
             "git_diff_sha256": hex::encode(Sha256::digest(git_diff)), "generator": GENERATOR,
+            "endpoint_routing": "sha256-object-affinity-v1",
             "block_size_bytes": BLOCK_BYTES, "query_seed": args.seed, "filesystem": filesystem,
             "topology": args.topology, "dataset_spec": args.dataset_spec, "dataset_bytes": sizes.iter().sum::<u64>(),
             "query_count": queries.len(), "concurrency": concurrencies, "routing": routings, "scenarios": scenarios}))? + "\n")?;
         if args.prepare_only { return Ok(()); }
         let measurement = Measurement {
-            root: &args.root,
+            root: &root,
             topology: &args.topology,
             http: &http,
             manifest: &manifest,
@@ -1161,10 +1281,11 @@ pub async fn run(args: CacheFillArgs) -> Result<()> {
                 if scenarios.contains("diagnostic") {
                     let warm_path = artifacts.join("cells").join(format!("diagnostic-warm-c{}-{}.json", concurrency, routing));
                     if warm_path.exists() { continue; }
-                    matrix::stop_topology(&args.root);
-                    make_data_readable(&args.root, &args.topology)?;
-                    let eviction = evict_page_cache(&args.root, &args.topology)?;
-                    matrix::start_topology(&http, &args.topology, &args.root).await?;
+                    matrix::stop_topology(&root);
+                    make_data_readable(&root, &args.topology)?;
+                    clear_reconstructed_cache(&root, &args.topology)?;
+                    let eviction = evict_page_cache(&root, &args.topology)?;
+                    matrix::start_topology(&http, &args.topology, &root).await?;
                     matrix::wait_quorum(&http, &all_endpoints).await?;
                     let endpoints = matrix::routed_endpoints(&http, &args.topology, routing, &all_endpoints).await;
                     eprintln!("running diagnostic-cold-c{}-{}", concurrency, routing);
@@ -1179,7 +1300,15 @@ pub async fn run(args: CacheFillArgs) -> Result<()> {
         }
         Ok(())
     }.await;
-    matrix::stop_topology(&args.root);
+    matrix::stop_topology(&root);
+    if result.is_ok() && !args.prepare_only {
+        matrix::reclaim_data(&args.topology, &root)
+            .context("failed to reclaim cache-fill benchmark data after a successful run")?;
+        let manifest_path = root.join("dataset-manifest.json");
+        if manifest_path.exists() {
+            fs::remove_file(manifest_path)?;
+        }
+    }
     result
 }
 
@@ -1253,6 +1382,40 @@ pub fn summarize(args: CacheFillSummaryArgs) -> Result<()> {
         (
             "logical_to_internal_byte_amplification",
             &["telemetry", "logical_to_internal_byte_amplification"],
+        ),
+        (
+            "reconstructed_cache_hits",
+            &["telemetry", "reconstructed_cache", "hits"],
+        ),
+        (
+            "reconstructed_cache_misses",
+            &["telemetry", "reconstructed_cache", "misses"],
+        ),
+        (
+            "reconstructed_cache_hit_rate",
+            &["telemetry", "reconstructed_cache", "hit_rate"],
+        ),
+        (
+            "reconstructed_cache_admissions",
+            &["telemetry", "reconstructed_cache", "admissions"],
+        ),
+        (
+            "reconstructed_cache_evictions",
+            &["telemetry", "reconstructed_cache", "evictions"],
+        ),
+        (
+            "reconstructed_cache_bypasses",
+            &["telemetry", "reconstructed_cache", "bypasses"],
+        ),
+        (
+            "reconstructed_cache_integrity_failures",
+            &["telemetry", "reconstructed_cache", "integrity_failures"],
+        ),
+        ("raft_term_changes", &["telemetry", "raft_term_changes"]),
+        ("max_log_lag", &["telemetry", "max_log_lag"]),
+        (
+            "unhealthy_quorums_at_end",
+            &["telemetry", "unhealthy_quorums_at_end"],
         ),
         ("rpc_errors", &["telemetry", "rpc_errors"]),
     ];
@@ -1343,6 +1506,19 @@ mod tests {
         assert_eq!(first, generated_block(1, 2, 1024));
         assert_ne!(first, generated_block(1, 3, 1024));
         assert!(first.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn object_routes_are_stable_across_requests() {
+        let client = S3Client::new(
+            vec!["http://one".to_string(), "http://two".to_string()],
+            2,
+            1,
+        )
+        .unwrap();
+        let first = client.endpoint("object-a").to_string();
+        assert_eq!(client.endpoint("object-a"), first);
+        assert_eq!(client.endpoint("object-a"), first);
     }
 
     #[test]

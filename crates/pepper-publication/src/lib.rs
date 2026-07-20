@@ -7,20 +7,19 @@ use pepper_consensus::{
     ConsensusDataStore, ConsensusResponse, NamespaceGroupManager, PublicationIntentRecord,
     namespace_log_contains,
 };
-use pepper_dag::{DagCodecRegistry, TraversalLimits, traverse};
+use pepper_dag::{BlockResolver, DagCodecRegistry, TraversalLimits, traverse};
 use pepper_metadata::{
     MetadataStore, NAMESPACE_DURABILITY_RECEIPTS, NAMESPACE_PUBLICATION_INTENTS,
     NAMESPACE_READ_LEASES, NAMESPACE_STAGING_LEASES,
 };
 use pepper_namespace::{
-    ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation,
-    NamespaceStateMachine, PinAction,
+    ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation, PinAction,
 };
-use pepper_types::{Cid, DurabilityReceipt};
+use pepper_types::{CODEC_ERASURE_MANIFEST, Cid, DurabilityReceipt, ErasureManifest};
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -32,6 +31,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 static DURABILITY_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static DURABILITY_MICROS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_PREVERIFIED_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_CACHED_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_BACKEND_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_MISSING_PREVERIFIED_RECEIPTS: AtomicU64 = AtomicU64::new(0);
+static DURABILITY_INVALID_PREVERIFIED_RECEIPTS: AtomicU64 = AtomicU64::new(0);
 static MERKLE_UPDATE_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static MERKLE_UPDATE_MICROS: AtomicU64 = AtomicU64::new(0);
 static RAFT_PUBLICATION_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +45,11 @@ static RAFT_PUBLICATION_MICROS: AtomicU64 = AtomicU64::new(0);
 pub struct PublicationPhaseStats {
     pub durability_observations: u64,
     pub durability_micros: u64,
+    pub durability_preverified_receipts: u64,
+    pub durability_cached_receipts: u64,
+    pub durability_backend_receipts: u64,
+    pub durability_missing_preverified_receipts: u64,
+    pub durability_invalid_preverified_receipts: u64,
     pub merkle_update_observations: u64,
     pub merkle_update_micros: u64,
     pub raft_publication_observations: u64,
@@ -51,6 +60,13 @@ pub fn process_phase_stats() -> PublicationPhaseStats {
     PublicationPhaseStats {
         durability_observations: DURABILITY_OBSERVATIONS.load(Ordering::Relaxed),
         durability_micros: DURABILITY_MICROS.load(Ordering::Relaxed),
+        durability_preverified_receipts: DURABILITY_PREVERIFIED_RECEIPTS.load(Ordering::Relaxed),
+        durability_cached_receipts: DURABILITY_CACHED_RECEIPTS.load(Ordering::Relaxed),
+        durability_backend_receipts: DURABILITY_BACKEND_RECEIPTS.load(Ordering::Relaxed),
+        durability_missing_preverified_receipts: DURABILITY_MISSING_PREVERIFIED_RECEIPTS
+            .load(Ordering::Relaxed),
+        durability_invalid_preverified_receipts: DURABILITY_INVALID_PREVERIFIED_RECEIPTS
+            .load(Ordering::Relaxed),
         merkle_update_observations: MERKLE_UPDATE_OBSERVATIONS.load(Ordering::Relaxed),
         merkle_update_micros: MERKLE_UPDATE_MICROS.load(Ordering::Relaxed),
         raft_publication_observations: RAFT_PUBLICATION_OBSERVATIONS.load(Ordering::Relaxed),
@@ -186,6 +202,10 @@ pub struct PublicationRequest {
     pub namespace_id: NamespaceId,
     pub command: CommandEnvelope,
     pub uploaded_roots: Vec<Cid>,
+    /// Fresh, internally generated replica acknowledgements for blocks created
+    /// by the same operation. Callers must not populate this from untrusted
+    /// request data.
+    pub preverified_durability: Vec<DurabilityReceipt>,
     pub staged_bytes: u64,
     pub staging_ttl_seconds: i64,
     pub retain_uploaded_on_conflict: bool,
@@ -276,6 +296,32 @@ pub trait ProtectionBackend: Send + Sync + 'static {
         cid: &Cid,
         reason: &str,
     ) -> Result<(), PublicationError>;
+
+    async fn protect_many(
+        &self,
+        namespace_id: &NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<(), PublicationError> {
+        for cid in cids {
+            self.protect(namespace_id, cid, reason, expires_at_unix_seconds)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn release_many(
+        &self,
+        namespace_id: &NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+    ) -> Result<(), PublicationError> {
+        for cid in cids {
+            self.release(namespace_id, cid, reason).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -465,11 +511,40 @@ impl PublicationRepository {
     }
 
     pub fn put_durability(&self, record: &StoredDurabilityReceipt) -> Result<(), PublicationError> {
-        let key = format!(
-            "{}|{}|{}",
-            record.namespace_id, record.request_id, record.receipt.cid
-        );
-        write_record(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS, &key, record)
+        self.put_durability_batch(std::slice::from_ref(record))
+    }
+
+    pub fn put_durability_batch(
+        &self,
+        records: &[StoredDurabilityReceipt],
+    ) -> Result<(), PublicationError> {
+        let encoded = records
+            .iter()
+            .map(|record| {
+                let key = format!(
+                    "{}|{}|{}",
+                    record.namespace_id, record.request_id, record.receipt.cid
+                );
+                let bytes = serde_json::to_vec(record).map_err(storage_error)?;
+                Ok((key, bytes))
+            })
+            .collect::<Result<Vec<_>, PublicationError>>()?;
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(storage_error)?;
+        {
+            let mut table = write
+                .open_table(NAMESPACE_DURABILITY_RECEIPTS)
+                .map_err(storage_error)?;
+            for (key, bytes) in &encoded {
+                table
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(storage_error)?;
+            }
+        }
+        write.commit().map_err(storage_error)
     }
 
     pub fn protected_roots(&self, now: i64) -> Result<HashSet<Cid>, PublicationError> {
@@ -596,11 +671,14 @@ where
         self.repository.put_staging(&lease)?;
         self.fault(PublicationFaultPoint::StagingLease)?;
         let staging_reason = format!("namespace-staging:{}", lease.lease_id);
-        for root in &lease.roots {
-            self.protection
-                .protect(&request.namespace_id, root, &staging_reason, Some(expires))
-                .await?;
-        }
+        self.protection
+            .protect_many(
+                &request.namespace_id,
+                &lease.roots,
+                &staging_reason,
+                Some(expires),
+            )
+            .await?;
 
         let result = self.publish_staged(&request, &mut lease, now).await;
         if result.is_ok() {
@@ -609,16 +687,14 @@ where
             self.reconcile_pin_intents().await?;
         }
         if result.is_err() && request.retain_uploaded_on_conflict {
-            for root in &request.uploaded_roots {
-                self.protection
-                    .protect(
-                        &request.namespace_id,
-                        root,
-                        "uploaded-publication-conflict",
-                        None,
-                    )
-                    .await?;
-            }
+            self.protection
+                .protect_many(
+                    &request.namespace_id,
+                    &request.uploaded_roots,
+                    "uploaded-publication-conflict",
+                    None,
+                )
+                .await?;
         }
         self.release_staging(&mut lease).await?;
         result.map(|(apply, durability)| PublicationResult {
@@ -634,26 +710,46 @@ where
         lease: &mut StagingLease,
         now: i64,
     ) -> Result<(ApplyResult, Vec<DurabilityReceipt>), PublicationError> {
-        let initial = self
+        self.fault(PublicationFaultPoint::LeaderValidation)?;
+        // Command validation and conditional checks must happen against the
+        // state at Raft log order. A pre-proposal state-machine preview was not
+        // authoritative under concurrency and duplicated every derived Merkle
+        // and commit-block write on the leader. The committed state machine
+        // returns the same application error without materializing a discarded
+        // candidate tree first.
+        self.fault(PublicationFaultPoint::CandidateRoot)?;
+        // A gateway does not have to host a Raft replica for the namespace it
+        // serves. Resolve the authoritative state through namespace routing
+        // instead of requiring a local group merely to read its durability
+        // policy.
+        let required = self
             .manager
             .linearizable_namespace_state(&request.namespace_id)
             .await
-            .map_err(|error| PublicationError::Namespace(error.to_string()))?;
-        self.fault(PublicationFaultPoint::LeaderValidation)?;
-        let mut preview = NamespaceStateMachine::new(self.data_store.clone(), initial.clone())
-            .map_err(|error| PublicationError::Namespace(error.to_string()))?;
-        {
-            let _timer = PhaseTimer::start(&MERKLE_UPDATE_OBSERVATIONS, &MERKLE_UPDATE_MICROS);
-            preview
-                .apply(request.command.clone())
-                .await
-                .map_err(|error| PublicationError::Conflict(error.to_string()))?;
-        }
-        self.fault(PublicationFaultPoint::CandidateRoot)?;
+            .map_err(|error| PublicationError::Namespace(error.to_string()))?
+            .descriptor
+            .durability
+            .replicas as usize;
 
-        let mut durable_cids = command_value_cids(&request.command);
-        durable_cids.extend(request.uploaded_roots.iter().cloned());
-        let roots_to_walk = durable_cids.clone();
+        let mut durable_cids = request.uploaded_roots.clone();
+        let mut roots_to_walk = request.uploaded_roots.clone();
+        for cid in command_value_cids(&request.command) {
+            if request
+                .preverified_durability
+                .iter()
+                .any(|receipt| receipt.cid == cid)
+            {
+                // The command-value block itself is fresh and verified, but its
+                // links can include already committed history. Uploaded roots
+                // below are the new external DAG frontier that must be walked.
+                durable_cids.push(cid);
+            } else if !roots_to_walk.contains(&cid) {
+                // Callers without an authenticated command-value receipt need
+                // the full traversal barrier.
+                roots_to_walk.push(cid.clone());
+                durable_cids.push(cid);
+            }
+        }
         for root in roots_to_walk {
             let traversal = traverse(
                 &self.registry,
@@ -667,44 +763,109 @@ where
         }
         durable_cids.sort_by_key(ToString::to_string);
         durable_cids.dedup();
+        let mut durability_required = HashMap::<Cid, usize>::new();
+        for manifest_cid in durable_cids
+            .iter()
+            .filter(|cid| cid.codec == CODEC_ERASURE_MANIFEST)
+        {
+            let payload = self
+                .data_store
+                .resolve(manifest_cid)
+                .await
+                .map_err(PublicationError::Traversal)?;
+            let manifest: ErasureManifest = serde_json::from_slice(&payload)
+                .map_err(|error| PublicationError::Traversal(error.to_string()))?;
+            manifest
+                .validate()
+                .map_err(|error| PublicationError::Traversal(error.to_string()))?;
+            for shard in manifest
+                .stripes
+                .into_iter()
+                .flat_map(|stripe| stripe.shards)
+            {
+                durability_required.insert(shard.cid, 1);
+            }
+        }
+        let mut candidate_roots = Vec::new();
         for cid in &durable_cids {
             if !lease.roots.contains(cid) {
                 lease.roots.push(cid.clone());
-                self.protection
-                    .protect(
-                        &request.namespace_id,
-                        cid,
-                        &format!("namespace-candidate:{}", lease.lease_id),
-                        Some(lease.expires_at_unix_seconds),
-                    )
-                    .await?;
+                candidate_roots.push(cid.clone());
             }
         }
+        self.protection
+            .protect_many(
+                &request.namespace_id,
+                &candidate_roots,
+                &format!("namespace-candidate:{}", lease.lease_id),
+                Some(lease.expires_at_unix_seconds),
+            )
+            .await?;
         lease.roots.sort_by_key(ToString::to_string);
         lease.roots.dedup();
         self.repository.update_staging(lease)?;
 
-        let required = initial.descriptor.durability.replicas as usize;
         let receipts = {
             let _timer = PhaseTimer::start(&DURABILITY_OBSERVATIONS, &DURABILITY_MICROS);
             let mut receipts = Vec::new();
+            let mut stored_receipts = Vec::new();
             for cid in durable_cids {
-                let receipt =
-                    if let Some(receipt) = self.repository.durable_receipt(&cid, required, now)? {
-                        receipt
-                    } else {
-                        self.durability.ensure_durable(&cid, required).await?
-                    };
-                if receipt.replicas_accepted < required || receipt.status != "durable" {
+                let cid_required = durability_required.get(&cid).copied().unwrap_or(required);
+                let supplied_receipt = request
+                    .preverified_durability
+                    .iter()
+                    .find(|receipt| receipt.cid == cid);
+                match supplied_receipt {
+                    Some(receipt)
+                        if receipt.replicas_accepted < cid_required
+                            || receipt.status != "durable" =>
+                    {
+                        DURABILITY_INVALID_PREVERIFIED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        DURABILITY_MISSING_PREVERIFIED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(_) => {}
+                }
+                let (receipt, cache_receipt) = if let Some(receipt) = request
+                    .preverified_durability
+                    .iter()
+                    .find(|receipt| {
+                        receipt.cid == cid
+                            && receipt.replicas_accepted >= cid_required
+                            && receipt.status == "durable"
+                    })
+                    .cloned()
+                {
+                    DURABILITY_PREVERIFIED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
+                    (receipt, false)
+                } else if let Some(receipt) =
+                    self.repository.durable_receipt(&cid, cid_required, now)?
+                {
+                    DURABILITY_CACHED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
+                    (receipt, false)
+                } else {
+                    DURABILITY_BACKEND_RECEIPTS.fetch_add(1, Ordering::Relaxed);
+                    (
+                        self.durability.ensure_durable(&cid, cid_required).await?,
+                        true,
+                    )
+                };
+                if receipt.replicas_accepted < cid_required || receipt.status != "durable" {
                     return Err(PublicationError::DurabilityNotMet(cid));
                 }
-                self.repository.put_durability(&StoredDurabilityReceipt {
-                    namespace_id: request.namespace_id.clone(),
-                    request_id: request.command.request_id.clone(),
-                    receipt: receipt.clone(),
-                    verified_at_unix_seconds: now,
-                })?;
+                if cache_receipt {
+                    stored_receipts.push(StoredDurabilityReceipt {
+                        namespace_id: request.namespace_id.clone(),
+                        request_id: request.command.request_id.clone(),
+                        receipt: receipt.clone(),
+                        verified_at_unix_seconds: now,
+                    });
+                }
                 receipts.push(receipt);
+            }
+            if !stored_receipts.is_empty() {
+                self.repository.put_durability_batch(&stored_receipts)?;
             }
             receipts
         };
@@ -737,22 +898,20 @@ where
         self.fault(PublicationFaultPoint::StagingRelease)?;
         lease.status = "released".to_string();
         self.repository.update_staging(lease)?;
-        for root in &lease.roots {
-            self.protection
-                .release(
-                    &lease.namespace_id,
-                    root,
-                    &format!("namespace-staging:{}", lease.lease_id),
-                )
-                .await?;
-            self.protection
-                .release(
-                    &lease.namespace_id,
-                    root,
-                    &format!("namespace-candidate:{}", lease.lease_id),
-                )
-                .await?;
-        }
+        self.protection
+            .release_many(
+                &lease.namespace_id,
+                &lease.roots,
+                &format!("namespace-staging:{}", lease.lease_id),
+            )
+            .await?;
+        self.protection
+            .release_many(
+                &lease.namespace_id,
+                &lease.roots,
+                &format!("namespace-candidate:{}", lease.lease_id),
+            )
+            .await?;
         Ok(())
     }
 
@@ -870,12 +1029,16 @@ fn command_value_cids(command: &CommandEnvelope) -> Vec<Cid> {
 
 fn response_to_apply(response: ConsensusResponse) -> Result<ApplyResult, PublicationError> {
     if let Some(message) = response.error {
-        return Err(PublicationError::Application {
-            code: response
-                .error_code
-                .unwrap_or_else(|| "invalid_namespace_command".to_string()),
-            message,
-        });
+        let code = response
+            .error_code
+            .unwrap_or_else(|| "invalid_namespace_command".to_string());
+        if matches!(
+            code.as_str(),
+            "generation_conflict" | "idempotency_conflict" | "stale_snapshot" | "no_changes"
+        ) {
+            return Err(PublicationError::Conflict(message));
+        }
+        return Err(PublicationError::Application { code, message });
     }
     response.result.ok_or_else(|| {
         PublicationError::Namespace("consensus returned no namespace result".to_string())
@@ -1245,6 +1408,7 @@ mod tests {
                     namespace_id: state.namespace_id.clone(),
                     command: command(&state, "request-1", "alpha", value.clone()),
                     uploaded_roots: vec![value.clone()],
+                    preverified_durability: Vec::new(),
                     staged_bytes: 5,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: true,
@@ -1271,6 +1435,7 @@ mod tests {
                         namespace_id: state.namespace_id.clone(),
                         command: stale,
                         uploaded_roots: vec![value.clone()],
+                        preverified_durability: Vec::new(),
                         staged_bytes: 5,
                         staging_ttl_seconds: 60,
                         retain_uploaded_on_conflict: true,
@@ -1310,6 +1475,7 @@ mod tests {
                     value.clone(),
                 ),
                 uploaded_roots: vec![value.clone()],
+                preverified_durability: Vec::new(),
                 staged_bytes: 5,
                 staging_ttl_seconds: 60,
                 retain_uploaded_on_conflict: true,

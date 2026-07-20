@@ -130,6 +130,176 @@ services:
       benchmark:
         ipv4_address: 172.30.43.13
 
+  ec1:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec1
+    ports: ["127.0.0.1:29280:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec1
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    volumes:
+      - ./config/ec1.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec1:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.21
+
+  ec2:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec2
+    ports: ["127.0.0.1:29281:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec2
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec2.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec2:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.22
+
+  ec3:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec3
+    ports: ["127.0.0.1:29282:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec3
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec3.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec3:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.23
+
+  ec4:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec4
+    ports: ["127.0.0.1:29283:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec4
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec4.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec4:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.24
+
+  ec5:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec5
+    ports: ["127.0.0.1:29284:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec5
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec5.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec5:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.25
+
+  ec6:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec6
+    ports: ["127.0.0.1:29285:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec6
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec6.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec6:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.26
+
+  ec7:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec7
+    ports: ["127.0.0.1:29286:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec7
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec7.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec7:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.27
+
+  ec8:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec8
+    ports: ["127.0.0.1:29287:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec8
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec8.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec8:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.28
+
+  ec9:
+    <<: *pepper
+    profiles: ["nine-ec"]
+    hostname: ec9
+    ports: ["127.0.0.1:29288:19080"]
+    environment:
+      <<: *environment
+      PEPPER_TEST_NODE_NAME: ec9
+    command: ["/usr/local/bin/s3-contract-node", "/etc/pepper/node.toml"]
+    depends_on:
+      ec1: {condition: service_healthy}
+    volumes:
+      - ./config/ec9.toml:/etc/pepper/node.toml:ro
+      - ${PEPPER_BENCH_ROOT}/ec9:/var/lib/pepper
+      - ${PEPPER_BENCH_ROOT}/control:/control
+    networks:
+      benchmark:
+        ipv4_address: 172.30.43.29
+
+
   fio:
     profiles: ["fio"]
     build:

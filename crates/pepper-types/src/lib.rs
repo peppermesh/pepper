@@ -141,6 +141,25 @@ impl Cid {
             && self.hash_alg == HashAlg::Blake3
             && compute_digest(self.version, self.codec, payload) == self.digest
     }
+
+    pub fn verify_segments(&self, segments: &[&[u8]]) -> bool {
+        if self.version != CID_VERSION || self.hash_alg != HashAlg::Blake3 {
+            return false;
+        }
+        let Some(size) = segments.iter().try_fold(0u64, |total, segment| {
+            total.checked_add(segment.len() as u64)
+        }) else {
+            return false;
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[self.version]);
+        hasher.update(&encode_u64_varint(self.codec.0));
+        hasher.update(&size.to_be_bytes());
+        for segment in segments {
+            hasher.update(segment);
+        }
+        *hasher.finalize().as_bytes() == self.digest
+    }
 }
 
 impl fmt::Display for Cid {
@@ -268,6 +287,7 @@ pub struct DurabilityReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectChunk {
     pub offset: u64,
     pub size: u64,
@@ -275,39 +295,53 @@ pub struct ObjectChunk {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectManifest {
-    #[serde(rename = "type")]
-    pub manifest_type: String,
-    pub version: u32,
     pub size: u64,
     pub chunk_size: u64,
     pub chunks: Vec<ObjectChunk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErasureShard {
     pub index: u16,
     pub cid: Cid,
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErasureStripeEncoding {
+    Raw,
+    Zstd,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureStripe {
+    pub offset: u64,
+    pub size: u64,
+    pub logical_cid: Cid,
+    pub encoding: ErasureStripeEncoding,
+    pub encoded_size: u64,
+    pub shard_size: u64,
+    pub shards: Vec<ErasureShard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ErasureManifest {
-    #[serde(rename = "type")]
-    pub manifest_type: String,
-    pub version: u32,
     pub size: u64,
     pub data_shards: u16,
     pub parity_shards: u16,
-    pub shard_size: u64,
-    pub shards: Vec<ErasureShard>,
+    pub stripe_size: u64,
+    pub stripes: Vec<ErasureStripe>,
 }
 
 impl ObjectManifest {
     pub fn new(size: u64, chunk_size: u64, chunks: Vec<ObjectChunk>) -> Self {
         Self {
-            manifest_type: "pepper.object_manifest".to_string(),
-            version: 1,
             size,
             chunk_size,
             chunks,
@@ -315,12 +349,6 @@ impl ObjectManifest {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.manifest_type != "pepper.object_manifest" {
-            return Err(ManifestError::InvalidType(self.manifest_type.clone()));
-        }
-        if self.version != 1 {
-            return Err(ManifestError::UnsupportedVersion(self.version));
-        }
         if self.chunk_size == 0 {
             return Err(ManifestError::InvalidChunkLayout);
         }
@@ -352,58 +380,76 @@ impl ErasureManifest {
         size: u64,
         data_shards: u16,
         parity_shards: u16,
-        shard_size: u64,
-        shards: Vec<ErasureShard>,
+        stripe_size: u64,
+        stripes: Vec<ErasureStripe>,
     ) -> Self {
         Self {
-            manifest_type: "pepper.erasure_manifest".to_string(),
-            version: 1,
             size,
             data_shards,
             parity_shards,
-            shard_size,
-            shards,
+            stripe_size,
+            stripes,
         }
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.manifest_type != "pepper.erasure_manifest" {
-            return Err(ManifestError::InvalidType(self.manifest_type.clone()));
-        }
-        if self.version != 1 {
-            return Err(ManifestError::UnsupportedVersion(self.version));
-        }
         if self.data_shards == 0
             || self.parity_shards == 0
             || self.parity_shards > self.data_shards
-            || self.shard_size == 0
+            || self.stripe_size == 0
         {
             return Err(ManifestError::InvalidErasureLayout);
         }
         let total = self.data_shards.saturating_add(self.parity_shards);
-        if total > 32 || total as usize != self.shards.len() {
+        if total > 32 || (self.size == 0) != self.stripes.is_empty() {
             return Err(ManifestError::InvalidErasureLayout);
         }
-        if self.size > self.shard_size.saturating_mul(self.data_shards as u64) {
-            return Err(ManifestError::InvalidErasureLayout);
-        }
-        let mut seen = vec![false; total as usize];
-        for shard in &self.shards {
-            if shard.index >= total || shard.size != self.shard_size || shard.cid.codec != CODEC_RAW
+        let mut expected_offset = 0u64;
+        for stripe in &self.stripes {
+            let expected_shard_size = stripe.encoded_size.div_ceil(u64::from(self.data_shards));
+            if stripe.offset != expected_offset
+                || stripe.size == 0
+                || stripe.size > self.stripe_size
+                || stripe.encoded_size == 0
+                || stripe.encoded_size > stripe.size
+                || stripe.logical_cid.codec != CODEC_RAW
+                || (stripe.encoding == ErasureStripeEncoding::Raw
+                    && stripe.encoded_size != stripe.size)
+                || (stripe.encoding == ErasureStripeEncoding::Zstd
+                    && stripe.encoded_size >= stripe.size)
+                || stripe.shard_size != expected_shard_size
+                || stripe.shards.len() != total as usize
             {
                 return Err(ManifestError::InvalidErasureLayout);
             }
-            let seen_slot = &mut seen[shard.index as usize];
-            if *seen_slot {
-                return Err(ManifestError::InvalidErasureLayout);
+            let mut seen = vec![false; total as usize];
+            for (position, shard) in stripe.shards.iter().enumerate() {
+                if shard.index >= total
+                    || shard.index as usize != position
+                    || shard.size != stripe.shard_size
+                    || shard.cid.codec != CODEC_RAW
+                {
+                    return Err(ManifestError::InvalidErasureLayout);
+                }
+                let seen_slot = &mut seen[shard.index as usize];
+                if *seen_slot {
+                    return Err(ManifestError::InvalidErasureLayout);
+                }
+                *seen_slot = true;
             }
-            *seen_slot = true;
+            expected_offset = expected_offset
+                .checked_add(stripe.size)
+                .ok_or(ManifestError::InvalidErasureLayout)?;
+        }
+        if expected_offset != self.size {
+            return Err(ManifestError::InvalidErasureLayout);
         }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DirEntry {
     pub path: String,
     pub kind: String,
@@ -413,29 +459,17 @@ pub struct DirEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DirManifest {
-    #[serde(rename = "type")]
-    pub manifest_type: String,
-    pub version: u32,
     pub entries: Vec<DirEntry>,
 }
 
 impl DirManifest {
     pub fn new(entries: Vec<DirEntry>) -> Self {
-        Self {
-            manifest_type: "pepper.dir_manifest".to_string(),
-            version: 1,
-            entries,
-        }
+        Self { entries }
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.manifest_type != "pepper.dir_manifest" {
-            return Err(ManifestError::InvalidType(self.manifest_type.clone()));
-        }
-        if self.version != 1 {
-            return Err(ManifestError::UnsupportedVersion(self.version));
-        }
         let mut previous: Option<&str> = None;
         for entry in &self.entries {
             if entry.mode & !0o777 != 0 {
@@ -484,10 +518,6 @@ impl DirManifest {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ManifestError {
-    #[error("invalid manifest type {0}")]
-    InvalidType(String),
-    #[error("unsupported manifest version {0}")]
-    UnsupportedVersion(u32),
     #[error("invalid object chunk layout")]
     InvalidChunkLayout,
     #[error("invalid erasure manifest layout")]
@@ -787,6 +817,8 @@ mod tests {
         assert_eq!(cid, parsed);
         assert!(parsed.verify(b"hello"));
         assert!(!parsed.verify(b"goodbye"));
+        assert!(parsed.verify_segments(&[b"he", b"ll", b"o"]));
+        assert!(!parsed.verify_segments(&[b"he", b"lp"]));
     }
 
     #[test]
@@ -850,6 +882,33 @@ mod tests {
     }
 
     #[test]
+    fn manifests_have_one_codec_selected_shape() {
+        let manifest = ObjectManifest::new(
+            5,
+            1024,
+            vec![ObjectChunk {
+                offset: 0,
+                size: 5,
+                cid: Cid::new(CODEC_RAW, b"hello"),
+            }],
+        );
+        let canonical = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            canonical.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["chunk_size", "chunks", "size"]
+        );
+
+        for extra in [("type", "pepper.object_manifest"), ("version", "1")] {
+            let mut old_shape = canonical.clone();
+            old_shape.as_object_mut().unwrap().insert(
+                extra.0.to_string(),
+                serde_json::Value::String(extra.1.into()),
+            );
+            assert!(serde_json::from_value::<ObjectManifest>(old_shape).is_err());
+        }
+    }
+
+    #[test]
     fn validates_erasure_manifest_layout() {
         let shards = (0..5)
             .map(|index| ErasureShard {
@@ -858,11 +917,25 @@ mod tests {
                 size: 8,
             })
             .collect::<Vec<_>>();
-        let manifest = ErasureManifest::new(24, 3, 2, 8, shards);
+        let manifest = ErasureManifest::new(
+            24,
+            3,
+            2,
+            24,
+            vec![ErasureStripe {
+                offset: 0,
+                size: 24,
+                logical_cid: Cid::new(CODEC_RAW, &[0; 24]),
+                encoding: ErasureStripeEncoding::Raw,
+                encoded_size: 24,
+                shard_size: 8,
+                shards,
+            }],
+        );
         manifest.validate().unwrap();
 
         let mut invalid = manifest.clone();
-        invalid.shards[0].index = 1;
+        invalid.stripes[0].shards[0].index = 1;
         assert_eq!(invalid.validate(), Err(ManifestError::InvalidErasureLayout));
 
         let shards = (0..5)
@@ -872,8 +945,58 @@ mod tests {
                 size: 8,
             })
             .collect();
-        let invalid = ErasureManifest::new(16, 2, 3, 8, shards);
+        let invalid = ErasureManifest::new(
+            16,
+            2,
+            3,
+            16,
+            vec![ErasureStripe {
+                offset: 0,
+                size: 16,
+                logical_cid: Cid::new(CODEC_RAW, &[0; 16]),
+                encoding: ErasureStripeEncoding::Raw,
+                encoded_size: 16,
+                shard_size: 8,
+                shards,
+            }],
+        );
         assert_eq!(invalid.validate(), Err(ManifestError::InvalidErasureLayout));
+    }
+
+    #[test]
+    fn validates_multi_gib_striped_erasure_manifest() {
+        let size = 4 * 1024 * 1024 * 1024u64;
+        let stripe_size = 24 * 1024 * 1024u64;
+        let mut offset = 0u64;
+        let mut stripes = Vec::new();
+        while offset < size {
+            let logical_size = stripe_size.min(size - offset);
+            let shard_size = logical_size.div_ceil(6);
+            let stripe_index = stripes.len();
+            let shards = (0..9)
+                .map(|index| ErasureShard {
+                    index,
+                    cid: Cid::new(
+                        CODEC_RAW,
+                        format!("stripe-{stripe_index}-shard-{index}").as_bytes(),
+                    ),
+                    size: shard_size,
+                })
+                .collect();
+            stripes.push(ErasureStripe {
+                offset,
+                size: logical_size,
+                logical_cid: Cid::new(CODEC_RAW, format!("stripe-{stripe_index}").as_bytes()),
+                encoding: ErasureStripeEncoding::Raw,
+                encoded_size: logical_size,
+                shard_size,
+                shards,
+            });
+            offset += logical_size;
+        }
+        ErasureManifest::new(size, 6, 3, stripe_size, stripes)
+            .validate()
+            .expect("a multi-GiB object is bounded by stripes, not a whole-object limit");
     }
 
     #[test]

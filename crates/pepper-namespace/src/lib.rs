@@ -555,6 +555,13 @@ pub struct NamespaceState {
 }
 
 impl NamespaceState {
+    pub fn into_head_projection(mut self) -> Self {
+        self.history.clear();
+        self.named_snapshots.clear();
+        self.idempotency.clear();
+        self
+    }
+
     pub fn idempotent_response_for(
         &self,
         envelope: &CommandEnvelope,
@@ -2129,12 +2136,23 @@ mod tests {
             KeyPrecondition::Absent,
             2,
         );
+        let projected_command = command.clone();
         let first = machine.apply(command.clone()).await.unwrap();
         let replay = machine.apply(command).await.unwrap();
         assert!(!first.replayed);
         assert!(replay.replayed);
         assert_eq!(first.response, replay.response);
         assert_eq!(machine.state().current_revision, 1);
+
+        let head = machine.state().clone().into_head_projection();
+        assert!(head.history.is_empty());
+        assert!(head.named_snapshots.is_empty());
+        assert_eq!(head.current_root_cid, machine.state().current_root_cid);
+        assert!(
+            head.idempotent_response_for(&projected_command)
+                .unwrap()
+                .is_none()
+        );
 
         let conflicting = put_command(
             machine.state(),

@@ -183,6 +183,18 @@ pub struct ErasureConfig {
     pub data_shards: u16,
     #[serde(default = "default_erasure_parity_shards")]
     pub parity_shards: u16,
+    #[serde(default)]
+    pub reconstructed_cache: ReconstructedCacheConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructedCacheConfig {
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub max_capacity_bytes: u64,
+    #[serde(default = "default_reconstructed_cache_admission_hits")]
+    pub admission_hits: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +284,11 @@ pub struct LimitsConfig {
     pub rpc_requests_per_minute: Option<u64>,
     pub erasure_repair_max_concurrent_shards: Option<usize>,
     pub erasure_repair_bytes_per_second: Option<u64>,
+    pub erasure_read_max_concurrent_stripes: Option<usize>,
+    pub s3_http_concurrency: Option<usize>,
+    pub s3_write_concurrency: Option<usize>,
+    pub s3_write_queue_depth: Option<usize>,
+    pub s3_write_queue_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -358,6 +375,7 @@ impl Default for ErasureConfig {
             min_size_bytes: default_erasure_min_size_bytes(),
             data_shards: default_erasure_data_shards(),
             parity_shards: default_erasure_parity_shards(),
+            reconstructed_cache: ReconstructedCacheConfig::default(),
         }
     }
 }
@@ -503,6 +521,10 @@ fn default_erasure_data_shards() -> u16 {
 
 fn default_erasure_parity_shards() -> u16 {
     3
+}
+
+fn default_reconstructed_cache_admission_hits() -> u8 {
+    2
 }
 
 fn default_compute_runtime() -> String {
@@ -871,6 +893,18 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
             "erasure data_shards + parity_shards must be <= 32".to_string(),
         ));
     }
+    let cache = &config.erasure.reconstructed_cache;
+    if cache.path.is_some() != (cache.max_capacity_bytes > 0) {
+        return Err(ConfigError::Invalid(
+            "erasure.reconstructed_cache path and max_capacity_bytes must be configured together"
+                .to_string(),
+        ));
+    }
+    if cache.path.is_some() && cache.admission_hits == 0 {
+        return Err(ConfigError::Invalid(
+            "erasure.reconstructed_cache.admission_hits must be greater than zero".to_string(),
+        ));
+    }
 
     if config.storage.locations.is_empty() {
         return Err(ConfigError::Invalid(
@@ -891,6 +925,35 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
                 location.path.display()
             )));
         }
+    }
+    for (name, value) in [
+        (
+            "limits.erasure_read_max_concurrent_stripes",
+            config.limits.erasure_read_max_concurrent_stripes,
+        ),
+        (
+            "limits.s3_http_concurrency",
+            config.limits.s3_http_concurrency,
+        ),
+        (
+            "limits.s3_write_concurrency",
+            config.limits.s3_write_concurrency,
+        ),
+        (
+            "limits.s3_write_queue_depth",
+            config.limits.s3_write_queue_depth,
+        ),
+    ] {
+        if value == Some(0) {
+            return Err(ConfigError::Invalid(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+    }
+    if config.limits.s3_write_queue_timeout_ms == Some(0) {
+        return Err(ConfigError::Invalid(
+            "limits.s3_write_queue_timeout_ms must be greater than zero".to_string(),
+        ));
     }
 
     let log_format = config.logging.format.as_str();
@@ -922,6 +985,9 @@ impl PepperConfig {
             fs::create_dir_all(location.path.join("tmp"))?;
             fs::create_dir_all(location.path.join("gc"))?;
             fs::create_dir_all(location.path.join("meta"))?;
+        }
+        if let Some(path) = &self.erasure.reconstructed_cache.path {
+            fs::create_dir_all(path)?;
         }
         if let Some(parent) = self.identity_key_path().parent() {
             fs::create_dir_all(parent)?;
@@ -1049,10 +1115,18 @@ mod tests {
             min_size_bytes = 1024
             data_shards = 4
             parity_shards = 2
+            [erasure.reconstructed_cache]
+            path = "/tmp/pepper-config-erasure-cache"
+            max_capacity_bytes = 4096
+            admission_hits = 2
             "#,
         )
         .unwrap();
         validate(&cfg).unwrap();
+        assert_eq!(
+            cfg.erasure.reconstructed_cache.path.as_deref(),
+            Some(Path::new("/tmp/pepper-config-erasure-cache"))
+        );
 
         let invalid: PepperConfig = toml::from_str(
             r#"
@@ -1066,6 +1140,19 @@ mod tests {
         )
         .unwrap();
         assert!(validate(&invalid).is_err());
+
+        let invalid_cache: PepperConfig = toml::from_str(
+            r#"
+            [[storage.locations]]
+            path = "/tmp/pepper-config-invalid-cache-test"
+            max_capacity_bytes = 1024
+            [erasure.reconstructed_cache]
+            path = "/tmp/pepper-config-invalid-cache"
+            admission_hits = 2
+            "#,
+        )
+        .unwrap();
+        assert!(validate(&invalid_cache).is_err());
     }
 
     #[test]

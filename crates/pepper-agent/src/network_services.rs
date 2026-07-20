@@ -4,8 +4,349 @@
 
 use super::*;
 
+const BLOCK_WRITE_BATCH_SIZE: usize = 4;
+const BLOCK_WRITE_BATCH_DELAY: Duration = Duration::from_micros(250);
+struct BlockBatchMetrics {
+    requests: AtomicU64,
+    batches: AtomicU64,
+    coalesced_batches: AtomicU64,
+    max_batch_size: AtomicU64,
+    queue_micros: AtomicU64,
+    execution_micros: AtomicU64,
+}
+
+impl BlockBatchMetrics {
+    const fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
+            coalesced_batches: AtomicU64::new(0),
+            max_batch_size: AtomicU64::new(0),
+            queue_micros: AtomicU64::new(0),
+            execution_micros: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> BlockBatchStats {
+        BlockBatchStats {
+            requests: self.requests.load(Ordering::Relaxed),
+            batches: self.batches.load(Ordering::Relaxed),
+            coalesced_batches: self.coalesced_batches.load(Ordering::Relaxed),
+            max_batch_size: self.max_batch_size.load(Ordering::Relaxed),
+            queue_micros: self.queue_micros.load(Ordering::Relaxed),
+            execution_micros: self.execution_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static NORMAL_BLOCK_BATCH_METRICS: BlockBatchMetrics = BlockBatchMetrics::new();
+static REPLICA_BLOCK_BATCH_METRICS: BlockBatchMetrics = BlockBatchMetrics::new();
+
+#[derive(Clone, Copy)]
+pub(super) struct BlockBatchStats {
+    pub(super) requests: u64,
+    pub(super) batches: u64,
+    pub(super) coalesced_batches: u64,
+    pub(super) max_batch_size: u64,
+    pub(super) queue_micros: u64,
+    pub(super) execution_micros: u64,
+}
+
+pub(super) fn block_batch_stats(replica: bool) -> BlockBatchStats {
+    if replica {
+        REPLICA_BLOCK_BATCH_METRICS.snapshot()
+    } else {
+        NORMAL_BLOCK_BATCH_METRICS.snapshot()
+    }
+}
+
+struct BlockWriteRequest {
+    codec: Codec,
+    payload: Vec<u8>,
+    verified_cid: Option<Cid>,
+    encoded_logical_size: Option<u64>,
+    enqueued_at: time::Instant,
+    response: oneshot::Sender<Result<(PutBlockResponse, Vec<u8>), String>>,
+}
+
+#[derive(Clone)]
+pub(super) struct BlockBatchWriter {
+    sender: tokio::sync::mpsc::Sender<BlockWriteRequest>,
+}
+
+impl BlockBatchWriter {
+    pub(super) fn normal(block_store: Arc<BlockStore>) -> Self {
+        Self::spawn(block_store, false)
+    }
+
+    pub(super) fn replica(block_store: Arc<BlockStore>) -> Self {
+        Self::spawn(block_store, true)
+    }
+
+    fn spawn(block_store: Arc<BlockStore>, replica: bool) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<BlockWriteRequest>(256);
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let mut requests = Vec::with_capacity(BLOCK_WRITE_BATCH_SIZE);
+                requests.push(first);
+                let deadline = time::sleep(BLOCK_WRITE_BATCH_DELAY);
+                tokio::pin!(deadline);
+                while requests.len() < BLOCK_WRITE_BATCH_SIZE {
+                    tokio::select! {
+                        request = receiver.recv() => {
+                            let Some(request) = request else {
+                                break;
+                            };
+                            requests.push(request);
+                        }
+                        _ = &mut deadline => break,
+                    }
+                }
+
+                let metrics = if replica {
+                    &REPLICA_BLOCK_BATCH_METRICS
+                } else {
+                    &NORMAL_BLOCK_BATCH_METRICS
+                };
+                metrics
+                    .requests
+                    .fetch_add(requests.len() as u64, Ordering::Relaxed);
+                metrics.batches.fetch_add(1, Ordering::Relaxed);
+                if requests.len() > 1 {
+                    metrics.coalesced_batches.fetch_add(1, Ordering::Relaxed);
+                }
+                metrics
+                    .max_batch_size
+                    .fetch_max(requests.len() as u64, Ordering::Relaxed);
+                let now = time::Instant::now();
+                let queue_micros = requests
+                    .iter()
+                    .map(|request| {
+                        now.duration_since(request.enqueued_at)
+                            .as_micros()
+                            .min(u64::MAX as u128) as u64
+                    })
+                    .sum::<u64>();
+                metrics
+                    .queue_micros
+                    .fetch_add(queue_micros, Ordering::Relaxed);
+
+                let mut responses = Vec::with_capacity(requests.len());
+                let mut blocks = Vec::with_capacity(requests.len());
+                let mut verified_cids = Vec::with_capacity(requests.len());
+                let mut encoded_logical_sizes = Vec::with_capacity(requests.len());
+                for request in requests {
+                    blocks.push((request.codec, request.payload));
+                    verified_cids.push(request.verified_cid);
+                    encoded_logical_sizes.push(request.encoded_logical_size);
+                    responses.push(request.response);
+                }
+                let store = block_store.clone();
+                let execution_started = time::Instant::now();
+                let result = tokio::task::spawn_blocking(move || {
+                    let all_encoded = encoded_logical_sizes.iter().all(Option::is_some);
+                    let any_encoded = encoded_logical_sizes.iter().any(Option::is_some);
+                    if replica && all_encoded {
+                        let wire_blocks = blocks
+                            .into_iter()
+                            .zip(verified_cids)
+                            .zip(encoded_logical_sizes)
+                            .map(|(((codec, payload), cid), logical_size)| {
+                                let cid = cid.ok_or_else(|| {
+                                    "encoded replica is missing its CID".to_string()
+                                })?;
+                                if cid.codec != codec {
+                                    return Err("encoded replica codec mismatch".to_string());
+                                }
+                                Ok((
+                                    cid,
+                                    logical_size.expect("all encoded sizes were checked"),
+                                    payload,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, String>>();
+                        let result = wire_blocks.and_then(|blocks| {
+                            store
+                                .put_replica_encoded_wire_batch(blocks)
+                                .map_err(|error| error.to_string())
+                        });
+                        let payloads = (0..result.as_ref().map_or(0, Vec::len))
+                            .map(|_| Vec::new())
+                            .collect();
+                        return (result, payloads);
+                    }
+                    if any_encoded {
+                        return (
+                            Err("cannot mix encoded and logical blocks in one batch".to_string()),
+                            Vec::new(),
+                        );
+                    }
+                    let result = if !replica {
+                        store
+                            .put_batch_with_encoded(&blocks)
+                            .map(|(puts, encoded)| {
+                                let payloads = encoded
+                                    .into_iter()
+                                    .map(pepper_storage::EncodedBlock::into_bytes)
+                                    .collect::<Vec<_>>();
+                                (puts, payloads)
+                            })
+                            .map_err(|error| error.to_string())
+                    } else if blocks.len() == 1 {
+                        let (codec, payload) = &blocks[0];
+                        let puts = if let Some(cid) = &verified_cids[0] {
+                            store
+                                .put_replica_verified(*codec, payload, cid)
+                                .map(|put| vec![put])
+                        } else {
+                            store.put_replica(*codec, payload).map(|put| vec![put])
+                        };
+                        puts.map(|puts| (puts, vec![Vec::new()]))
+                            .map_err(|error| error.to_string())
+                    } else {
+                        if let Some(cids) =
+                            verified_cids.iter().cloned().collect::<Option<Vec<_>>>()
+                        {
+                            store.put_replica_batch_verified(&blocks, &cids)
+                        } else {
+                            store.put_replica_batch(&blocks)
+                        }
+                        .map(|puts| {
+                            let payloads = (0..puts.len()).map(|_| Vec::new()).collect();
+                            (puts, payloads)
+                        })
+                        .map_err(|error| error.to_string())
+                    };
+                    match result {
+                        Ok(result) => (Ok(result.0), result.1),
+                        Err(error) => (Err(error), Vec::new()),
+                    }
+                })
+                .await;
+                metrics.execution_micros.fetch_add(
+                    execution_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                match result {
+                    Ok((Ok(puts), payloads))
+                        if puts.len() == responses.len() && payloads.len() == responses.len() =>
+                    {
+                        for ((response, put), payload) in
+                            responses.into_iter().zip(puts).zip(payloads)
+                        {
+                            let _ = response.send(Ok((put, payload)));
+                        }
+                    }
+                    Ok((Ok(_), _)) => {
+                        for response in responses {
+                            let _ =
+                                response
+                                    .send(Err("block batch result length does not match request"
+                                        .to_string()));
+                        }
+                    }
+                    Ok((Err(error), _)) => {
+                        let error = error.to_string();
+                        for response in responses {
+                            let _ = response.send(Err(error.clone()));
+                        }
+                    }
+                    Err(error) => {
+                        let error = format!("block batch worker failed: {error}");
+                        for response in responses {
+                            let _ = response.send(Err(error.clone()));
+                        }
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    pub(super) async fn put(
+        &self,
+        codec: Codec,
+        payload: Vec<u8>,
+    ) -> Result<PutBlockResponse, String> {
+        self.put_with_payload(codec, payload)
+            .await
+            .map(|(put, _)| put)
+    }
+
+    pub(super) async fn put_with_payload(
+        &self,
+        codec: Codec,
+        payload: Vec<u8>,
+    ) -> Result<(PutBlockResponse, Vec<u8>), String> {
+        self.put_with_payload_and_cid(codec, payload, None).await
+    }
+
+    pub(super) async fn put_verified(
+        &self,
+        codec: Codec,
+        payload: Vec<u8>,
+        cid: Cid,
+    ) -> Result<PutBlockResponse, String> {
+        self.put_with_payload_and_cid(codec, payload, Some(cid))
+            .await
+            .map(|(put, _)| put)
+    }
+
+    async fn put_with_payload_and_cid(
+        &self,
+        codec: Codec,
+        payload: Vec<u8>,
+        verified_cid: Option<Cid>,
+    ) -> Result<(PutBlockResponse, Vec<u8>), String> {
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .send(BlockWriteRequest {
+                codec,
+                payload,
+                verified_cid,
+                encoded_logical_size: None,
+                enqueued_at: time::Instant::now(),
+                response,
+            })
+            .await
+            .map_err(|_| "block batch writer is unavailable".to_string())?;
+        receive
+            .await
+            .map_err(|_| "block batch writer stopped before replying".to_string())?
+    }
+
+    pub(super) async fn put_encoded_verified(
+        &self,
+        codec: Codec,
+        payload: Vec<u8>,
+        cid: Cid,
+        logical_size: u64,
+    ) -> Result<PutBlockResponse, String> {
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .send(BlockWriteRequest {
+                codec,
+                payload,
+                verified_cid: Some(cid),
+                encoded_logical_size: Some(logical_size),
+                enqueued_at: time::Instant::now(),
+                response,
+            })
+            .await
+            .map_err(|_| "block batch writer is unavailable".to_string())?;
+        receive
+            .await
+            .map_err(|_| "block batch writer stopped before replying".to_string())?
+            .map(|(put, _)| put)
+    }
+}
+
 pub(super) struct AgentBlockService {
     pub(super) block_store: Arc<BlockStore>,
+    pub(super) replica_writer: BlockBatchWriter,
     pub(super) operation_lock: Arc<RwLock<()>>,
 }
 
@@ -30,7 +371,36 @@ impl NetworkBlockService for AgentBlockService {
         payload: Vec<u8>,
     ) -> Result<PutBlockResponse, NetworkError> {
         let _guard = self.operation_lock.read().await;
-        tokio::task::block_in_place(|| self.block_store.put_replica(codec, &payload))
+        self.replica_writer
+            .put(codec, payload)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+
+    async fn put_verified_replica(
+        &self,
+        codec: Codec,
+        expected_cid: &Cid,
+        payload: Vec<u8>,
+    ) -> Result<PutBlockResponse, NetworkError> {
+        let _guard = self.operation_lock.read().await;
+        self.replica_writer
+            .put_verified(codec, payload, expected_cid.clone())
+            .await
+            .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+
+    async fn put_encoded_verified_replica(
+        &self,
+        codec: Codec,
+        expected_cid: &Cid,
+        logical_size: u64,
+        payload: Vec<u8>,
+    ) -> Result<PutBlockResponse, NetworkError> {
+        let _guard = self.operation_lock.read().await;
+        self.replica_writer
+            .put_encoded_verified(codec, payload, expected_cid.clone(), logical_size)
+            .await
             .map_err(|error| NetworkError::BlockService(error.to_string()))
     }
 }
@@ -50,25 +420,22 @@ impl NetworkNamespaceAliasService for AgentNamespaceAliasService {
         _authenticated_node: &str,
         alias: String,
     ) -> Result<Option<String>, NetworkError> {
-        if alias == S3_BUCKET_CATALOG_ALIAS {
-            return local_s3_bucket_catalog_namespace(&self.state)
-                .await
-                .map(|namespace| namespace.map(|namespace| namespace.to_string()))
-                .map_err(|error| NetworkError::BlockService(error.message));
+        if alias != S3_BUCKET_CATALOG_ALIAS {
+            return Ok(None);
         }
-        local_s3_bucket_namespace(&self.state, &alias)
+        local_s3_bucket_catalog_namespace(&self.state)
             .await
             .map(|namespace| namespace.map(|namespace| namespace.to_string()))
             .map_err(|error| NetworkError::BlockService(error.message))
     }
 
     async fn list(&self, _authenticated_node: &str) -> Result<Vec<(String, String)>, NetworkError> {
-        local_s3_bucket_aliases(&self.state)
+        local_s3_bucket_catalog_namespace(&self.state)
             .await
-            .map(|aliases| {
-                aliases
+            .map(|namespace| {
+                namespace
                     .into_iter()
-                    .map(|(alias, namespace)| (alias, namespace.to_string()))
+                    .map(|namespace| (S3_BUCKET_CATALOG_ALIAS.to_string(), namespace.to_string()))
                     .collect()
             })
             .map_err(|error| NetworkError::BlockService(error.message))

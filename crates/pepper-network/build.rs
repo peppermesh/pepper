@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../proto/pepper/v1/network.proto");
     let protoc = protoc_bin_vendored::protoc_bin_path()
         .expect("failed to locate the vendored protoc binary");
     let mut config = prost_build::Config::new();

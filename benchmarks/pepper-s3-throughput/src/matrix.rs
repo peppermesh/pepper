@@ -17,12 +17,69 @@ use std::{
 const METRIC_FAMILIES: &[&str] = &[
     "pepper_namespace_commits_total",
     "pepper_namespace_commit_latency_microseconds_total",
+    "pepper_namespace_reads_total",
+    "pepper_namespace_read_latency_microseconds_total",
+    "pepper_namespace_linearizable_reads_total",
     "pepper_rpc_request_bytes_total",
     "pepper_rpc_response_bytes_total",
     "pepper_rpc_errors_total",
     "pepper_merkle_nodes_written_total",
+    "pepper_merkle_mutations_total",
+    "pepper_block_write_batch_requests_total",
+    "pepper_block_write_batches_total",
+    "pepper_block_write_coalesced_batches_total",
+    "pepper_block_write_batch_size_max",
+    "pepper_block_write_queue_microseconds_total",
+    "pepper_block_write_execution_microseconds_total",
+    "pepper_raft_storage_operations_total",
+    "pepper_raft_storage_entries_total",
+    "pepper_raft_storage_queue_microseconds_total",
+    "pepper_raft_storage_execution_microseconds_total",
+    "pepper_raft_proposal_requests_total",
+    "pepper_raft_proposal_batches_total",
+    "pepper_raft_proposal_batch_size_max",
+    "pepper_raft_proposal_queue_microseconds_total",
+    "pepper_raft_proposal_execution_microseconds_total",
     "pepper_s3_put_phase_duration_microseconds_total",
     "pepper_s3_put_phase_observations_total",
+    "pepper_namespace_durability_receipt_sources_total",
+    "pepper_namespace_durability_preverified_rejections_total",
+    "pepper_storage_block_encoding_attempts_total",
+    "pepper_storage_block_encoding_blocks_total",
+    "pepper_storage_block_encoding_bytes_total",
+    "pepper_storage_block_encoding_microseconds_total",
+    "pepper_storage_block_reads_total",
+    "pepper_storage_block_read_bytes_total",
+    "pepper_storage_inline_block_writes_total",
+    "pepper_storage_inline_block_write_bytes_total",
+    "pepper_storage_data_durability_barriers_total",
+    "pepper_storage_data_files_durable_total",
+    "pepper_storage_directory_durability_barriers_total",
+    "pepper_erasure_stripes_encoded_total",
+    "pepper_erasure_stripes_compressed_total",
+    "pepper_erasure_stripe_logical_bytes_total",
+    "pepper_erasure_stripe_encoded_bytes_total",
+    "pepper_erasure_stripe_encoding_microseconds_total",
+    "pepper_erasure_shard_read_hedges_total",
+    "pepper_erasure_shard_fetch_ewma_microseconds",
+    "pepper_erasure_read_admission_queue_microseconds_total",
+    "pepper_erasure_read_admission_observations_total",
+    "pepper_erasure_repair_throttle_microseconds_total",
+    "pepper_erasure_zero_copy_streamed_bytes_total",
+    "pepper_erasure_streamed_decompression_bytes_total",
+    "pepper_erasure_systematic_range_bytes_total",
+    "pepper_reconstructed_cache_requests_total",
+    "pepper_reconstructed_cache_admissions_total",
+    "pepper_reconstructed_cache_evictions_total",
+    "pepper_reconstructed_cache_bypasses_total",
+    "pepper_reconstructed_cache_integrity_failures_total",
+    "pepper_reconstructed_cache_bytes_total",
+    "pepper_s3_write_admission_rejections_total",
+    "pepper_s3_write_admission_queue_microseconds_total",
+    "pepper_s3_http_admission_rejections_total",
+    "pepper_s3_list_cache_hits_total",
+    "pepper_s3_list_cache_misses_total",
+    "pepper_s3_list_cache_coalesced_total",
 ];
 const PHASES: &[&str] = &[
     "request_streaming",
@@ -32,17 +89,22 @@ const PHASES: &[&str] = &[
     "merkle_update",
     "raft_namespace_publication",
 ];
+const BENCHMARK_BUCKET: &str = "pepper-s3-throughput";
 
 #[derive(Debug, Args)]
 pub struct MatrixArgs {
     #[arg(long)]
     matrix: Option<PathBuf>,
-    #[arg(long, default_value = "/var/tmp/pepper-s3-throughput")]
-    root: PathBuf,
+    /// Bulk-data root on a dedicated XFS filesystem (never the OS root filesystem).
+    #[arg(long)]
+    root: Option<PathBuf>,
     #[arg(long)]
     artifacts: Option<PathBuf>,
     #[arg(long, default_value_t = 60)]
     duration: u64,
+    /// Maximum transient S3 retries per logical benchmark operation.
+    #[arg(long, default_value_t = 8)]
+    s3_retries: u32,
     #[arg(long, default_value_t = 0)]
     cold_bytes: u64,
     #[arg(long)]
@@ -56,17 +118,34 @@ pub struct MatrixArgs {
     #[arg(long)]
     operations: Option<String>,
     #[arg(long)]
+    payload_profiles: Option<String>,
+    #[arg(long)]
     dry_run: bool,
     #[arg(long)]
     allow_short: bool,
     #[arg(long)]
     skip_fio: bool,
+    /// Reuse the existing Docker image for iterative benchmark-only changes.
+    #[arg(long)]
+    no_build: bool,
     #[arg(long, default_value_t = 60)]
     fio_runtime: u64,
     #[arg(long, default_value = "16g")]
     fio_size: String,
     #[arg(long)]
     fresh: bool,
+    /// Keep topology data and preload markers for an exact follow-up run.
+    #[arg(long)]
+    retain_data: bool,
+    /// Drop only Pepper's disposable reconstructed-stripe cache before startup.
+    #[arg(long)]
+    clear_reconstructed_cache: bool,
+    /// Restart the current namespace leader this many seconds into every non-raw cell.
+    #[arg(long)]
+    restart_leader_at_seconds: Option<u64>,
+    /// How long the selected leader remains stopped so followers must elect a replacement.
+    #[arg(long, default_value_t = 10)]
+    leader_outage_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +155,8 @@ struct Matrix {
     routing: Vec<String>,
     topologies: Vec<String>,
     operations: Vec<String>,
+    #[serde(default = "default_payload_profiles")]
+    payload_profiles: Vec<String>,
     range_bytes: u64,
     minimum_duration_seconds: u64,
     cold_dataset_memory_ratio: f64,
@@ -88,6 +169,11 @@ struct Cell {
     concurrency: usize,
     routing: String,
     operation: String,
+    payload_profile: String,
+}
+
+fn default_payload_profiles() -> Vec<String> {
+    vec!["incompressible".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -125,6 +211,21 @@ pub(crate) fn run_command(command: &mut Command) -> Result<Output> {
     Ok(output)
 }
 
+pub(crate) fn prepare_benchmark_root(root: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create benchmark root {}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve benchmark root {}", root.display()))?;
+    ensure!(root.is_dir(), "benchmark root is not a directory");
+    ensure!(
+        fs::metadata(&root)?.dev() != fs::metadata("/")?.dev(),
+        "benchmark root {} is on the OS root filesystem; select a dedicated data mount",
+        root.display()
+    );
+    Ok(root)
+}
+
 pub(crate) fn docker(root: &Path) -> Command {
     let mut command = Command::new("docker");
     command
@@ -150,6 +251,27 @@ fn filter_strings(selected: &Option<String>, all: &[String]) -> Result<Vec<Strin
         .filter(|value| wanted.contains(*value))
         .cloned()
         .collect())
+}
+
+fn payload_profiles(selected: &Option<String>, defaults: &[String]) -> Result<Vec<String>> {
+    let profiles = selected.as_ref().map_or_else(
+        || defaults.to_vec(),
+        |selected| selected.split(',').map(str::to_string).collect(),
+    );
+    for profile in &profiles {
+        ensure!(
+            matches!(
+                profile.as_str(),
+                "incompressible"
+                    | "compressible-2x"
+                    | "compressible-4x"
+                    | "compressible-10x"
+                    | "compressible-20x"
+            ),
+            "unknown payload profile: {profile}"
+        );
+    }
+    Ok(profiles)
 }
 
 fn filter_numbers<T>(selected: &Option<String>, all: &[T]) -> Result<Vec<T>>
@@ -245,6 +367,9 @@ pub(crate) fn topology_endpoints(topology: &str) -> Vec<String> {
     let ports: &[u16] = match topology {
         "single" => &[29080, 29081, 29082],
         "three" => &[29180, 29181, 29182],
+        "nine-ec" => &[
+            29280, 29281, 29282, 29283, 29284, 29285, 29286, 29287, 29288,
+        ],
         _ => &[],
     };
     ports
@@ -253,10 +378,13 @@ pub(crate) fn topology_endpoints(topology: &str) -> Vec<String> {
         .collect()
 }
 
-fn topology_services(topology: &str) -> Vec<&'static str> {
+pub(crate) fn topology_services(topology: &str) -> Vec<&'static str> {
     match topology {
         "single" => vec!["single", "single2", "single3"],
         "three" => vec!["node1", "node2", "node3"],
+        "nine-ec" => vec![
+            "ec1", "ec2", "ec3", "ec4", "ec5", "ec6", "ec7", "ec8", "ec9",
+        ],
         _ => Vec::new(),
     }
 }
@@ -315,7 +443,7 @@ pub(crate) fn metric_sum(metrics: &Metrics, name: &str) -> f64 {
     family(metrics, name).map(|(_, value)| value).sum()
 }
 
-fn unhealthy_quorum_count(scrape: &Scrape) -> usize {
+pub(crate) fn unhealthy_quorum_count(scrape: &Scrape) -> usize {
     let mut namespaces = BTreeMap::<String, f64>::new();
     for metrics in scrape.values() {
         for (key, value) in family(metrics, "pepper_namespace_quorum_healthy") {
@@ -357,10 +485,9 @@ pub(crate) async fn wait_quorum(client: &reqwest::Client, endpoints: &[String]) 
             .values()
             .map(|values| metric_sum(values, "pepper_namespace_groups_hosted"))
             .collect::<Vec<_>>();
-        let equal = hosted
-            .first()
-            .is_some_and(|first| *first > 0.0 && hosted.iter().all(|value| value == first));
-        if equal && unhealthy_quorum_count(&metrics) == 0 {
+        let required_hosts = endpoints.len().min(3);
+        let hosted_quorum = hosted.iter().filter(|value| **value > 0.0).count() >= required_hosts;
+        if hosted_quorum && unhealthy_quorum_count(&metrics) == 0 {
             stable += 1;
         } else {
             stable = 0;
@@ -380,6 +507,8 @@ pub(crate) fn stop_topology(root: &Path) {
             "single",
             "--profile",
             "three",
+            "--profile",
+            "nine-ec",
             "down",
             "--remove-orphans",
         ])
@@ -395,13 +524,21 @@ pub(crate) async fn start_topology(
         return Ok(());
     }
     let services = topology_services(topology);
-    run_command(docker(root).args(["--profile", topology, "build", services[0]]))?;
     run_command(
         docker(root)
             .args(["--profile", topology, "up", "-d"])
             .args(&services),
     )?;
     wait_ready(client, &topology_endpoints(topology)).await
+}
+
+pub(crate) fn build_topology(topology: &str, root: &Path) -> Result<()> {
+    if topology == "raw" {
+        return Ok(());
+    }
+    let services = topology_services(topology);
+    run_command(docker(root).args(["--profile", topology, "build", services[0]]))?;
+    Ok(())
 }
 
 pub(crate) fn reset_data(topology: &str, root: &Path) -> Result<()> {
@@ -414,8 +551,18 @@ pub(crate) fn reset_data(topology: &str, root: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
         return Ok(());
     }
+    reclaim_data(topology, root)
+}
+
+pub(crate) fn reclaim_data(topology: &str, root: &Path) -> Result<()> {
+    if topology == "raw" {
+        let path = root.join("raw");
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        return Ok(());
+    }
     let services = topology_services(topology);
-    run_command(docker(root).args(["--profile", topology, "build", services[0]]))?;
     for service in services {
         run_command(docker(root).args([
             "--profile",
@@ -430,6 +577,29 @@ pub(crate) fn reset_data(topology: &str, root: &Path) -> Result<()> {
             service,
             "-c",
             "find /var/lib/pepper -mindepth 1 -delete",
+        ]))?;
+    }
+    Ok(())
+}
+
+fn clear_reconstructed_cache(topology: &str, root: &Path) -> Result<()> {
+    if topology == "raw" {
+        return Ok(());
+    }
+    for service in topology_services(topology) {
+        run_command(docker(root).args([
+            "--profile",
+            topology,
+            "run",
+            "--rm",
+            "--no-deps",
+            "--user",
+            "0",
+            "--entrypoint",
+            "/bin/sh",
+            service,
+            "-c",
+            "if [ -d /var/lib/pepper/reconstructed-cache ]; then find /var/lib/pepper/reconstructed-cache -mindepth 1 -delete; fi",
         ]))?;
     }
     Ok(())
@@ -474,18 +644,9 @@ pub(crate) async fn routed_endpoints(
         return Vec::new();
     }
     let (metrics, _) = scrape(client, endpoints).await;
-    let leader = metrics
-        .values()
-        .enumerate()
-        .max_by_key(|(_, values)| {
-            values
-                .keys()
-                .filter(|key| {
-                    key.starts_with("pepper_namespace_role{") && key.contains("role=\"leader\"")
-                })
-                .count()
-        })
-        .map_or(0, |(index, _)| index);
+    let leader = bucket_leader_index(client, endpoints)
+        .await
+        .unwrap_or_else(|| namespace_leader_index(&metrics));
     match routing {
         "leader" => vec![endpoints[leader].clone()],
         "follower" => endpoints
@@ -496,6 +657,46 @@ pub(crate) async fn routed_endpoints(
             .collect(),
         _ => endpoints.to_vec(),
     }
+}
+
+async fn bucket_leader_index(client: &reqwest::Client, endpoints: &[String]) -> Option<usize> {
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let Ok(response) = client
+            .get(format!(
+                "{endpoint}/v1/namespaces/{BENCHMARK_BUCKET}/status"
+            ))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(status) = response.json::<Value>().await else {
+            continue;
+        };
+        if status["state"].as_str() == Some("Leader") {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn namespace_leader_index(metrics: &Scrape) -> usize {
+    metrics
+        .values()
+        .enumerate()
+        .max_by_key(|(_, values)| {
+            values
+                .keys()
+                .filter(|key| {
+                    key.starts_with("pepper_namespace_role{") && key.contains("role=\"leader\"")
+                })
+                .count()
+        })
+        .map_or(0, |(index, _)| index)
 }
 
 pub(crate) fn container_pids(topology: &str, root: &Path) -> Result<Vec<u32>> {
@@ -636,16 +837,45 @@ pub(crate) fn disk_delta(
 fn aggregate_metrics(before: &Scrape, after: &Scrape) -> BTreeMap<String, f64> {
     let mut result = BTreeMap::new();
     for name in METRIC_FAMILIES {
+        if matches!(
+            *name,
+            "pepper_block_write_batch_size_max" | "pepper_raft_proposal_batch_size_max"
+        ) {
+            let value = after
+                .values()
+                .map(|values| {
+                    family(values, name)
+                        .map(|(_, value)| *value)
+                        .fold(0.0, f64::max)
+                })
+                .fold(0.0, f64::max);
+            result.insert((*name).to_string(), value);
+            continue;
+        }
         let start: f64 = before.values().map(|values| metric_sum(values, name)).sum();
         let end: f64 = after.values().map(|values| metric_sum(values, name)).sum();
         result.insert((*name).to_string(), (end - start).max(0.0));
     }
-    for name in &METRIC_FAMILIES[6..] {
+    // Retain labelled deltas for every family. In particular, an aggregate RPC
+    // error count without method and direction hides whether the data path,
+    // linearizable-read proof, or discovery fallback is churning.
+    for name in METRIC_FAMILIES {
         let keys = after
             .values()
             .flat_map(|values| family(values, name).map(|(key, _)| key.clone()))
             .collect::<BTreeSet<_>>();
         for key in keys {
+            if matches!(
+                *name,
+                "pepper_block_write_batch_size_max" | "pepper_raft_proposal_batch_size_max"
+            ) {
+                let value = after
+                    .values()
+                    .filter_map(|values| values.get(&key).copied())
+                    .fold(0.0, f64::max);
+                result.insert(key, value);
+                continue;
+            }
             let start: f64 = before
                 .values()
                 .map(|values| values.get(&key).copied().unwrap_or(0.0))
@@ -755,11 +985,22 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
         "duration must be at least {} seconds",
         matrix.minimum_duration_seconds
     );
+    if let Some(at) = args.restart_leader_at_seconds {
+        ensure!(
+            at > 0 && at < args.duration,
+            "leader restart must occur within the cell duration"
+        );
+        ensure!(
+            args.leader_outage_seconds > 0,
+            "leader outage must be greater than zero"
+        );
+    }
     let sizes = filter_numbers(&args.sizes, &matrix.object_sizes)?;
     let concurrencies = filter_numbers(&args.concurrency, &matrix.concurrency)?;
     let routings = filter_strings(&args.routing, &matrix.routing)?;
     let topologies = filter_strings(&args.topologies, &matrix.topologies)?;
     let operations = filter_strings(&args.operations, &matrix.operations)?;
+    let payload_profiles = payload_profiles(&args.payload_profiles, &matrix.payload_profiles)?;
     let cold_bytes = if args.cold_bytes == 0 {
         (mem_total()? as f64 * matrix.cold_dataset_memory_ratio) as u64
     } else {
@@ -771,14 +1012,17 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             for concurrency in &concurrencies {
                 for routing in &routings {
                     for operation in &operations {
-                        if topology != "raw" || routing == "leader" {
-                            cells.push(Cell {
-                                topology: topology.clone(),
-                                size: *size,
-                                concurrency: *concurrency,
-                                routing: routing.clone(),
-                                operation: operation.clone(),
-                            });
+                        for payload_profile in &payload_profiles {
+                            if topology != "raw" || routing == "leader" {
+                                cells.push(Cell {
+                                    topology: topology.clone(),
+                                    size: *size,
+                                    concurrency: *concurrency,
+                                    routing: routing.clone(),
+                                    operation: operation.clone(),
+                                    payload_profile: payload_profile.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -793,12 +1037,16 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
         );
         return Ok(());
     }
-    fs::create_dir_all(&args.root)?;
-    ensure!(args.root.is_dir(), "benchmark root is not a directory");
+    let requested_root = args
+        .root
+        .as_deref()
+        .context("--root is required for a benchmark run; select a dedicated XFS data mount")?;
+    let root = prepare_benchmark_root(requested_root)?;
     for name in [
-        "single", "single2", "single3", "node1", "node2", "node3", "control", "raw", "fio",
+        "single", "single2", "single3", "node1", "node2", "node3", "ec1", "ec2", "ec3", "ec4",
+        "ec5", "ec6", "ec7", "ec8", "ec9", "control", "raw", "fio",
     ] {
-        let path = args.root.join(name);
+        let path = root.join(name);
         fs::create_dir_all(&path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
     }
@@ -806,7 +1054,7 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
         run_command(
             Command::new("findmnt")
                 .args(["-n", "-o", "FSTYPE", "-T"])
-                .arg(&args.root),
+                .arg(&root),
         )?
         .stdout,
     )?
@@ -822,9 +1070,9 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     let artifacts = args
         .artifacts
         .clone()
-        .unwrap_or_else(|| args.root.join("artifacts").join(stamp));
+        .unwrap_or_else(|| root.join("artifacts").join(stamp));
     fs::create_dir_all(artifacts.join("cells"))?;
-    let prepared_root = args.root.join(".prepared");
+    let prepared_root = root.join(".prepared");
     fs::create_dir_all(&prepared_root)?;
     let diff = Command::new("git")
         .args(["diff", "--binary"])
@@ -837,14 +1085,17 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     .trim()
     .to_string();
     let manifest = json!({"schema_version": 1, "started_at": time::OffsetDateTime::now_utc().to_string(),
-        "root": args.root.canonicalize()?, "filesystem": fs_type, "cold_bytes": cold_bytes,
+        "root": root, "filesystem": fs_type, "cold_bytes": cold_bytes,
         "duration_seconds": args.duration, "cell_count": cells.len(), "git_commit": git_output(&["rev-parse", "HEAD"]),
+        "s3_retries": args.s3_retries,
         "git_diff_sha256": hex::encode(Sha256::digest(diff)), "benchmark_source_sha256": sha256_tree(&here())?,
         "host": {"kernel": program_output("uname", &["-r"]), "cpu_model": cpu_model(),
             "logical_cpus": std::thread::available_parallelism().map(usize::from).unwrap_or(1), "memory_bytes": mem_total()?,
             "rust": program_output("rustc", &["--version"]), "docker": docker_version},
+        "restart_leader_at_seconds": args.restart_leader_at_seconds,
+        "leader_outage_seconds": args.leader_outage_seconds,
         "matrix": {"object_sizes": sizes, "concurrency": concurrencies, "routing": routings,
-            "topologies": topologies, "operations": operations}});
+            "topologies": topologies, "operations": operations, "payload_profiles": payload_profiles}});
     fs::write(
         artifacts.join("manifest.json"),
         serde_json::to_string_pretty(&manifest)? + "\n",
@@ -852,7 +1103,7 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     let fio = if args.skip_fio {
         BTreeMap::new()
     } else {
-        fio_baselines(&args.root, &artifacts, args.fio_runtime, &args.fio_size)?
+        fio_baselines(&root, &artifacts, args.fio_runtime, &args.fio_size)?
     };
     fs::write(
         artifacts.join("fio-summary.json"),
@@ -865,37 +1116,43 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     let result = async {
         for (cell_index, cell) in cells.iter().enumerate() {
             if cell.topology != current {
-                stop_topology(&args.root);
+                stop_topology(&root);
+                if !args.no_build {
+                    build_topology(&cell.topology, &root)?;
+                }
                 if args.fresh {
-                    reset_data(&cell.topology, &args.root)?;
+                    reset_data(&cell.topology, &root)?;
                     for entry in fs::read_dir(&prepared_root)? {
                         let path = entry?.path();
                         if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&format!("{}-", cell.topology))) { fs::remove_file(path)?; }
                     }
+                } else if args.clear_reconstructed_cache {
+                    clear_reconstructed_cache(&cell.topology, &root)?;
                 }
-                start_topology(&client, &cell.topology, &args.root).await?;
+                start_topology(&client, &cell.topology, &root).await?;
                 current.clone_from(&cell.topology);
                 if cell.topology != "raw" {
                     let endpoints = topology_endpoints(&cell.topology); ensure_bucket(&endpoints)?; wait_quorum(&client, &endpoints).await?;
                 }
             }
-            let cell_id = format!("{}-s{}-c{}-{}-{}", cell.topology, cell.size, cell.concurrency, cell.routing, cell.operation);
+            let cell_id = format!("{}-s{}-c{}-{}-{}-{}", cell.topology, cell.size, cell.concurrency, cell.routing, cell.operation, cell.payload_profile);
             let output = artifacts.join("cells").join(format!("{cell_id}.json"));
             if output.exists() { println!("[{}/{}] resume: {cell_id}", cell_index + 1, cells.len()); continue; }
             let object_count = max_concurrency.max(cold_bytes.div_ceil(cell.size));
             let needs_data = matches!(cell.operation.as_str(), "get" | "range-get" | "head" | "list" | "mixed");
-            let marker = prepared_root.join(format!("{}-{}-{object_count}", cell.topology, cell.size));
-            if marker.exists() { prepared.insert((cell.topology.clone(), cell.size)); }
-            if needs_data && !prepared.contains(&(cell.topology.clone(), cell.size)) {
+            let marker = prepared_root.join(format!("{}-{}-{}-{object_count}", cell.topology, cell.size, cell.payload_profile));
+            if marker.exists() { prepared.insert((cell.topology.clone(), cell.size, cell.payload_profile.clone())); }
+            if needs_data && !prepared.contains(&(cell.topology.clone(), cell.size, cell.payload_profile.clone())) {
                 println!("[{}/{}] preload {} size={} objects={object_count}", cell_index + 1, cells.len(), cell.topology, cell.size);
                 let mut command = loadgen_command()?;
                 command.args(["--backend", if cell.topology == "raw" { "raw" } else { "s3" }, "--operation", "put",
                     "--size", &cell.size.to_string(), "--concurrency", &cell.concurrency.min(32).to_string(), "--duration", "1",
                     "--allow-short", "--object-count", &object_count.to_string(), "--prepare", "--prepare-only", "--quiet"]);
-                if cell.topology == "raw" { command.args(["--raw-root"]).arg(args.root.join("raw")); }
+                command.args(["--payload-profile", &cell.payload_profile]);
+                if cell.topology == "raw" { command.args(["--raw-root"]).arg(root.join("raw")); }
                 else { command.args(["--endpoints", &topology_endpoints(&cell.topology).join(",")]); }
                 run_command(&mut command)?;
-                prepared.insert((cell.topology.clone(), cell.size));
+                prepared.insert((cell.topology.clone(), cell.size, cell.payload_profile.clone()));
                 fs::write(marker, serde_json::to_vec(&json!({"topology": cell.topology, "size": cell.size, "objects": object_count}))?)?;
             }
             let endpoints = routed_endpoints(&client, &cell.topology, &cell.routing, &topology_endpoints(&cell.topology)).await;
@@ -904,16 +1161,17 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             let mut command = loadgen_command()?;
             command.args(["--backend", if cell.topology == "raw" { "raw" } else { "s3" }, "--operation", &cell.operation,
                 "--size", &cell.size.to_string(), "--concurrency", &cell.concurrency.to_string(), "--duration", &args.duration.to_string(),
-                "--object-count", &object_count.to_string(), "--range-bytes", &matrix.range_bytes.to_string(), "--output"])
+                "--object-count", &object_count.to_string(), "--range-bytes", &matrix.range_bytes.to_string(), "--retries", &args.s3_retries.to_string(), "--output"])
                 .arg(&loadgen_output).arg("--quiet");
+            command.args(["--payload-profile", &cell.payload_profile]);
             if args.allow_short { command.arg("--allow-short"); }
-            if cell.topology == "raw" { command.arg("--raw-root").arg(args.root.join("raw")); }
+            if cell.topology == "raw" { command.arg("--raw-root").arg(root.join("raw")); }
             else { command.args(["--endpoints", &endpoints.join(",")]); }
             command.stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
-            let pids = container_pids(&cell.topology, &args.root)?;
+            let pids = container_pids(&cell.topology, &root)?;
             let metrics_endpoints = topology_endpoints(&cell.topology);
             let (metrics_before, raw_before) = scrape(&client, &metrics_endpoints).await;
-            let disk_before = block_stats(&args.root)?;
+            let disk_before = block_stats(&root)?;
             let cpu_before = host_cpu()?; let ticks_before = proc_ticks(&pids);
             println!("[{}/{}] run {cell_id}", cell_index + 1, cells.len());
             let started = Instant::now();
@@ -921,22 +1179,46 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             let mut samples = Vec::new();
             let mut previous_terms = BTreeMap::new();
             let mut term_changes = 0;
+            let mut fault_event = None;
             loop {
                 if let Some(status) = child.try_wait()? {
                     ensure!(status.success(), "load generator failed for {cell_id}; see {}", output.with_extension("log").display());
                     break;
                 }
                 let (metrics, _) = scrape(&client, &metrics_endpoints).await;
+                if fault_event.is_none()
+                    && args.restart_leader_at_seconds.is_some_and(|at| {
+                        started.elapsed() >= Duration::from_secs(at)
+                    })
+                    && cell.topology != "raw"
+                {
+                    let leader = bucket_leader_index(&client, &metrics_endpoints)
+                        .await
+                        .unwrap_or_else(|| namespace_leader_index(&metrics));
+                    let services = topology_services(&cell.topology);
+                    let service = services.get(leader).context("leader service is missing")?;
+                    let stopped_at = started.elapsed().as_secs_f64();
+                    run_command(docker(&root).args(["stop", "-t", "1", service]))?;
+                    tokio::time::sleep(Duration::from_secs(args.leader_outage_seconds)).await;
+                    run_command(docker(&root).args(["start", service]))?;
+                    fault_event = Some(json!({
+                        "kind": "leader_failover",
+                        "service": service,
+                        "stopped_at_seconds": stopped_at,
+                        "restarted_at_seconds": started.elapsed().as_secs_f64(),
+                        "outage_seconds": args.leader_outage_seconds,
+                    }));
+                }
                 let terms = metrics.iter().flat_map(|(endpoint, values)| family(values, "pepper_namespace_term").map(move |(key, value)| (format!("{endpoint}{key}"), *value))).collect::<BTreeMap<_, _>>();
                 term_changes += terms.iter().filter(|(key, value)| previous_terms.get(*key).is_some_and(|old| old != *value)).count() as u64;
                 previous_terms = terms;
                 let max_log_lag = metrics.values().flat_map(|values| family(values, "pepper_namespace_log_lag").map(|(_, value)| *value)).fold(0.0, f64::max);
-                samples.push(Sample { time: unix_time(), process_ticks: proc_ticks(&pids), disk: block_stats(&args.root).unwrap_or_default(),
+                samples.push(Sample { time: unix_time(), process_ticks: proc_ticks(&pids), disk: block_stats(&root).unwrap_or_default(),
                     term_changes, max_log_lag, quorum_unhealthy: unhealthy_quorum_count(&metrics) });
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             let elapsed = started.elapsed().as_secs_f64();
-            let cpu_after = host_cpu()?; let ticks_after = proc_ticks(&pids); let disk_after = block_stats(&args.root)?;
+            let cpu_after = host_cpu()?; let ticks_after = proc_ticks(&pids); let disk_after = block_stats(&root)?;
             let (metrics_after, raw_after) = scrape(&client, &metrics_endpoints).await;
             let mut report: Value = serde_json::from_slice(&fs::read(&loadgen_output)?)?;
             let logical = report["results"]["logical_bytes"].as_u64().unwrap_or(0);
@@ -962,6 +1244,7 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
                 "raft_term_increments": raft_term_increments(&metrics_before, &metrics_after),
                 "max_log_lag": samples.iter().map(|sample| sample.max_log_lag).fold(0.0, f64::max),
                 "quorum_unhealthy_samples": samples.iter().map(|sample| sample.quorum_unhealthy).sum::<usize>(),
+                "fault_event": fault_event,
                 "metrics_delta": metrics_delta, "put_phase_average_microseconds": phase_averages,
                 "raft_commit_latency_microseconds_avg": phase_averages.get("raft_namespace_publication")});
             report["efficiency"] = json!({"fio_queue_depth": qd, "durability_fio_bytes_per_second": fio_rate,
@@ -970,10 +1253,31 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             fs::write(output.with_extension("metrics-before.prom"), raw_before.values().cloned().collect::<Vec<_>>().join("\n"))?;
             fs::write(output.with_extension("metrics-after.prom"), raw_after.values().cloned().collect::<Vec<_>>().join("\n"))?;
             fs::write(output.with_extension("samples.json"), serde_json::to_string_pretty(&samples)? + "\n")?;
+            if cell.topology != "raw" {
+                let mut logs = docker(&root);
+                logs.args(["logs", "--no-color"]);
+                for service in topology_services(&cell.topology) {
+                    logs.arg(service);
+                }
+                let logs = run_command(&mut logs)?;
+                let mut combined = logs.stdout;
+                combined.extend_from_slice(&logs.stderr);
+                fs::write(output.with_extension("cluster.log"), combined)?;
+            }
             fs::remove_file(loadgen_output)?;
         }
         Ok(())
     }.await;
-    stop_topology(&args.root);
+    stop_topology(&root);
+    if result.is_ok() && !args.retain_data {
+        for topology in &topologies {
+            reclaim_data(topology, &root).with_context(|| {
+                format!("failed to reclaim {topology} benchmark data after a successful run")
+            })?;
+        }
+        if prepared_root.exists() {
+            fs::remove_dir_all(&prepared_root)?;
+        }
+    }
     result
 }
