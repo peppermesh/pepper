@@ -395,7 +395,7 @@ pub(super) async fn bootstrap_namespace_group(
                 .map_err(ApiError::network)?;
         }
     }
-    let initializer = &replicas[0];
+    let initializer = descriptor_initializer(&created.state.descriptor, &replicas)?;
     if initializer == &state.status.node_id {
         manager
             .initialize(
@@ -437,6 +437,21 @@ pub(super) async fn bootstrap_namespace_group(
     Ok(created)
 }
 
+fn descriptor_initializer<'a>(
+    descriptor: &NamespaceDescriptor,
+    replicas: &'a [String],
+) -> Result<&'a String, ApiError> {
+    if let Some(preferred) = descriptor.placement_constraints.get("initial_leader") {
+        return replicas
+            .iter()
+            .find(|replica| *replica == preferred)
+            .ok_or_else(|| {
+                ApiError::internal("namespace initial_leader is not an initial replica")
+            });
+    }
+    Ok(&replicas[0])
+}
+
 pub(super) async fn namespace_create(
     State(state): State<AppState>,
     Json(request): Json<CreateNamespaceRequest>,
@@ -470,6 +485,34 @@ pub(super) async fn namespace_create(
         "00",
         unix_seconds(),
     );
+    // S3 data partitions keep three Raft replicas for ordered metadata while
+    // applying the deployment's configured durability to referenced object
+    // blocks. This is what makes the benchmark's RF=1 topology distinct from
+    // RF=3 without weakening namespace consensus itself.
+    if request
+        .request_id
+        .as_deref()
+        .is_some_and(|request_id| request_id.starts_with("s3p-"))
+    {
+        descriptor.durability.replicas = u16::try_from(state.replication_factor)
+            .map_err(|_| ApiError::internal("replication factor exceeds namespace bounds"))?;
+    }
+    if let Some(request_id) = &request.request_id {
+        descriptor
+            .placement_constraints
+            .insert("creation_id".to_string(), request_id.clone());
+        if request_id.starts_with("s3p-") {
+            let digest = Cid::new(CODEC_RAW, request_id.as_bytes()).digest;
+            let leader = replicas[usize::from(digest[0]) % replicas.len()].clone();
+            descriptor.placement_constraints.insert(
+                "application".to_string(),
+                "s3_bucket_partition_v1".to_string(),
+            );
+            descriptor
+                .placement_constraints
+                .insert("initial_leader".to_string(), leader);
+        }
+    }
     if let Some(keep_last) = request.retention_keep_last {
         descriptor.retention.keep_last = keep_last;
     }
@@ -636,6 +679,35 @@ pub(super) async fn apply_command(
     staged_bytes: u64,
     retain_uploaded_on_conflict: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    apply_command_with_metadata_only(
+        state,
+        namespace_id,
+        command,
+        CommandPublicationInputs {
+            uploaded_roots,
+            preverified_durability,
+            metadata_only_cids: Vec::new(),
+            staged_bytes,
+            retain_uploaded_on_conflict,
+        },
+    )
+    .await
+}
+
+pub(super) struct CommandPublicationInputs {
+    pub(super) uploaded_roots: Vec<Cid>,
+    pub(super) preverified_durability: Vec<DurabilityReceipt>,
+    pub(super) metadata_only_cids: Vec<Cid>,
+    pub(super) staged_bytes: u64,
+    pub(super) retain_uploaded_on_conflict: bool,
+}
+
+pub(super) async fn apply_command_with_metadata_only(
+    state: &AppState,
+    namespace_id: NamespaceId,
+    command: CommandEnvelope,
+    publication: CommandPublicationInputs,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let current = namespace_manager(state)?
         .linearizable_namespace_state(&namespace_id)
         .await
@@ -672,11 +744,12 @@ pub(super) async fn apply_command(
             PublicationRequest {
                 namespace_id: namespace_id.clone(),
                 command,
-                uploaded_roots,
-                preverified_durability,
-                staged_bytes,
+                uploaded_roots: publication.uploaded_roots,
+                preverified_durability: publication.preverified_durability,
+                metadata_only_cids: publication.metadata_only_cids,
+                staged_bytes: publication.staged_bytes,
                 staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
-                retain_uploaded_on_conflict,
+                retain_uploaded_on_conflict: publication.retain_uploaded_on_conflict,
             },
             unix_seconds(),
         )
@@ -1270,7 +1343,7 @@ pub(super) async fn admin_namespace_replace(
             .await
             .map_err(namespace_error)?;
     AgentDurabilityBackend(state.clone())
-        .ensure_durable(&checkpoint, 3)
+        .ensure_durable(&checkpoint, 3, None)
         .await
         .map_err(publication_error)?;
     let target = state
@@ -1332,7 +1405,7 @@ pub(super) async fn admin_namespace_recover(
         ));
     }
     AgentDurabilityBackend(state.clone())
-        .ensure_durable(&request.checkpoint_cid, 3)
+        .ensure_durable(&request.checkpoint_cid, 3, None)
         .await
         .map_err(publication_error)?;
     let manager = namespace_manager(&state)?;

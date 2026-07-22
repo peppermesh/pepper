@@ -123,9 +123,8 @@ impl From<StorageError> for ApiError {
             | StorageError::Serde(_)
             | StorageError::BatchResultMissing
             | StorageError::PreverifiedCidMismatch(_)
-            | StorageError::Compression(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
-            }
+            | StorageError::Compression(_)
+            | StorageError::Native(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
         };
         Self::new(status, code, error.to_string())
     }
@@ -134,7 +133,23 @@ impl From<StorageError> for ApiError {
 impl From<NetworkError> for ApiError {
     fn from(error: NetworkError) -> Self {
         let (status, code) = match error {
-            NetworkError::Rpc { .. } | NetworkError::BlockService(_) => {
+            NetworkError::BulkAddressUnavailable(_)
+            | NetworkError::Connection(_)
+            | NetworkError::Connect(_)
+            | NetworkError::Write(_)
+            | NetworkError::ClosedStream(_)
+            | NetworkError::Read(_)
+            | NetworkError::ReadExact(_)
+            | NetworkError::TransportTask(_)
+            | NetworkError::DeadlineExceeded => {
+                (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable)
+            }
+            NetworkError::RateLimited => (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::RateLimited),
+            NetworkError::Rpc { .. }
+            | NetworkError::BlockService(_)
+            | NetworkError::ProstDecode(_)
+            | NetworkError::ProstEncode(_)
+            | NetworkError::Unauthenticated => {
                 (StatusCode::BAD_GATEWAY, ErrorCode::UpstreamFailure)
             }
             NetworkError::InvalidPeerAddress { .. } | NetworkError::InvalidDescriptor(_) => {
@@ -154,5 +169,25 @@ impl IntoResponse for ApiError {
             error: self.message,
         };
         (self.status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_and_overloaded_peers_are_retryable() {
+        let deadline = ApiError::from(NetworkError::DeadlineExceeded);
+        assert_eq!(deadline.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(deadline.code, ErrorCode::Unavailable);
+
+        let limited = ApiError::from(NetworkError::RateLimited);
+        assert_eq!(limited.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(limited.code, ErrorCode::RateLimited);
+
+        let upstream = ApiError::from(NetworkError::BlockService("failed".to_string()));
+        assert_eq!(upstream.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.code, ErrorCode::UpstreamFailure);
     }
 }

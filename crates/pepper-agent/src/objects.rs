@@ -48,13 +48,34 @@ pub(super) async fn get_object(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> Result<Response, ApiError> {
-    let guard = Arc::new(state.operation_lock.clone().read_owned().await);
+    let guard = Some(Arc::new(state.operation_lock.clone().read_owned().await));
     let cid = BlockStore::parse_cid(&cid)?;
-    if cid.codec != CODEC_OBJECT_MANIFEST && cid.codec != CODEC_ERASURE_MANIFEST {
+    if !matches!(
+        cid.codec,
+        CODEC_SMALL_OBJECT | CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST
+    ) {
         return Err(ApiError::bad_request("CID is not an object manifest"));
     }
-    let body = if cid.codec == CODEC_ERASURE_MANIFEST {
-        let manifest_block = get_block_resolved(&state, &cid).await?;
+    get_object_at_placement(state, cid, None, guard).await
+}
+
+pub(super) async fn get_object_at_placement(
+    state: AppState,
+    cid: Cid,
+    placement: Option<PlacementReference>,
+    guard: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+) -> Result<Response, ApiError> {
+    let body = if cid.codec == CODEC_SMALL_OBJECT {
+        let block = match placement.as_ref() {
+            Some(placement) => get_block_at_placement(&state, &cid, placement).await?,
+            None => get_block_resolved(&state, &cid).await?,
+        };
+        Body::from(block.payload)
+    } else if cid.codec == CODEC_ERASURE_MANIFEST {
+        let manifest_block = match placement.as_ref() {
+            Some(placement) => get_block_at_placement(&state, &cid, placement).await?,
+            None => get_block_resolved(&state, &cid).await?,
+        };
         let manifest: ErasureManifest =
             serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
         validate_erasure_resource_limits(&state, &manifest)?;
@@ -97,7 +118,10 @@ pub(super) async fn get_object(
         let first_stream = stream::iter(first_frames.into_iter().map(Ok::<Bytes, std::io::Error>));
         Body::from_stream(first_stream.chain(remaining_stream))
     } else {
-        let manifest_block = get_block_resolved(&state, &cid).await?;
+        let manifest_block = match placement.as_ref() {
+            Some(placement) => get_block_at_placement(&state, &cid, placement).await?,
+            None => get_block_resolved(&state, &cid).await?,
+        };
         let manifest: ObjectManifest =
             serde_json::from_slice(&manifest_block.payload).map_err(ApiError::serde)?;
         validate_object_resource_limits(&state, &manifest)?;
@@ -106,13 +130,29 @@ pub(super) async fn get_object(
                 "object manifest contains too many chunks",
             ));
         }
-        let chunks = manifest.chunks;
-        let body_stream = stream::iter(chunks.into_iter().map(move |chunk| {
+        let mut chunks = manifest.chunks.into_iter();
+        let Some(first_chunk) = chunks.next() else {
+            return Ok((
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                Body::empty(),
+            )
+                .into_response());
+        };
+        let first_block =
+            get_block_at_placement(&state, &first_chunk.cid, &first_chunk.placement).await?;
+        if first_block.payload.len() as u64 != first_chunk.size {
+            return Err(ApiError::internal("object chunk size mismatch"));
+        }
+        let first_stream =
+            stream::once(
+                async move { Ok::<Bytes, std::io::Error>(Bytes::from(first_block.payload)) },
+            );
+        let body_stream = stream::iter(chunks.map(move |chunk| {
             let state = state.clone();
             let guard = guard.clone();
             async move {
                 let _guard = guard;
-                let block = get_block_resolved(&state, &chunk.cid)
+                let block = get_block_at_placement(&state, &chunk.cid, &chunk.placement)
                     .await
                     .map_err(|error| std::io::Error::other(error.message))?;
                 if block.payload.len() as u64 != chunk.size {
@@ -122,7 +162,7 @@ pub(super) async fn get_object(
             }
         }))
         .buffered(16);
-        Body::from_stream(body_stream)
+        Body::from_stream(first_stream.chain(body_stream))
     };
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
@@ -253,7 +293,7 @@ pub(super) async fn fetch_object_chunks_parallel(
     let mut fetches = stream::iter(chunks.into_iter().map(|chunk| {
         let state = state.clone();
         async move {
-            let block = get_block_resolved(&state, &chunk.cid).await?;
+            let block = get_block_at_placement(&state, &chunk.cid, &chunk.placement).await?;
             if block.payload.len() as u64 != chunk.size {
                 return Err(ApiError::bad_request("object chunk size mismatch"));
             }

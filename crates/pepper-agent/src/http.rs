@@ -76,6 +76,24 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/admin/repair", post(run_repair))
         .route("/v1/admin/status", get(admin_status))
         .route("/v1/admin/storage", get(admin_storage))
+        .route("/v1/admin/placement", get(admin_placement_status))
+        .route("/v1/admin/placement/maps", post(admin_placement_map_update))
+        .route(
+            "/v1/admin/s3/buckets/{bucket}/partitions",
+            get(admin_bucket_partitions).post(admin_bucket_partition_change),
+        )
+        .route(
+            "/v1/admin/s3/buckets/{bucket}/pack",
+            post(admin_small_object_pack),
+        )
+        .route(
+            "/v1/admin/placement/exceptions",
+            post(admin_placement_exception_put),
+        )
+        .route(
+            "/v1/admin/placement/exceptions/delete",
+            post(admin_placement_exception_delete),
+        )
         .route(
             "/v1/admin/diagnostics/blocks",
             get(diagnostics::block_inventory),

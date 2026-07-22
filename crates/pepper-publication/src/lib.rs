@@ -15,7 +15,9 @@ use pepper_metadata::{
 use pepper_namespace::{
     ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation, PinAction,
 };
-use pepper_types::{CODEC_ERASURE_MANIFEST, Cid, DurabilityReceipt, ErasureManifest};
+use pepper_types::{
+    CODEC_ERASURE_MANIFEST, Cid, DurabilityReceipt, ErasureManifest, PlacementReference,
+};
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -206,6 +208,11 @@ pub struct PublicationRequest {
     /// by the same operation. Callers must not populate this from untrusted
     /// request data.
     pub preverified_durability: Vec<DurabilityReceipt>,
+    /// Command values whose complete, immutable payload is embedded in the
+    /// Merkle leaf metadata. These CIDs are integrity commitments, not block
+    /// roots, and therefore must not enter staging, DAG traversal, durability,
+    /// or pin protection. Callers must not populate this from untrusted data.
+    pub metadata_only_cids: Vec<Cid>,
     pub staged_bytes: u64,
     pub staging_ttl_seconds: i64,
     pub retain_uploaded_on_conflict: bool,
@@ -278,6 +285,7 @@ pub trait DurabilityBackend: Send + Sync + 'static {
         &self,
         cid: &Cid,
         replication_factor: usize,
+        placement: Option<&PlacementReference>,
     ) -> Result<DurabilityReceipt, PublicationError>;
 }
 
@@ -493,6 +501,7 @@ impl PublicationRepository {
     pub fn durable_receipt(
         &self,
         cid: &Cid,
+        placement: Option<&pepper_types::PlacementReference>,
         required: usize,
         now: i64,
     ) -> Result<Option<DurabilityReceipt>, PublicationError> {
@@ -501,6 +510,9 @@ impl PublicationRepository {
                 .into_iter()
                 .filter(|record| {
                     &record.receipt.cid == cid
+                        && placement.is_none_or(|expected| {
+                            record.receipt.placement.as_ref() == Some(expected)
+                        })
                         && record.receipt.replicas_accepted >= required
                         && record.receipt.status == "durable"
                         && record.verified_at_unix_seconds >= now.saturating_sub(60 * 60)
@@ -654,7 +666,24 @@ where
         let expires = now
             .checked_add(request.staging_ttl_seconds)
             .ok_or(PublicationError::StagingUnavailable)?;
-        let mut roots = command_value_cids(&request.command);
+        let command_cids = command_value_cids(&request.command);
+        let unique_metadata_only_cids = request.metadata_only_cids.iter().collect::<HashSet<_>>();
+        if unique_metadata_only_cids.len() != request.metadata_only_cids.len()
+            || request.metadata_only_cids.len() > command_cids.len()
+            || request
+                .metadata_only_cids
+                .iter()
+                .any(|cid| !command_cids.contains(cid))
+        {
+            return Err(PublicationError::Application {
+                code: "invalid_metadata_only_cid".to_string(),
+                message: "metadata-only CIDs must be command values".to_string(),
+            });
+        }
+        let mut roots = command_cids
+            .into_iter()
+            .filter(|cid| !request.metadata_only_cids.contains(cid))
+            .collect::<Vec<_>>();
         roots.extend(request.uploaded_roots.iter().cloned());
         roots.sort_by_key(ToString::to_string);
         roots.dedup();
@@ -732,8 +761,27 @@ where
             .replicas as usize;
 
         let mut durable_cids = request.uploaded_roots.clone();
-        let mut roots_to_walk = request.uploaded_roots.clone();
+        durable_cids.extend(
+            request
+                .preverified_durability
+                .iter()
+                .map(|receipt| receipt.cid.clone()),
+        );
+        let mut roots_to_walk = request
+            .uploaded_roots
+            .iter()
+            .filter(|root| {
+                !request
+                    .preverified_durability
+                    .iter()
+                    .any(|receipt| &receipt.cid == *root)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         for cid in command_value_cids(&request.command) {
+            if request.metadata_only_cids.contains(&cid) {
+                continue;
+            }
             if request
                 .preverified_durability
                 .iter()
@@ -764,10 +812,28 @@ where
         durable_cids.sort_by_key(ToString::to_string);
         durable_cids.dedup();
         let mut durability_required = HashMap::<Cid, usize>::new();
+        let mut durability_placements = HashMap::<Cid, PlacementReference>::new();
+        for receipt in &request.preverified_durability {
+            if let Some(placement) = receipt
+                .placement
+                .as_ref()
+                .filter(|placement| placement.role == pepper_types::PlacementRole::ErasureShard)
+            {
+                durability_required.insert(receipt.cid.clone(), 1);
+                durability_placements.insert(receipt.cid.clone(), placement.clone());
+            }
+        }
         for manifest_cid in durable_cids
             .iter()
             .filter(|cid| cid.codec == CODEC_ERASURE_MANIFEST)
         {
+            if request
+                .preverified_durability
+                .iter()
+                .any(|receipt| &receipt.cid == manifest_cid)
+            {
+                continue;
+            }
             let payload = self
                 .data_store
                 .resolve(manifest_cid)
@@ -783,7 +849,8 @@ where
                 .into_iter()
                 .flat_map(|stripe| stripe.shards)
             {
-                durability_required.insert(shard.cid, 1);
+                durability_required.insert(shard.cid.clone(), 1);
+                durability_placements.insert(shard.cid, shard.placement);
             }
         }
         let mut candidate_roots = Vec::new();
@@ -811,6 +878,7 @@ where
             let mut stored_receipts = Vec::new();
             for cid in durable_cids {
                 let cid_required = durability_required.get(&cid).copied().unwrap_or(required);
+                let expected_placement = durability_placements.get(&cid);
                 let supplied_receipt = request
                     .preverified_durability
                     .iter()
@@ -818,7 +886,10 @@ where
                 match supplied_receipt {
                     Some(receipt)
                         if receipt.replicas_accepted < cid_required
-                            || receipt.status != "durable" =>
+                            || receipt.status != "durable"
+                            || expected_placement.is_some_and(|expected| {
+                                receipt.placement.as_ref() != Some(expected)
+                            }) =>
                     {
                         DURABILITY_INVALID_PREVERIFIED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
                     }
@@ -834,24 +905,33 @@ where
                         receipt.cid == cid
                             && receipt.replicas_accepted >= cid_required
                             && receipt.status == "durable"
+                            && expected_placement
+                                .is_none_or(|expected| receipt.placement.as_ref() == Some(expected))
                     })
                     .cloned()
                 {
                     DURABILITY_PREVERIFIED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
-                    (receipt, false)
+                    (receipt, true)
                 } else if let Some(receipt) =
-                    self.repository.durable_receipt(&cid, cid_required, now)?
+                    self.repository
+                        .durable_receipt(&cid, expected_placement, cid_required, now)?
                 {
                     DURABILITY_CACHED_RECEIPTS.fetch_add(1, Ordering::Relaxed);
                     (receipt, false)
                 } else {
                     DURABILITY_BACKEND_RECEIPTS.fetch_add(1, Ordering::Relaxed);
                     (
-                        self.durability.ensure_durable(&cid, cid_required).await?,
+                        self.durability
+                            .ensure_durable(&cid, cid_required, expected_placement)
+                            .await?,
                         true,
                     )
                 };
-                if receipt.replicas_accepted < cid_required || receipt.status != "durable" {
+                if receipt.replicas_accepted < cid_required
+                    || receipt.status != "durable"
+                    || expected_placement
+                        .is_some_and(|expected| receipt.placement.as_ref() != Some(expected))
+                {
                     return Err(PublicationError::DurabilityNotMet(cid));
                 }
                 if cache_receipt {
@@ -1022,7 +1102,7 @@ fn command_value_cids(command: &CommandEnvelope) -> Vec<Cid> {
         .iter()
         .filter_map(|mutation| match mutation {
             NamespaceMutation::Put { value_cid, .. } => Some(value_cid.clone()),
-            NamespaceMutation::Delete { .. } => None,
+            NamespaceMutation::Assert { .. } | NamespaceMutation::Delete { .. } => None,
         })
         .collect()
 }
@@ -1111,7 +1191,9 @@ fn storage_error(error: impl std::fmt::Display) -> PublicationError {
 mod tests {
     use super::*;
     use pepper_config::StorageLocationConfig;
-    use pepper_consensus::{InProcessRouter, MemoryDataBackend, raft_members};
+    use pepper_consensus::{
+        ConsensusDataBackend, InProcessRouter, MemoryDataBackend, raft_members,
+    };
     use pepper_merkle::{MerkleLimits, MerkleNodeCodecHandler, MerkleWriteStore};
     use pepper_namespace::{
         CommandResponse, KeyPrecondition, NamespaceCommitCodecHandler, NamespaceDescriptor,
@@ -1119,7 +1201,7 @@ mod tests {
         TransactionCommand, create_namespace,
     };
     use pepper_storage::BlockStore;
-    use pepper_types::{CODEC_RAW, ProviderRecord};
+    use pepper_types::{CODEC_RAW, Codec, PlacementReference};
     use std::{collections::HashMap, sync::Mutex};
 
     struct InjectAt(PublicationFaultPoint);
@@ -1137,15 +1219,51 @@ mod tests {
     #[derive(Default)]
     struct MockDurability;
 
+    #[derive(Clone, Default)]
+    struct TrackingDataBackend {
+        inner: Arc<MemoryDataBackend>,
+        reads: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl TrackingDataBackend {
+        fn reads_for(&self, cid: &Cid) -> u64 {
+            self.reads
+                .lock()
+                .unwrap()
+                .get(&cid.to_string())
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait]
+    impl ConsensusDataBackend for TrackingDataBackend {
+        async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry(cid.to_string())
+                .or_default() += 1;
+            self.inner.get(cid).await
+        }
+
+        async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String> {
+            self.inner.put(codec, payload).await
+        }
+    }
+
     #[async_trait]
     impl DurabilityBackend for MockDurability {
         async fn ensure_durable(
             &self,
             cid: &Cid,
             replication_factor: usize,
+            placement: Option<&PlacementReference>,
         ) -> Result<DurabilityReceipt, PublicationError> {
             Ok(DurabilityReceipt {
                 cid: cid.clone(),
+                placement: placement.cloned(),
                 codec: cid.codec,
                 size: 1,
                 replicas_accepted: replication_factor,
@@ -1153,7 +1271,6 @@ mod tests {
                     .map(|index| format!("node-{index}"))
                     .collect(),
                 status: "durable".to_string(),
-                providers: Vec::<ProviderRecord>::new(),
             })
         }
     }
@@ -1308,6 +1425,7 @@ mod tests {
         let router = InProcessRouter::default();
         let mut managers = Vec::new();
         let mut stores = Vec::new();
+        let mut data_backends = Vec::new();
         let mut directories = Vec::new();
         let mut initial_state = None;
         for identity in ["node-a", "node-b", "node-c"] {
@@ -1315,7 +1433,8 @@ mod tests {
             let metadata = Arc::new(
                 MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
             );
-            let store = ConsensusDataStore::new(MemoryDataBackend::default());
+            let backend = TrackingDataBackend::default();
+            let store = ConsensusDataStore::new(backend.clone());
             let created = create_namespace(
                 &store,
                 descriptor(),
@@ -1340,6 +1459,7 @@ mod tests {
             initial_state.get_or_insert(created.state);
             managers.push(manager);
             stores.push(store);
+            data_backends.push(backend);
             directories.push(directory);
         }
         let state = initial_state.unwrap();
@@ -1409,6 +1529,7 @@ mod tests {
                     command: command(&state, "request-1", "alpha", value.clone()),
                     uploaded_roots: vec![value.clone()],
                     preverified_durability: Vec::new(),
+                    metadata_only_cids: Vec::new(),
                     staged_bytes: 5,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: true,
@@ -1427,6 +1548,163 @@ mod tests {
             }
         ));
 
+        // A trusted inline metadata value is committed and fenced by the
+        // Merkle/Raft transaction itself. It is intentionally absent from the
+        // block store and must never enter traversal, durability, or pins.
+        let inline_value = Cid::new(CODEC_RAW, b"inline-control-record");
+        let inline_reads_before = data_backends[leader_index].reads_for(&inline_value);
+        let current = managers[leader_index]
+            .linearizable_namespace_state(&state.namespace_id)
+            .await
+            .unwrap();
+        let inline = coordinator
+            .publish(
+                PublicationRequest {
+                    namespace_id: state.namespace_id.clone(),
+                    command: command(
+                        &current,
+                        "request-inline",
+                        "inline-control",
+                        inline_value.clone(),
+                    ),
+                    uploaded_roots: Vec::new(),
+                    preverified_durability: Vec::new(),
+                    metadata_only_cids: vec![inline_value.clone()],
+                    staged_bytes: 21,
+                    staging_ttl_seconds: 60,
+                    retain_uploaded_on_conflict: false,
+                },
+                11,
+            )
+            .await
+            .unwrap();
+        assert!(inline.durability.is_empty());
+        assert_eq!(
+            data_backends[leader_index].reads_for(&inline_value),
+            inline_reads_before
+        );
+        assert!(
+            !repository
+                .protected_roots(12)
+                .unwrap()
+                .contains(&inline_value)
+        );
+
+        let current = managers[leader_index]
+            .linearizable_namespace_state(&state.namespace_id)
+            .await
+            .unwrap();
+        let unrelated = Cid::new(CODEC_RAW, b"not-a-command-value");
+        assert!(matches!(
+            coordinator
+                .publish(
+                    PublicationRequest {
+                        namespace_id: state.namespace_id.clone(),
+                        command: command(
+                            &current,
+                            "request-invalid-inline",
+                            "invalid-inline",
+                            value.clone(),
+                        ),
+                        uploaded_roots: Vec::new(),
+                        preverified_durability: Vec::new(),
+                        metadata_only_cids: vec![unrelated],
+                        staged_bytes: 0,
+                        staging_ttl_seconds: 60,
+                        retain_uploaded_on_conflict: false,
+                    },
+                    12,
+                )
+                .await,
+            Err(PublicationError::Application { code, .. }) if code == "invalid_metadata_only_cid"
+        ));
+        assert!(matches!(
+            coordinator
+                .publish(
+                    PublicationRequest {
+                        namespace_id: state.namespace_id.clone(),
+                        command: command(
+                            &current,
+                            "request-duplicate-inline",
+                            "duplicate-inline",
+                            value.clone(),
+                        ),
+                        uploaded_roots: Vec::new(),
+                        preverified_durability: Vec::new(),
+                        metadata_only_cids: vec![value.clone(), value.clone()],
+                        staged_bytes: 0,
+                        staging_ttl_seconds: 60,
+                        retain_uploaded_on_conflict: false,
+                    },
+                    12,
+                )
+                .await,
+            Err(PublicationError::Application { code, .. }) if code == "invalid_metadata_only_cid"
+        ));
+
+        // An authenticated receipt is the complete durability proof for a
+        // freshly uploaded root. A gateway that is not an authoritative block
+        // owner must therefore be able to publish it without resolving the
+        // block through the legacy provider directory.
+        let preverified_value = stores[leader_index]
+            .put(CODEC_RAW, b"preverified".to_vec())
+            .await
+            .unwrap();
+        let reads_before = data_backends[leader_index].reads_for(&preverified_value);
+        let preverified_placement = PlacementReference::replicated(7, preverified_value.clone(), 3);
+        let current = managers[leader_index]
+            .linearizable_namespace_state(&state.namespace_id)
+            .await
+            .unwrap();
+        coordinator
+            .publish(
+                PublicationRequest {
+                    namespace_id: state.namespace_id.clone(),
+                    command: command(
+                        &current,
+                        "request-preverified",
+                        "preverified",
+                        preverified_value.clone(),
+                    ),
+                    uploaded_roots: vec![preverified_value.clone()],
+                    preverified_durability: vec![DurabilityReceipt {
+                        cid: preverified_value.clone(),
+                        placement: Some(preverified_placement.clone()),
+                        codec: preverified_value.codec,
+                        size: 11,
+                        replicas_accepted: 3,
+                        replica_nodes: vec!["node-a".into(), "node-b".into(), "node-c".into()],
+                        status: "durable".to_string(),
+                    }],
+                    metadata_only_cids: Vec::new(),
+                    staged_bytes: 11,
+                    staging_ttl_seconds: 60,
+                    retain_uploaded_on_conflict: true,
+                },
+                12,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data_backends[leader_index].reads_for(&preverified_value),
+            reads_before,
+            "preverified uploaded root was unexpectedly resolved"
+        );
+        assert!(
+            repository
+                .durable_receipt(&preverified_value, Some(&preverified_placement), 3, 12)
+                .unwrap()
+                .is_some()
+        );
+        let wrong_placement = PlacementReference::replicated(8, preverified_value.clone(), 3);
+        assert!(
+            repository
+                .durable_receipt(&preverified_value, Some(&wrong_placement), 3, 12)
+                .unwrap()
+                .is_none(),
+            "a durability receipt from another placement epoch was reused"
+        );
+
         let stale = command(&state, "request-conflict", "alpha", value.clone());
         assert!(matches!(
             coordinator
@@ -1436,6 +1714,7 @@ mod tests {
                         command: stale,
                         uploaded_roots: vec![value.clone()],
                         preverified_durability: Vec::new(),
+                        metadata_only_cids: Vec::new(),
                         staged_bytes: 5,
                         staging_ttl_seconds: 60,
                         retain_uploaded_on_conflict: true,
@@ -1476,6 +1755,7 @@ mod tests {
                 ),
                 uploaded_roots: vec![value.clone()],
                 preverified_durability: Vec::new(),
+                metadata_only_cids: Vec::new(),
                 staged_bytes: 5,
                 staging_ttl_seconds: 60,
                 retain_uploaded_on_conflict: true,

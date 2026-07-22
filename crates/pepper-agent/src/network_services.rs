@@ -358,10 +358,31 @@ impl NetworkBlockService for AgentBlockService {
             .map_err(|error| NetworkError::BlockService(error.to_string()))
     }
 
+    async fn has_blocks(&self, cids: &[Cid]) -> Result<Vec<bool>, NetworkError> {
+        let _guard = self.operation_lock.read().await;
+        tokio::task::block_in_place(|| {
+            cids.iter()
+                .map(|cid| self.block_store.has(cid))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+
     async fn get_block(&self, cid: &Cid) -> Result<Vec<u8>, NetworkError> {
         let _guard = self.operation_lock.read().await;
         tokio::task::block_in_place(|| self.block_store.get(cid))
             .map(|block| block.payload)
+            .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+
+    async fn get_block_range(
+        &self,
+        cid: &Cid,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let _guard = self.operation_lock.read().await;
+        tokio::task::block_in_place(|| self.block_store.get_range(cid, start, end))
             .map_err(|error| NetworkError::BlockService(error.to_string()))
     }
 
@@ -402,6 +423,83 @@ impl NetworkBlockService for AgentBlockService {
             .put_encoded_verified(codec, payload, expected_cid.clone(), logical_size)
             .await
             .map_err(|error| NetworkError::BlockService(error.to_string()))
+    }
+}
+
+pub(super) struct AgentErasureService {
+    pub(super) state: AppState,
+}
+
+#[async_trait]
+impl NetworkErasureService for AgentErasureService {
+    async fn push_repair_inventory(
+        &self,
+        authenticated_node: &str,
+        inventory_json: String,
+    ) -> Result<(), NetworkError> {
+        accept_repair_inventory(&self.state, authenticated_node, &inventory_json)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+
+    async fn execute_repair(
+        &self,
+        authenticated_node: &str,
+        task_json: String,
+    ) -> Result<proto::RepairExecuteResponse, NetworkError> {
+        let request: RepairExecutionRequest = serde_json::from_str(&task_json)?;
+        execute_placement_repair(&self.state, authenticated_node, request)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+
+    async fn cleanup_repair_extra(
+        &self,
+        _authenticated_node: &str,
+        exception_json: String,
+    ) -> Result<bool, NetworkError> {
+        let exception: PlacementException = serde_json::from_str(&exception_json)?;
+        cleanup_expired_repair_extra(&self.state, exception)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+
+    async fn encode_parity(
+        &self,
+        _authenticated_node: &str,
+        request: proto::ErasureTransferRequest,
+    ) -> Result<proto::ErasureTransferResponse, NetworkError> {
+        execute_distributed_parity(&self.state, request)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.message))
+    }
+
+    async fn store_stripe_stream(
+        &self,
+        _authenticated_node: &str,
+        request: proto::ErasureTransferRequest,
+        mut chunks: ErasureChunkReceiver,
+    ) -> Result<proto::ErasureTransferResponse, NetworkError> {
+        if request.plan == EcTransferPlan::Pipelined.as_str() {
+            return execute_pipelined_erasure_transfer(&self.state, request, chunks)
+                .await
+                .map_err(|error| NetworkError::BlockService(error.message));
+        }
+        let capacity = usize::try_from(request.encoded_size).map_err(|_| {
+            NetworkError::BlockService("encoded size does not fit usize".to_string())
+        })?;
+        let mut encoded = Vec::with_capacity(capacity);
+        while let Some(chunk) = chunks.recv().await {
+            if encoded.len().saturating_add(chunk.len()) > capacity {
+                return Err(NetworkError::BlockService(
+                    "erasure stream exceeded declared size".to_string(),
+                ));
+            }
+            encoded.extend_from_slice(&chunk);
+        }
+        execute_remote_erasure_transfer(&self.state, request, encoded)
+            .await
+            .map_err(|error| NetworkError::BlockService(error.message))
     }
 }
 

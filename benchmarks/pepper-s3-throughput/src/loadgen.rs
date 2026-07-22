@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    error::Error as _,
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -111,6 +112,10 @@ pub struct LoadgenArgs {
     pub region: String,
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
+    /// Maximum time an operation already in flight at the cell deadline may
+    /// take to finish before it is cancelled.
+    #[arg(long, default_value_t = 60)]
+    pub drain_timeout: u64,
     /// Maximum retries for transient S3 transport and service failures.
     #[arg(long, default_value_t = 3)]
     pub retries: u32,
@@ -132,6 +137,8 @@ struct RequestResult {
     transferred: u64,
     retries: u64,
     retry_after: Option<Duration>,
+    error: Option<String>,
+    attempt_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +155,7 @@ struct WorkerConfig {
     request: GeneratedRequest,
     object_count: u64,
     deadline: Instant,
+    drain_deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -182,6 +190,8 @@ struct WorkerResult {
     logical_bytes: u64,
     latencies_micros: Vec<u64>,
     statuses: BTreeMap<u16, u64>,
+    errors: BTreeMap<String, u64>,
+    final_errors: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +209,7 @@ struct ReportConfig {
     object_size_bytes: u64,
     concurrency: usize,
     requested_duration_seconds: u64,
+    drain_timeout_seconds: u64,
     object_count: u64,
     range_bytes: u64,
     payload_profile: PayloadProfile,
@@ -220,6 +231,8 @@ struct ReportResults {
     operations_per_second: f64,
     latency_ms: LatencyReport,
     http_status_counts: BTreeMap<u16, u64>,
+    error_counts: BTreeMap<String, u64>,
+    final_error_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,12 +311,52 @@ impl S3Backend {
             if response.is_ok_and(|response| response.status().is_success())
                 || status == StatusCode::CONFLICT.as_u16()
             {
-                return Ok(());
+                break;
             }
             if !matches!(status, 0 | 503) || Instant::now() >= deadline {
                 bail!("CreateBucket failed with HTTP {status}");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        // A matrix cell may route its first request to any configured gateway.
+        // Do not count cluster bootstrap/catalog catch-up as data-path latency.
+        // This is also an explicit correctness gate for the replicated bucket
+        // catalog: every selected healthy gateway must resolve the bucket.
+        loop {
+            let mut pending = Vec::new();
+            for endpoint in &self.endpoints {
+                let path = format!("/{}", aws_encode(&self.bucket, false));
+                let headers = signed_headers(
+                    Method::HEAD,
+                    endpoint,
+                    &path,
+                    "",
+                    &self.access_key,
+                    &self.secret_key,
+                    &self.region,
+                );
+                let status = self
+                    .client
+                    .head(format!("{endpoint}{path}"))
+                    .headers(headers)
+                    .send()
+                    .await
+                    .map_or(0, |response| response.status().as_u16());
+                if status != StatusCode::OK.as_u16() {
+                    pending.push(format!("{endpoint}=HTTP {status}"));
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "bucket was not visible through every selected gateway before the deadline: {}",
+                    pending.join(", ")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -317,13 +370,20 @@ impl S3Backend {
         payload_profile: PayloadProfile,
     ) -> RequestResult {
         let mut retries = 0u64;
+        let mut attempt_errors = Vec::new();
         loop {
             let mut result = self
                 .request_once(operation, key, size, range_bytes, seed, payload_profile)
                 .await;
             result.retries = retries;
+            if !result.success {
+                attempt_errors.push(result.error.clone().unwrap_or_else(|| {
+                    format!("HTTP {} without a retained error body", result.status)
+                }));
+            }
             if result.success || retries >= u64::from(self.retries) || !retryable_s3_result(&result)
             {
+                result.attempt_errors = attempt_errors;
                 return result;
             }
             let delay = result.retry_after.unwrap_or_else(|| {
@@ -394,14 +454,19 @@ impl S3Backend {
                 format!("bytes=0-{}", requested.saturating_sub(1)),
             );
         }
-        let Ok(response) = request.send().await else {
-            return RequestResult {
-                success: false,
-                status: 0,
-                transferred: 0,
-                retries: 0,
-                retry_after: None,
-            };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return RequestResult {
+                    success: false,
+                    status: 0,
+                    transferred: 0,
+                    retries: 0,
+                    retry_after: None,
+                    error: Some(reqwest_error_summary("request", &error)),
+                    attempt_errors: Vec::new(),
+                };
+            }
         };
         let status = response.status();
         let retry_after = response
@@ -411,17 +476,26 @@ impl S3Backend {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
         let mut transferred = 0u64;
+        let mut error_body = Vec::new();
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
             match chunk {
-                Ok(chunk) => transferred = transferred.saturating_add(chunk.len() as u64),
-                Err(_) => {
+                Ok(chunk) => {
+                    transferred = transferred.saturating_add(chunk.len() as u64);
+                    if !status.is_success() && error_body.len() < 4096 {
+                        let take = (4096 - error_body.len()).min(chunk.len());
+                        error_body.extend_from_slice(&chunk[..take]);
+                    }
+                }
+                Err(error) => {
                     return RequestResult {
                         success: false,
                         status: status.as_u16(),
                         transferred,
                         retries: 0,
                         retry_after,
+                        error: Some(reqwest_error_summary("response_body", &error)),
+                        attempt_errors: Vec::new(),
                     };
                 }
             }
@@ -432,6 +506,8 @@ impl S3Backend {
             transferred,
             retries: 0,
             retry_after,
+            error: (!status.is_success()).then(|| s3_error_summary(&error_body)),
+            attempt_errors: Vec::new(),
         }
     }
 
@@ -566,6 +642,8 @@ impl S3Backend {
                 transferred: size,
                 retries: 0,
                 retry_after: None,
+                error: None,
+                attempt_errors: Vec::new(),
             }
         } else {
             self.abort_multipart(endpoint, &path, &upload_id).await;
@@ -599,7 +677,56 @@ fn failed_request(status: u16) -> RequestResult {
         transferred: 0,
         retries: 0,
         retry_after: None,
+        error: None,
+        attempt_errors: Vec::new(),
     }
+}
+
+fn s3_error_summary(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let code = xml_element(&text, "Code");
+    let message = xml_element(&text, "Message");
+    let summary = match (code, message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code,
+        _ => text.split_whitespace().collect::<Vec<_>>().join(" "),
+    };
+    if summary.is_empty() {
+        "empty error response".to_string()
+    } else {
+        summary.chars().take(512).collect()
+    }
+}
+
+fn reqwest_error_summary(phase: &str, error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    };
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    let detail = if causes.is_empty() {
+        error.to_string()
+    } else {
+        causes.join(": ")
+    };
+    format!("{phase} {kind}: {detail}")
+        .chars()
+        .take(512)
+        .collect()
 }
 
 fn xml_element(body: &str, name: &str) -> Option<String> {
@@ -650,6 +777,8 @@ impl RawBackend {
             transferred: 0,
             retries: 0,
             retry_after: None,
+            error: Some("raw backend task failed".to_string()),
+            attempt_errors: Vec::new(),
         })
     }
 }
@@ -733,6 +862,8 @@ fn raw_request(
             transferred,
             retries: 0,
             retry_after: None,
+            error: None,
+            attempt_errors: Vec::new(),
         },
         Err(_) => RequestResult {
             success: false,
@@ -740,6 +871,8 @@ fn raw_request(
             transferred: 0,
             retries: 0,
             retry_after: None,
+            error: Some("raw operation failed".to_string()),
+            attempt_errors: Vec::new(),
         },
     }
 }
@@ -938,6 +1071,18 @@ fn object_key(size: u64, index: u64, payload_profile: PayloadProfile) -> String 
     )
 }
 
+fn write_object_key(
+    size: u64,
+    worker_id: usize,
+    iteration: u64,
+    payload_profile: PayloadProfile,
+) -> String {
+    format!(
+        "writes/{}/{size}/{worker_id:06}/{iteration:020}.bin",
+        payload_profile.as_str()
+    )
+}
+
 async fn prepare(
     backend: Backend,
     size: u64,
@@ -962,8 +1107,9 @@ async fn prepare(
                     .await;
                 ensure!(
                     result.success,
-                    "preload PUT {index} failed with status {}",
-                    result.status
+                    "preload PUT {index} failed with status {}: {}",
+                    result.status,
+                    result.error.as_deref().unwrap_or("no error body")
                 );
                 Ok::<_, anyhow::Error>(())
             }
@@ -994,6 +1140,7 @@ async fn worker(worker_id: usize, backend: Backend, config: WorkerConfig) -> Wor
         request,
         object_count,
         deadline,
+        drain_deadline,
     } = config;
     let GeneratedRequest {
         size,
@@ -1016,14 +1163,16 @@ async fn worker(worker_id: usize, backend: Backend, config: WorkerConfig) -> Wor
         } else {
             operation
         };
-        let key = if selected == Operation::List {
-            String::new()
-        } else {
-            object_key(size, index, payload_profile)
+        let key = match selected {
+            Operation::List => String::new(),
+            Operation::Put | Operation::MultipartPut => {
+                write_object_key(size, worker_id, iteration, payload_profile)
+            }
+            _ => object_key(size, index, payload_profile),
         };
         let started = Instant::now();
         let Ok(mut request) = tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
+            drain_deadline.saturating_duration_since(Instant::now()),
             backend.request(
                 selected,
                 key,
@@ -1035,10 +1184,9 @@ async fn worker(worker_id: usize, backend: Backend, config: WorkerConfig) -> Wor
         )
         .await
         else {
-            // A duration benchmark measures operations completed inside its
-            // window. Cancel and exclude the final in-flight operation rather
-            // than letting its request timeout and retry budget extend the cell
-            // by minutes under deliberate overload.
+            // Stop a genuinely stuck final request after the bounded drain
+            // window. Healthy requests that crossed the launch deadline are
+            // allowed to finish, avoiding synthetic server-side stream errors.
             break;
         };
         request.success &= match selected {
@@ -1052,8 +1200,14 @@ async fn worker(worker_id: usize, backend: Backend, config: WorkerConfig) -> Wor
         *result.statuses.entry(request.status).or_default() += 1;
         result.attempts += 1;
         result.retries = result.retries.saturating_add(request.retries);
+        for error in request.attempt_errors {
+            *result.errors.entry(error).or_default() += 1;
+        }
         if !request.success {
             result.failures += 1;
+            if let Some(error) = request.error {
+                *result.final_errors.entry(error).or_default() += 1;
+            }
         } else if matches!(selected, Operation::Put | Operation::MultipartPut) {
             result.logical_bytes = result.logical_bytes.saturating_add(size);
         } else if matches!(selected, Operation::Get | Operation::RangeGet) {
@@ -1129,6 +1283,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
     let started_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(args.duration);
+    let drain_deadline = deadline + Duration::from_secs(args.drain_timeout);
     let mut workers = JoinSet::new();
     for worker_id in 0..args.concurrency {
         workers.spawn(worker(
@@ -1144,6 +1299,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
                 },
                 object_count: args.object_count,
                 deadline,
+                drain_deadline,
             },
         ));
     }
@@ -1158,11 +1314,17 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
         for (status, count) in result.statuses {
             *combined.statuses.entry(status).or_default() += count;
         }
+        for (error, count) in result.errors {
+            *combined.errors.entry(error).or_default() += count;
+        }
+        for (error, count) in result.final_errors {
+            *combined.final_errors.entry(error).or_default() += count;
+        }
     }
     let elapsed = started.elapsed().as_secs_f64();
     combined.latencies_micros.sort_unstable();
     let report = Report {
-        schema_version: 2,
+        schema_version: 5,
         started_at,
         config: ReportConfig {
             backend: args.backend,
@@ -1170,6 +1332,7 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
             object_size_bytes: args.size,
             concurrency: args.concurrency,
             requested_duration_seconds: args.duration,
+            drain_timeout_seconds: args.drain_timeout,
             object_count: args.object_count,
             range_bytes: args.range_bytes,
             payload_profile: args.payload_profile,
@@ -1202,6 +1365,8 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
                 max: combined.latencies_micros.last().copied().unwrap_or(0) as f64 / 1000.0,
             },
             http_status_counts: combined.statuses,
+            error_counts: combined.errors,
+            final_error_counts: combined.final_errors,
         },
     };
     let encoded = serde_json::to_string_pretty(&report)? + "\n";
@@ -1228,6 +1393,8 @@ mod tests {
             transferred: 0,
             retries: 0,
             retry_after: None,
+            error: None,
+            attempt_errors: Vec::new(),
         }
     }
 
@@ -1288,5 +1455,19 @@ mod tests {
                 chunk.iter().filter(|byte| **byte == 0).count() as f64 / chunk.len() as f64;
             assert!(zero_fraction >= minimum_zero_fraction);
         }
+    }
+
+    #[test]
+    fn timed_writes_have_worker_local_unique_keys() {
+        let first = write_object_key(4096, 0, 0, PayloadProfile::Incompressible);
+        assert_ne!(
+            first,
+            write_object_key(4096, 1, 0, PayloadProfile::Incompressible)
+        );
+        assert_ne!(
+            first,
+            write_object_key(4096, 0, 1, PayloadProfile::Incompressible)
+        );
+        assert!(first.starts_with("writes/incompressible/4096/"));
     }
 }

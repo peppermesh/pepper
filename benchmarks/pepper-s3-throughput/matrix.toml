@@ -3,9 +3,12 @@
 object_sizes = [4096, 1048576, 67108864, 1073741824, 4294967296]
 concurrency = [1, 2, 4, 8, 16, 32, 64]
 routing = ["leader", "follower", "round-robin"]
-topologies = ["raw", "single", "three"]
+topologies = ["raw", "single", "three", "nine-ec"]
+storage_engines = ["files", "native-nvme"]
 operations = ["put", "get", "range-get", "head", "list", "mixed"]
 payload_profiles = ["incompressible"]
+erasure_transfer_plans = ["adaptive", "gateway-fanout", "distributed-parity", "hierarchical", "pipelined"]
+gateway_capacities_mbps = [1000, 10000, 25000, 100000]
 range_bytes = 1048576
 minimum_duration_seconds = 60
 cold_dataset_memory_ratio = 1.25

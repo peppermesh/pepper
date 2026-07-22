@@ -16,6 +16,7 @@ blake3 = { workspace = true }
 crc32c = { workspace = true }
 fs2 = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 pepper-config = { version = "0.3.0", path = "../pepper-config" }
 pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
 pepper-types = { version = "0.3.0", path = "../pepper-types" }
@@ -25,5 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 zstd = { workspace = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
 [dev-dependencies]
 tempfile = "3.23"

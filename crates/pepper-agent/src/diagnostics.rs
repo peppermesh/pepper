@@ -450,17 +450,23 @@ pub(super) async fn read_resolution_diagnostic(
 ) -> Result<impl IntoResponse, ApiError> {
     let cid = BlockStore::parse_cid(&cid)?;
     let limit = page_limit(query.limit)?;
-    let records = state
+    let mut records = state
         .read_diagnostics
         .lock()
-        .map_err(|_| ApiError::internal("read diagnostic lock poisoned"))?;
-    let mut entries = records
+        .map_err(|_| ApiError::internal("read diagnostic lock poisoned"))?
         .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(runtime) = &state.fast_path {
+        records.extend(runtime.read_diagnostics());
+    }
+    records.sort_by_key(|record| record.sequence);
+    let mut entries = records
+        .into_iter()
         .filter(|record| {
             record.cid == cid && query.after.is_none_or(|after| record.sequence > after)
         })
         .take(limit.saturating_add(1))
-        .cloned()
         .collect::<Vec<_>>();
     let has_more = entries.len() > limit;
     entries.truncate(limit);

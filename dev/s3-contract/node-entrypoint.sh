@@ -37,10 +37,14 @@ stop_processes() {
 
 trap stop_processes INT TERM
 
-# Pepper's HTTP API remains loopback-only. This bridge is reachable only from
-# the isolated Compose network and exists solely for the black-box S3 test.
-socat TCP-LISTEN:19080,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9080 &
-proxy_pid=$!
+# Contract tests keep the loopback-only API behind a disposable bridge. The
+# throughput benchmark explicitly binds the API to its isolated Docker network
+# and bypasses this process-per-connection proxy so it is not part of the
+# measurement.
+if [ "${PEPPER_TEST_DIRECT_API:-0}" != "1" ]; then
+    socat TCP-LISTEN:19080,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9080 &
+    proxy_pid=$!
+fi
 
 generation=0
 while [ "$stopping" -eq 0 ]; do
@@ -81,8 +85,10 @@ while [ "$stopping" -eq 0 ]; do
         continue
     fi
 
-    kill "$proxy_pid" 2>/dev/null || true
-    wait "$proxy_pid" 2>/dev/null || true
+    if [ -n "$proxy_pid" ]; then
+        kill "$proxy_pid" 2>/dev/null || true
+        wait "$proxy_pid" 2>/dev/null || true
+    fi
     exit "$agent_status"
 done
 
