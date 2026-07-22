@@ -4,6 +4,8 @@ name: ci
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -25,10 +27,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        # The workspace includes real multi-process QUIC/Raft tests. Running
-        # those in parallel on a two-core hosted runner starves heartbeats and
-        # produces false quorum-loss failures, so libtest cases are serialized.
-        run: cargo test --locked --workspace -- --test-threads=1
+        # Keep ordinary unit and integration tests on one runner. The largest
+        # multi-process QUIC/Raft contracts run below on isolated hosted
+        # runners so their node churn and I/O cannot accumulate for 45+ minutes
+        # in a single test process.
+        run: |
+          cargo test --locked --workspace -- --test-threads=1 \
+            --skip s3_adaptive_erasure_transfer_plans_preserve_canonical_layout \
+            --skip s3_catalog_survives_gateway_loss_and_concurrent_load \
+            --skip s3_placement_owned_repair_fails_over_migrates_and_collects_extras \
+            --skip s3_small_objects_pack_into_partitioned_ec_extents \
+            --skip s3_streaming_six_plus_three_survives_three_missing_shards
       - name: Verify system-test workspace
         # The nested workspace keeps orchestration dependencies out of product
         # crates. Real three-node scenarios remain scheduled/manual; this step
@@ -38,6 +47,27 @@ jobs:
           cargo fmt --manifest-path system-tests/Cargo.toml -- --check
           cargo clippy --manifest-path system-tests/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path system-tests/Cargo.toml --locked
+
+  multinode-contract:
+    name: multinode ${{ matrix.test }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - s3_adaptive_erasure_transfer_plans_preserve_canonical_layout
+          - s3_catalog_survives_gateway_loss_and_concurrent_load
+          - s3_placement_owned_repair_fails_over_migrates_and_collects_extras
+          - s3_small_objects_pack_into_partitioned_ec_extents
+          - s3_streaming_six_plus_three_survives_three_missing_shards
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Run isolated multinode contract
+        run: >-
+          cargo test --locked -p pepper-agent --test multinode
+          "${{ matrix.test }}" -- --exact --nocapture --test-threads=1
 
   audit:
     runs-on: ubuntu-latest

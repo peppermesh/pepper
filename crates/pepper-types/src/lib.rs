@@ -23,6 +23,14 @@ pub const CODEC_NAMESPACE_COMMIT: Codec = Codec(0x0a);
 pub const CODEC_BUCKET_OBJECT: Codec = Codec(0x0b);
 pub const CODEC_FILESYSTEM_ROOT: Codec = Codec(0x0c);
 pub const CODEC_FILESYSTEM_INODE: Codec = Codec(0x0d);
+pub const CODEC_BUCKET_PARTITION_BARRIER: Codec = Codec(0x0e);
+/// Canonical direct payload record for an object that fits the small-object
+/// segment-log threshold. The CID identifies the user bytes directly.
+pub const CODEC_SMALL_OBJECT: Codec = Codec(0x0f);
+/// Replicated metadata for one packed small-object extent. The descriptor
+/// links the EC extent and indexes its bounded record set so compaction can
+/// enumerate dirty extents instead of scanning every object in a bucket.
+pub const CODEC_SMALL_OBJECT_EXTENT_INDEX: Codec = Codec(0x10);
 
 /// Stable machine-readable error categories shared by HTTP, CLI, and future
 /// namespace services. New variants may be added; existing serialized names
@@ -125,6 +133,17 @@ pub struct Cid {
     pub digest: [u8; 32],
 }
 
+/// Incremental verifier for a CID whose payload arrives in bounded chunks.
+/// The declared size is part of Pepper's CID digest, so callers must provide
+/// it before accepting any bytes.
+pub struct CidStreamVerifier {
+    expected: Cid,
+    expected_size: u64,
+    seen: u64,
+    hasher: blake3::Hasher,
+    invalid: bool,
+}
+
 impl Cid {
     pub fn new(codec: Codec, payload: &[u8]) -> Self {
         let digest = compute_digest(CID_VERSION, codec, payload);
@@ -159,6 +178,44 @@ impl Cid {
             hasher.update(segment);
         }
         *hasher.finalize().as_bytes() == self.digest
+    }
+
+    pub fn stream_verifier(&self, expected_size: u64) -> Option<CidStreamVerifier> {
+        if self.version != CID_VERSION || self.hash_alg != HashAlg::Blake3 {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[self.version]);
+        hasher.update(&encode_u64_varint(self.codec.0));
+        hasher.update(&expected_size.to_be_bytes());
+        Some(CidStreamVerifier {
+            expected: self.clone(),
+            expected_size,
+            seen: 0,
+            hasher,
+            invalid: false,
+        })
+    }
+}
+
+impl CidStreamVerifier {
+    pub fn update(&mut self, chunk: &[u8]) {
+        let Some(seen) = self.seen.checked_add(chunk.len() as u64) else {
+            self.invalid = true;
+            return;
+        };
+        if seen > self.expected_size {
+            self.invalid = true;
+            return;
+        }
+        self.seen = seen;
+        self.hasher.update(chunk);
+    }
+
+    pub fn finish(self) -> bool {
+        !self.invalid
+            && self.seen == self.expected_size
+            && *self.hasher.finalize().as_bytes() == self.expected.digest
     }
 }
 
@@ -275,15 +332,92 @@ pub struct ProviderRecord {
     pub signature_hex: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementRole {
+    Replicated,
+    ErasureShard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementReference {
+    pub epoch: u64,
+    pub role: PlacementRole,
+    pub seed: Cid,
+    pub index: u16,
+    pub replicas: u16,
+}
+
+impl PlacementReference {
+    pub fn replicated(epoch: u64, cid: Cid, replicas: u16) -> Self {
+        Self {
+            epoch,
+            role: PlacementRole::Replicated,
+            seed: cid,
+            index: 0,
+            replicas,
+        }
+    }
+
+    pub fn erasure_shard(epoch: u64, stripe_cid: Cid, shard_index: u16) -> Self {
+        Self {
+            epoch,
+            role: PlacementRole::ErasureShard,
+            seed: stripe_cid,
+            index: shard_index,
+            replicas: 1,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), PlacementReferenceError> {
+        if self.epoch == 0 || self.replicas == 0 || self.replicas > 32 {
+            return Err(PlacementReferenceError::InvalidBounds);
+        }
+        match self.role {
+            PlacementRole::Replicated if self.index == 0 => Ok(()),
+            PlacementRole::ErasureShard if self.replicas == 1 => Ok(()),
+            _ => Err(PlacementReferenceError::InvalidRole),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlacementReferenceError {
+    #[error("placement reference has invalid epoch or replica bounds")]
+    InvalidBounds,
+    #[error("placement reference fields do not match its role")]
+    InvalidRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlacedCid {
+    pub cid: Cid,
+    pub placement: PlacementReference,
+}
+
+impl PlacedCid {
+    pub fn new(cid: Cid, placement: PlacementReference) -> Result<Self, PlacementReferenceError> {
+        placement.validate()?;
+        if placement.role == PlacementRole::Replicated && placement.seed != cid {
+            return Err(PlacementReferenceError::InvalidRole);
+        }
+        Ok(Self { cid, placement })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DurabilityReceipt {
     pub cid: Cid,
+    /// Authoritative placement used for this block. Control-plane bootstrap
+    /// records may omit this before the first placement map is committed.
+    pub placement: Option<PlacementReference>,
     pub codec: Codec,
     pub size: u64,
     pub replicas_accepted: usize,
     pub replica_nodes: Vec<String>,
     pub status: String,
-    pub providers: Vec<ProviderRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -292,6 +426,7 @@ pub struct ObjectChunk {
     pub offset: u64,
     pub size: u64,
     pub cid: Cid,
+    pub placement: PlacementReference,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +443,7 @@ pub struct ErasureShard {
     pub index: u16,
     pub cid: Cid,
     pub size: u64,
+    pub placement: PlacementReference,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +497,9 @@ impl ObjectManifest {
                 || chunk.size == 0
                 || chunk.size > self.chunk_size
                 || chunk.cid.codec != CODEC_RAW
+                || chunk.placement.seed != chunk.cid
+                || chunk.placement.validate().is_err()
+                || chunk.placement.role != PlacementRole::Replicated
             {
                 return Err(ManifestError::InvalidChunkLayout);
             }
@@ -428,6 +567,10 @@ impl ErasureManifest {
                     || shard.index as usize != position
                     || shard.size != stripe.shard_size
                     || shard.cid.codec != CODEC_RAW
+                    || shard.placement.seed != stripe.logical_cid
+                    || shard.placement.index != shard.index
+                    || shard.placement.validate().is_err()
+                    || shard.placement.role != PlacementRole::ErasureShard
                 {
                     return Err(ManifestError::InvalidErasureLayout);
                 }
@@ -497,7 +640,10 @@ impl DirManifest {
                         || !entry.cid.as_ref().is_some_and(|cid| {
                             matches!(
                                 cid.codec,
-                                CODEC_RAW | CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST
+                                CODEC_RAW
+                                    | CODEC_OBJECT_MANIFEST
+                                    | CODEC_ERASURE_MANIFEST
+                                    | CODEC_SMALL_OBJECT
                             )
                         })
                     {
@@ -695,7 +841,6 @@ pub struct BlockStatResponse {
     pub size: u64,
     pub storage_location: String,
     pub created_at_unix_seconds: u64,
-    pub last_accessed_at_unix_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -819,6 +964,16 @@ mod tests {
         assert!(!parsed.verify(b"goodbye"));
         assert!(parsed.verify_segments(&[b"he", b"ll", b"o"]));
         assert!(!parsed.verify_segments(&[b"he", b"lp"]));
+
+        let mut verifier = parsed.stream_verifier(5).unwrap();
+        verifier.update(b"he");
+        verifier.update(b"ll");
+        verifier.update(b"o");
+        assert!(verifier.finish());
+
+        let mut wrong_size = parsed.stream_verifier(4).unwrap();
+        wrong_size.update(b"hello");
+        assert!(!wrong_size.finish());
     }
 
     #[test]
@@ -846,10 +1001,12 @@ mod tests {
 
     #[test]
     fn validates_object_manifest_layout() {
+        let chunk_cid = Cid::new(CODEC_RAW, b"hello");
         let chunk = ObjectChunk {
             offset: 0,
             size: 5,
-            cid: Cid::new(CODEC_RAW, b"hello"),
+            cid: chunk_cid.clone(),
+            placement: PlacementReference::replicated(1, chunk_cid, 3),
         };
         ObjectManifest::new(5, 1024, vec![chunk.clone()])
             .validate()
@@ -873,6 +1030,7 @@ mod tests {
                     offset: 0,
                     size: 0,
                     cid: Cid::new(CODEC_RAW, b""),
+                    placement: PlacementReference::replicated(1, Cid::new(CODEC_RAW, b""), 3,),
                 }],
             )
             .validate()
@@ -883,13 +1041,15 @@ mod tests {
 
     #[test]
     fn manifests_have_one_codec_selected_shape() {
+        let chunk_cid = Cid::new(CODEC_RAW, b"hello");
         let manifest = ObjectManifest::new(
             5,
             1024,
             vec![ObjectChunk {
                 offset: 0,
                 size: 5,
-                cid: Cid::new(CODEC_RAW, b"hello"),
+                cid: chunk_cid.clone(),
+                placement: PlacementReference::replicated(1, chunk_cid, 3),
             }],
         );
         let canonical = serde_json::to_value(&manifest).unwrap();
@@ -910,11 +1070,13 @@ mod tests {
 
     #[test]
     fn validates_erasure_manifest_layout() {
+        let logical_cid = Cid::new(CODEC_RAW, &[0; 24]);
         let shards = (0..5)
             .map(|index| ErasureShard {
                 index,
                 cid: Cid::new(CODEC_RAW, &[index as u8]),
                 size: 8,
+                placement: PlacementReference::erasure_shard(1, logical_cid.clone(), index),
             })
             .collect::<Vec<_>>();
         let manifest = ErasureManifest::new(
@@ -925,7 +1087,7 @@ mod tests {
             vec![ErasureStripe {
                 offset: 0,
                 size: 24,
-                logical_cid: Cid::new(CODEC_RAW, &[0; 24]),
+                logical_cid,
                 encoding: ErasureStripeEncoding::Raw,
                 encoded_size: 24,
                 shard_size: 8,
@@ -938,11 +1100,13 @@ mod tests {
         invalid.stripes[0].shards[0].index = 1;
         assert_eq!(invalid.validate(), Err(ManifestError::InvalidErasureLayout));
 
+        let invalid_logical_cid = Cid::new(CODEC_RAW, &[0; 16]);
         let shards = (0..5)
             .map(|index| ErasureShard {
                 index,
                 cid: Cid::new(CODEC_RAW, &[index as u8]),
                 size: 8,
+                placement: PlacementReference::erasure_shard(1, invalid_logical_cid.clone(), index),
             })
             .collect();
         let invalid = ErasureManifest::new(
@@ -953,7 +1117,7 @@ mod tests {
             vec![ErasureStripe {
                 offset: 0,
                 size: 16,
-                logical_cid: Cid::new(CODEC_RAW, &[0; 16]),
+                logical_cid: invalid_logical_cid,
                 encoding: ErasureStripeEncoding::Raw,
                 encoded_size: 16,
                 shard_size: 8,
@@ -973,6 +1137,7 @@ mod tests {
             let logical_size = stripe_size.min(size - offset);
             let shard_size = logical_size.div_ceil(6);
             let stripe_index = stripes.len();
+            let logical_cid = Cid::new(CODEC_RAW, format!("stripe-{stripe_index}").as_bytes());
             let shards = (0..9)
                 .map(|index| ErasureShard {
                     index,
@@ -981,12 +1146,13 @@ mod tests {
                         format!("stripe-{stripe_index}-shard-{index}").as_bytes(),
                     ),
                     size: shard_size,
+                    placement: PlacementReference::erasure_shard(1, logical_cid.clone(), index),
                 })
                 .collect();
             stripes.push(ErasureStripe {
                 offset,
                 size: logical_size,
-                logical_cid: Cid::new(CODEC_RAW, format!("stripe-{stripe_index}").as_bytes()),
+                logical_cid,
                 encoding: ErasureStripeEncoding::Raw,
                 encoded_size: logical_size,
                 shard_size,

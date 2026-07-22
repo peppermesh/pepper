@@ -14,4 +14,5 @@ description = "Deterministic data placement for PepperMesh"
 [dependencies]
 blake3 = { workspace = true }
 pepper-types = { version = "0.3.0", path = "../pepper-types" }
+serde = { workspace = true }
 thiserror = { workspace = true }

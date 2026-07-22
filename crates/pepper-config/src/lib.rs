@@ -62,6 +62,8 @@ pub struct PepperConfig {
     #[serde(default)]
     pub s3: S3Config,
     #[serde(default)]
+    pub fast_path: FastPathConfig,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -75,6 +77,12 @@ pub struct NodeConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     pub advertise_addr: Option<String>,
+    /// Dedicated QUIC bulk-data listener. When omitted, Pepper uses the
+    /// control listener port plus one on the same address.
+    pub bulk_listen_addr: Option<String>,
+    /// Routable address advertised for the dedicated bulk-data listener.
+    /// When omitted, Pepper uses the control advertise port plus one.
+    pub bulk_advertise_addr: Option<String>,
     pub failure_domain: Option<String>,
     #[serde(default)]
     pub placement_labels: BTreeMap<String, String>,
@@ -100,13 +108,132 @@ pub struct IdentityConfig {
 pub struct ApiConfig {
     #[serde(default = "default_api_bind_addr")]
     pub bind_addr: String,
+    /// Explicitly permits the built-in plaintext HTTP server to listen beyond
+    /// loopback. This is intended for isolated test networks; production
+    /// deployments should terminate TLS and authentication at a proxy.
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(default)]
+    pub engine: StorageEngine,
+    #[serde(default)]
+    pub native: NativeStorageConfig,
+    #[serde(default)]
+    pub small_object_pack: SmallObjectPackConfig,
+    #[serde(default)]
     pub locations: Vec<StorageLocationConfig>,
+}
+
+/// Durable append-log storage for small content blocks on the files backend.
+/// Sealed local segments are the replicated-record stage consumed by the
+/// object-level EC packer; the native backend already provides this physical
+/// representation for every block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmallObjectPackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_small_object_pack_max_bytes")]
+    pub max_object_bytes: u64,
+    #[serde(default = "default_small_object_pack_segment_bytes")]
+    pub segment_bytes: u64,
+    #[serde(default = "default_small_object_pack_owners")]
+    pub owners: usize,
+    #[serde(default = "default_native_io_uring_entries")]
+    pub io_uring_entries: u32,
+    #[serde(default)]
+    pub require_io_uring: bool,
+    #[serde(default = "default_small_object_pack_group_commit_delay_microseconds")]
+    pub group_commit_delay_microseconds: u64,
+    #[serde(default = "default_small_object_pack_group_commit_max_requests")]
+    pub group_commit_max_requests: usize,
+    #[serde(default = "default_native_compaction_percent")]
+    pub compaction_dead_percent: u8,
+}
+
+impl Default for SmallObjectPackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_object_bytes: default_small_object_pack_max_bytes(),
+            segment_bytes: default_small_object_pack_segment_bytes(),
+            owners: default_small_object_pack_owners(),
+            io_uring_entries: default_native_io_uring_entries(),
+            require_io_uring: false,
+            group_commit_delay_microseconds:
+                default_small_object_pack_group_commit_delay_microseconds(),
+            group_commit_max_requests: default_small_object_pack_group_commit_max_requests(),
+            compaction_dead_percent: default_native_compaction_percent(),
+        }
+    }
+}
+
+impl SmallObjectPackConfig {
+    pub fn native_config(&self) -> NativeStorageConfig {
+        NativeStorageConfig {
+            segment_bytes: self.segment_bytes,
+            owners: self.owners,
+            io_uring_entries: self.io_uring_entries,
+            // Buffered append logs avoid direct-I/O padding overhead for 4 KiB
+            // records while retaining the same grouped durability protocol.
+            direct_io: false,
+            require_io_uring: self.require_io_uring,
+            group_commit_delay_microseconds: self.group_commit_delay_microseconds,
+            group_commit_max_requests: self.group_commit_max_requests,
+            compaction_dead_percent: self.compaction_dead_percent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageEngine {
+    #[default]
+    Files,
+    NativeNvme,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeStorageConfig {
+    #[serde(default = "default_native_segment_bytes")]
+    pub segment_bytes: u64,
+    /// Zero selects a bounded number of online CPUs.
+    #[serde(default)]
+    pub owners: usize,
+    #[serde(default = "default_native_io_uring_entries")]
+    pub io_uring_entries: u32,
+    #[serde(default = "default_true")]
+    pub direct_io: bool,
+    #[serde(default)]
+    pub require_io_uring: bool,
+    /// Maximum time the native engine waits to combine independent object
+    /// commits into one device durability barrier.
+    #[serde(default = "default_native_group_commit_delay_microseconds")]
+    pub group_commit_delay_microseconds: u64,
+    #[serde(default = "default_native_group_commit_max_requests")]
+    pub group_commit_max_requests: usize,
+    #[serde(default = "default_native_compaction_percent")]
+    pub compaction_dead_percent: u8,
+}
+
+impl Default for NativeStorageConfig {
+    fn default() -> Self {
+        Self {
+            segment_bytes: default_native_segment_bytes(),
+            owners: 0,
+            io_uring_entries: default_native_io_uring_entries(),
+            direct_io: true,
+            require_io_uring: false,
+            group_commit_delay_microseconds: default_native_group_commit_delay_microseconds(),
+            group_commit_max_requests: default_native_group_commit_max_requests(),
+            compaction_dead_percent: default_native_compaction_percent(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,11 +243,56 @@ pub struct StorageLocationConfig {
     pub max_capacity_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    #[serde(default)]
+    pub bulk: BulkTransportConfig,
+}
+
+/// Physical bulk-data plane limits. Control and Raft traffic never consumes
+/// these workers, connection slots, stream slots, or flow-control windows.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkTransportConfig {
+    #[serde(default = "default_bulk_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_bulk_inbound_connections")]
+    pub inbound_connections: usize,
+    #[serde(default = "default_bulk_streams_per_connection")]
+    pub streams_per_connection: usize,
+    #[serde(default = "default_bulk_send_window_bytes")]
+    pub send_window_bytes: u64,
+    #[serde(default = "default_bulk_connection_receive_window_bytes")]
+    pub connection_receive_window_bytes: u64,
+    #[serde(default = "default_bulk_stream_receive_window_bytes")]
+    pub stream_receive_window_bytes: u64,
+    #[serde(default = "default_bulk_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// Aggregate raw bulk payload budget. Zero disables shaping. Set this
+    /// below measured link capacity to reserve bandwidth for control traffic.
+    #[serde(default)]
+    pub max_bytes_per_second: u64,
+    #[serde(default = "default_bulk_bandwidth_burst_bytes")]
+    pub bandwidth_burst_bytes: u64,
+}
+
+impl Default for BulkTransportConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: default_bulk_worker_threads(),
+            inbound_connections: default_bulk_inbound_connections(),
+            streams_per_connection: default_bulk_streams_per_connection(),
+            send_window_bytes: default_bulk_send_window_bytes(),
+            connection_receive_window_bytes: default_bulk_connection_receive_window_bytes(),
+            stream_receive_window_bytes: default_bulk_stream_receive_window_bytes(),
+            request_timeout_seconds: default_bulk_request_timeout_seconds(),
+            max_bytes_per_second: 0,
+            bandwidth_burst_bytes: default_bulk_bandwidth_burst_bytes(),
+        }
+    }
 }
 
 /// Transactional namespace and per-node consensus resource configuration.
@@ -184,7 +356,52 @@ pub struct ErasureConfig {
     #[serde(default = "default_erasure_parity_shards")]
     pub parity_shards: u16,
     #[serde(default)]
+    pub transfer: ErasureTransferConfig,
+    #[serde(default)]
     pub reconstructed_cache: ReconstructedCacheConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ErasureTransferStrategy {
+    #[default]
+    Adaptive,
+    GatewayFanout,
+    DistributedParity,
+    Hierarchical,
+    Pipelined,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureTransferConfig {
+    #[serde(default)]
+    pub strategy: ErasureTransferStrategy,
+    /// Gateway link shape used with live queue/completion telemetry. Zero lets
+    /// the selector infer pressure only from bounded stream occupancy.
+    #[serde(default)]
+    pub gateway_capacity_mbps: u64,
+    #[serde(default = "default_erasure_transfer_switch_samples")]
+    pub switch_after_samples: u16,
+    #[serde(default = "default_erasure_transfer_min_dwell_ms")]
+    pub minimum_dwell_ms: u64,
+    #[serde(default = "default_erasure_transfer_min_stripe_bytes")]
+    pub minimum_adaptive_stripe_bytes: u64,
+    #[serde(default = "default_erasure_pipeline_max_hops")]
+    pub pipeline_max_hops: u8,
+}
+
+impl Default for ErasureTransferConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ErasureTransferStrategy::Adaptive,
+            gateway_capacity_mbps: 0,
+            switch_after_samples: default_erasure_transfer_switch_samples(),
+            minimum_dwell_ms: default_erasure_transfer_min_dwell_ms(),
+            minimum_adaptive_stripe_bytes: default_erasure_transfer_min_stripe_bytes(),
+            pipeline_max_hops: default_erasure_pipeline_max_hops(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -260,6 +477,8 @@ pub struct S3Config {
     pub secret_access_key_path: Option<PathBuf>,
     #[serde(default = "default_s3_clock_skew_seconds")]
     pub max_clock_skew_seconds: u64,
+    #[serde(default = "default_s3_bucket_partitions")]
+    pub bucket_partitions: u16,
 }
 
 impl Default for S3Config {
@@ -270,6 +489,51 @@ impl Default for S3Config {
             access_key_id: None,
             secret_access_key_path: None,
             max_clock_skew_seconds: default_s3_clock_skew_seconds(),
+            bucket_partitions: default_s3_bucket_partitions(),
+        }
+    }
+}
+
+/// Per-core S3 execution ownership and admission configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastPathConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Zero selects one owner for every online CPU not reserved for control.
+    #[serde(default)]
+    pub workers: usize,
+    #[serde(default = "default_fast_path_control_cores")]
+    pub control_cores: usize,
+    #[serde(default = "default_fast_path_queue_depth")]
+    pub queue_depth: usize,
+    #[serde(default = "default_fast_path_requests_per_worker")]
+    pub requests_per_worker: usize,
+    #[serde(default = "default_fast_path_writes_per_worker")]
+    pub writes_per_worker: usize,
+    #[serde(default = "default_fast_path_replications_per_worker")]
+    pub replications_per_worker: usize,
+    #[serde(default = "default_fast_path_stripe_reads_per_worker")]
+    pub stripe_reads_per_worker: usize,
+    #[serde(default = "default_fast_path_response_frames")]
+    pub response_frames: usize,
+    #[serde(default = "default_true")]
+    pub pin_cpus: bool,
+}
+
+impl Default for FastPathConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workers: 0,
+            control_cores: default_fast_path_control_cores(),
+            queue_depth: default_fast_path_queue_depth(),
+            requests_per_worker: default_fast_path_requests_per_worker(),
+            writes_per_worker: default_fast_path_writes_per_worker(),
+            replications_per_worker: default_fast_path_replications_per_worker(),
+            stripe_reads_per_worker: default_fast_path_stripe_reads_per_worker(),
+            response_frames: default_fast_path_response_frames(),
+            pin_cpus: true,
         }
     }
 }
@@ -304,6 +568,8 @@ impl Default for NodeConfig {
             name: default_node_name(),
             listen_addr: default_listen_addr(),
             advertise_addr: None,
+            bulk_listen_addr: None,
+            bulk_advertise_addr: None,
             failure_domain: None,
             placement_labels: BTreeMap::new(),
         }
@@ -331,6 +597,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_api_bind_addr(),
+            allow_insecure_remote: false,
         }
     }
 }
@@ -375,6 +642,7 @@ impl Default for ErasureConfig {
             min_size_bytes: default_erasure_min_size_bytes(),
             data_shards: default_erasure_data_shards(),
             parity_shards: default_erasure_parity_shards(),
+            transfer: ErasureTransferConfig::default(),
             reconstructed_cache: ReconstructedCacheConfig::default(),
         }
     }
@@ -423,6 +691,38 @@ fn default_listen_addr() -> String {
     "127.0.0.1:9000".to_string()
 }
 
+fn default_bulk_worker_threads() -> usize {
+    2
+}
+
+fn default_bulk_inbound_connections() -> usize {
+    512
+}
+
+fn default_bulk_streams_per_connection() -> usize {
+    256
+}
+
+fn default_bulk_send_window_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+fn default_bulk_connection_receive_window_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+fn default_bulk_stream_receive_window_bytes() -> u64 {
+    68 * 1024 * 1024
+}
+
+fn default_bulk_request_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_bulk_bandwidth_burst_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
 fn default_api_bind_addr() -> String {
     "127.0.0.1:9080".to_string()
 }
@@ -433,6 +733,78 @@ fn default_s3_region() -> String {
 
 fn default_s3_clock_skew_seconds() -> u64 {
     900
+}
+
+fn default_s3_bucket_partitions() -> u16 {
+    16
+}
+
+fn default_native_segment_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_small_object_pack_max_bytes() -> u64 {
+    4 * 1024
+}
+
+fn default_small_object_pack_segment_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_small_object_pack_owners() -> usize {
+    8
+}
+
+fn default_small_object_pack_group_commit_delay_microseconds() -> u64 {
+    200
+}
+
+fn default_small_object_pack_group_commit_max_requests() -> usize {
+    256
+}
+
+fn default_native_io_uring_entries() -> u32 {
+    256
+}
+
+fn default_native_group_commit_delay_microseconds() -> u64 {
+    0
+}
+
+fn default_native_group_commit_max_requests() -> usize {
+    64
+}
+
+fn default_native_compaction_percent() -> u8 {
+    50
+}
+
+fn default_fast_path_control_cores() -> usize {
+    2
+}
+
+fn default_fast_path_queue_depth() -> usize {
+    256
+}
+
+fn default_fast_path_requests_per_worker() -> usize {
+    128
+}
+
+fn default_fast_path_writes_per_worker() -> usize {
+    4
+}
+
+fn default_fast_path_replications_per_worker() -> usize {
+    8
+}
+
+fn default_fast_path_stripe_reads_per_worker() -> usize {
+    32
+}
+
+fn default_fast_path_response_frames() -> usize {
+    8
 }
 
 fn default_data_path() -> PathBuf {
@@ -521,6 +893,22 @@ fn default_erasure_data_shards() -> u16 {
 
 fn default_erasure_parity_shards() -> u16 {
     3
+}
+
+fn default_erasure_transfer_switch_samples() -> u16 {
+    3
+}
+
+fn default_erasure_transfer_min_dwell_ms() -> u64 {
+    5_000
+}
+
+fn default_erasure_transfer_min_stripe_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_erasure_pipeline_max_hops() -> u8 {
+    6
 }
 
 fn default_reconstructed_cache_admission_hits() -> u8 {
@@ -625,15 +1013,97 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
                 .to_string(),
         ));
     }
+    let derived_bulk_listen = SocketAddr::new(
+        listen_addr.ip(),
+        listen_addr.port().checked_add(1).ok_or_else(|| {
+            ConfigError::Invalid(
+                "node.bulk_listen_addr is required when node.listen_addr uses port 65535"
+                    .to_string(),
+            )
+        })?,
+    );
+    let bulk_listen_addr = config
+        .node
+        .bulk_listen_addr
+        .as_deref()
+        .map(str::parse::<SocketAddr>)
+        .transpose()
+        .map_err(|e| {
+            ConfigError::Invalid(format!(
+                "node.bulk_listen_addr is not a socket address: {e}"
+            ))
+        })?
+        .unwrap_or(derived_bulk_listen);
+    if bulk_listen_addr == listen_addr {
+        return Err(ConfigError::Invalid(
+            "node.bulk_listen_addr must differ from node.listen_addr".to_string(),
+        ));
+    }
+    let advertise_addr = config
+        .node
+        .advertise_addr
+        .as_deref()
+        .unwrap_or(&config.node.listen_addr)
+        .parse::<SocketAddr>()
+        .expect("control advertise address was validated above");
+    let derived_bulk_advertise = SocketAddr::new(
+        advertise_addr.ip(),
+        advertise_addr.port().checked_add(1).ok_or_else(|| {
+            ConfigError::Invalid(
+                "node.bulk_advertise_addr is required when node.advertise_addr uses port 65535"
+                    .to_string(),
+            )
+        })?,
+    );
+    let bulk_advertise_addr = config
+        .node
+        .bulk_advertise_addr
+        .as_deref()
+        .map(str::parse::<SocketAddr>)
+        .transpose()
+        .map_err(|e| {
+            ConfigError::Invalid(format!(
+                "node.bulk_advertise_addr is not a socket address: {e}"
+            ))
+        })?
+        .unwrap_or(derived_bulk_advertise);
+    if bulk_advertise_addr.ip().is_unspecified() || bulk_advertise_addr.ip().is_multicast() {
+        return Err(ConfigError::Invalid(
+            "node.bulk_advertise_addr must be a routable unicast address".to_string(),
+        ));
+    }
+    let bulk = &config.network.bulk;
+    if bulk.worker_threads == 0
+        || bulk.worker_threads > 128
+        || bulk.inbound_connections == 0
+        || bulk.inbound_connections > 65_535
+        || bulk.streams_per_connection == 0
+        || bulk.streams_per_connection > 65_535
+        || bulk.send_window_bytes < 4 * 1024 * 1024
+        || bulk.send_window_bytes > u64::from(u32::MAX)
+        || bulk.connection_receive_window_bytes < 4 * 1024 * 1024
+        || bulk.connection_receive_window_bytes > u64::from(u32::MAX)
+        || bulk.stream_receive_window_bytes < 1024 * 1024
+        || bulk.stream_receive_window_bytes > bulk.connection_receive_window_bytes
+        || bulk.request_timeout_seconds == 0
+        || bulk.request_timeout_seconds > 3600
+        || (bulk.max_bytes_per_second > 0
+            && (bulk.max_bytes_per_second < 1024 * 1024
+                || bulk.bandwidth_burst_bytes < 68 * 1024 * 1024))
+        || bulk.bandwidth_burst_bytes > u64::from(u32::MAX)
+    {
+        return Err(ConfigError::Invalid(
+            "network.bulk limits are outside their supported ranges".to_string(),
+        ));
+    }
 
     let api_addr =
         config.api.bind_addr.parse::<SocketAddr>().map_err(|e| {
             ConfigError::Invalid(format!("api.bind_addr is not a socket address: {e}"))
         })?;
-    if !api_addr.ip().is_loopback() {
+    if !api_addr.ip().is_loopback() && !config.api.allow_insecure_remote {
         return Err(ConfigError::Invalid(
-            "api.bind_addr must use a loopback address; use a TLS reverse proxy for remote access"
-                .to_string(),
+            "api.bind_addr must use a loopback address unless api.allow_insecure_remote is explicitly enabled; use a TLS reverse proxy for production remote access".to_string(),
         ));
     }
 
@@ -805,6 +1275,41 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
                 "s3.max_clock_skew_seconds must be between 1 and 3600".to_string(),
             ));
         }
+        if config.s3.bucket_partitions == 0
+            || config.s3.bucket_partitions > 256
+            || !config.s3.bucket_partitions.is_power_of_two()
+        {
+            return Err(ConfigError::Invalid(
+                "s3.bucket_partitions must be a power of two between 1 and 256".to_string(),
+            ));
+        }
+    }
+    if config.fast_path.enabled {
+        if config.fast_path.control_cores == 0 {
+            return Err(ConfigError::Invalid(
+                "fast_path.control_cores must be greater than zero".to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("queue_depth", config.fast_path.queue_depth),
+            ("requests_per_worker", config.fast_path.requests_per_worker),
+            ("writes_per_worker", config.fast_path.writes_per_worker),
+            (
+                "replications_per_worker",
+                config.fast_path.replications_per_worker,
+            ),
+            (
+                "stripe_reads_per_worker",
+                config.fast_path.stripe_reads_per_worker,
+            ),
+            ("response_frames", config.fast_path.response_frames),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "fast_path.{name} must be greater than zero"
+                )));
+            }
+        }
     }
     if config
         .limits
@@ -893,6 +1398,28 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
             "erasure data_shards + parity_shards must be <= 32".to_string(),
         ));
     }
+    let transfer = &config.erasure.transfer;
+    if !(1..=100).contains(&transfer.switch_after_samples) {
+        return Err(ConfigError::Invalid(
+            "erasure.transfer.switch_after_samples must be between 1 and 100".to_string(),
+        ));
+    }
+    if transfer.minimum_dwell_ms > 60_000 {
+        return Err(ConfigError::Invalid(
+            "erasure.transfer.minimum_dwell_ms must not exceed 60000".to_string(),
+        ));
+    }
+    if transfer.minimum_adaptive_stripe_bytes == 0 {
+        return Err(ConfigError::Invalid(
+            "erasure.transfer.minimum_adaptive_stripe_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if !(1..=config.erasure.data_shards.min(32) as u8).contains(&transfer.pipeline_max_hops) {
+        return Err(ConfigError::Invalid(format!(
+            "erasure.transfer.pipeline_max_hops must be between 1 and erasure.data_shards ({})",
+            config.erasure.data_shards
+        )));
+    }
     let cache = &config.erasure.reconstructed_cache;
     if cache.path.is_some() != (cache.max_capacity_bytes > 0) {
         return Err(ConfigError::Invalid(
@@ -924,6 +1451,111 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
                 "duplicate storage location path {}",
                 location.path.display()
             )));
+        }
+    }
+    if config.storage.engine == StorageEngine::NativeNvme {
+        let native = &config.storage.native;
+        if native.segment_bytes < 4 * 1024 * 1024
+            || native.segment_bytes > u64::from(u32::MAX)
+            || native.segment_bytes % 4096 != 0
+        {
+            return Err(ConfigError::Invalid(
+                "storage.native.segment_bytes must be between 4 MiB and 4 GiB and 4096-byte aligned"
+                    .to_string(),
+            ));
+        }
+        let maximum_block = config.limits.max_block_bytes.unwrap_or(64 * 1024 * 1024);
+        if native.segment_bytes < maximum_block.saturating_add(1024 * 1024) {
+            return Err(ConfigError::Invalid(
+                "storage.native.segment_bytes must exceed limits.max_block_bytes by at least 1 MiB"
+                    .to_string(),
+            ));
+        }
+        if config
+            .storage
+            .locations
+            .iter()
+            .any(|location| location.max_capacity_bytes < native.segment_bytes)
+        {
+            return Err(ConfigError::Invalid(
+                "each native storage location must have capacity for at least one segment"
+                    .to_string(),
+            ));
+        }
+        if !(8..=32_768).contains(&native.io_uring_entries) {
+            return Err(ConfigError::Invalid(
+                "storage.native.io_uring_entries must be between 8 and 32768".to_string(),
+            ));
+        }
+        if native.owners > 4096 {
+            return Err(ConfigError::Invalid(
+                "storage.native.owners must be zero or at most 4096".to_string(),
+            ));
+        }
+        if native.group_commit_delay_microseconds > 10_000 {
+            return Err(ConfigError::Invalid(
+                "storage.native.group_commit_delay_microseconds must be at most 10000".to_string(),
+            ));
+        }
+        if !(1..=4096).contains(&native.group_commit_max_requests) {
+            return Err(ConfigError::Invalid(
+                "storage.native.group_commit_max_requests must be between 1 and 4096".to_string(),
+            ));
+        }
+        if !(10..=90).contains(&native.compaction_dead_percent) {
+            return Err(ConfigError::Invalid(
+                "storage.native.compaction_dead_percent must be between 10 and 90".to_string(),
+            ));
+        }
+    }
+    let pack = &config.storage.small_object_pack;
+    if pack.enabled && config.storage.engine == StorageEngine::Files {
+        if !(4 * 1024..=1024 * 1024).contains(&pack.max_object_bytes) {
+            return Err(ConfigError::Invalid(
+                "storage.small_object_pack.max_object_bytes must be between 4 KiB and 1 MiB"
+                    .to_string(),
+            ));
+        }
+        if pack.segment_bytes < 4 * 1024 * 1024
+            || pack.segment_bytes > u64::from(u32::MAX)
+            || pack.segment_bytes % 4096 != 0
+            || pack.segment_bytes < pack.max_object_bytes.saturating_add(1024 * 1024)
+        {
+            return Err(ConfigError::Invalid(
+                "storage.small_object_pack.segment_bytes must be 4 MiB to 4 GiB, 4096-byte aligned, and exceed max_object_bytes by at least 1 MiB"
+                    .to_string(),
+            ));
+        }
+        if pack.owners == 0 || pack.owners > 4096 {
+            return Err(ConfigError::Invalid(
+                "storage.small_object_pack.owners must be between 1 and 4096".to_string(),
+            ));
+        }
+        if !(8..=32_768).contains(&pack.io_uring_entries) {
+            return Err(ConfigError::Invalid(
+                "storage.small_object_pack.io_uring_entries must be between 8 and 32768"
+                    .to_string(),
+            ));
+        }
+        if pack.group_commit_delay_microseconds > 10_000
+            || !(1..=4096).contains(&pack.group_commit_max_requests)
+            || !(10..=90).contains(&pack.compaction_dead_percent)
+        {
+            return Err(ConfigError::Invalid(
+                "storage.small_object_pack group commit or compaction settings are out of range"
+                    .to_string(),
+            ));
+        }
+        if config
+            .storage
+            .locations
+            .iter()
+            .any(|location| location.max_capacity_bytes < pack.segment_bytes)
+        {
+            return Err(ConfigError::Invalid(
+                "each storage location must have capacity for one small-object pack segment"
+                    .to_string(),
+            ));
         }
     }
     for (name, value) in [
@@ -985,6 +1617,9 @@ impl PepperConfig {
             fs::create_dir_all(location.path.join("tmp"))?;
             fs::create_dir_all(location.path.join("gc"))?;
             fs::create_dir_all(location.path.join("meta"))?;
+            if self.storage.engine == StorageEngine::NativeNvme {
+                fs::create_dir_all(location.path.join("segments"))?;
+            }
         }
         if let Some(path) = &self.erasure.reconstructed_cache.path {
             fs::create_dir_all(path)?;
@@ -1038,13 +1673,116 @@ mod tests {
         validate(&cfg).unwrap();
         assert_eq!(cfg.node.name, "node-a");
         assert_eq!(cfg.api.bind_addr, "127.0.0.1:9080");
+        assert!(!cfg.api.allow_insecure_remote);
         assert_eq!(cfg.replication.default_factor, 3);
         assert!(!cfg.namespace.enabled);
         assert!(!cfg.s3.enabled);
         assert_eq!(cfg.s3.region, "us-east-1");
+        assert!(cfg.fast_path.enabled);
+        assert_eq!(cfg.fast_path.control_cores, 2);
+        assert_eq!(cfg.network.bulk.worker_threads, 2);
+        assert_eq!(cfg.network.bulk.max_bytes_per_second, 0);
+        assert_eq!(cfg.storage.small_object_pack.max_object_bytes, 4 * 1024);
         assert!(!cfg.erasure.enabled);
         assert_eq!(cfg.erasure.data_shards, 6);
         assert_eq!(cfg.erasure.parity_shards, 3);
+    }
+
+    #[test]
+    fn remote_plaintext_api_binding_requires_explicit_opt_in() {
+        let rejected: PepperConfig = toml::from_str(
+            r#"
+            [node]
+            name = "node-a"
+            [api]
+            bind_addr = "0.0.0.0:9080"
+            [[storage.locations]]
+            path = "/tmp/pepper-config-remote-rejected"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        assert!(validate(&rejected).is_err());
+
+        let allowed: PepperConfig = toml::from_str(
+            r#"
+            [node]
+            name = "node-a"
+            [api]
+            bind_addr = "0.0.0.0:9080"
+            allow_insecure_remote = true
+            [[storage.locations]]
+            path = "/tmp/pepper-config-remote-allowed"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&allowed).unwrap();
+    }
+
+    #[test]
+    fn validates_per_core_fast_path() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [fast_path]
+            workers = 4
+            control_cores = 2
+            queue_depth = 64
+            requests_per_worker = 32
+            writes_per_worker = 2
+            replications_per_worker = 4
+            stripe_reads_per_worker = 8
+            response_frames = 4
+            pin_cpus = false
+            [[storage.locations]]
+            path = "/tmp/pepper-config-fast-path-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.fast_path.workers, 4);
+
+        let mut invalid = cfg;
+        invalid.fast_path.queue_depth = 0;
+        assert!(validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_isolated_bulk_transport() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [node]
+            listen_addr = "127.0.0.1:9000"
+            bulk_listen_addr = "127.0.0.1:9100"
+            bulk_advertise_addr = "127.0.0.1:9100"
+            [network.bulk]
+            worker_threads = 3
+            inbound_connections = 128
+            streams_per_connection = 64
+            send_window_bytes = 268435456
+            connection_receive_window_bytes = 268435456
+            stream_receive_window_bytes = 71303168
+            request_timeout_seconds = 90
+            max_bytes_per_second = 125000000
+            bandwidth_burst_bytes = 134217728
+            [[storage.locations]]
+            path = "/tmp/pepper-config-bulk-transport-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.network.bulk.worker_threads, 3);
+        assert_eq!(cfg.network.bulk.max_bytes_per_second, 125_000_000);
+
+        let mut invalid = cfg.clone();
+        invalid.node.bulk_listen_addr = Some(invalid.node.listen_addr.clone());
+        assert!(validate(&invalid).is_err());
+        invalid.node.bulk_listen_addr = Some("127.0.0.1:9100".to_string());
+        invalid.network.bulk.stream_receive_window_bytes =
+            invalid.network.bulk.connection_receive_window_bytes + 1;
+        assert!(validate(&invalid).is_err());
     }
 
     #[test]
@@ -1067,6 +1805,10 @@ mod tests {
         )
         .unwrap();
         validate(&cfg).unwrap();
+        assert_eq!(cfg.s3.bucket_partitions, 16);
+        let mut invalid_partitions = cfg.clone();
+        invalid_partitions.s3.bucket_partitions = 3;
+        assert!(validate(&invalid_partitions).is_err());
 
         let invalid: PepperConfig = toml::from_str(
             r#"
@@ -1115,6 +1857,13 @@ mod tests {
             min_size_bytes = 1024
             data_shards = 4
             parity_shards = 2
+            [erasure.transfer]
+            strategy = "distributed-parity"
+            gateway_capacity_mbps = 10000
+            switch_after_samples = 4
+            minimum_dwell_ms = 2000
+            minimum_adaptive_stripe_bytes = 8388608
+            pipeline_max_hops = 4
             [erasure.reconstructed_cache]
             path = "/tmp/pepper-config-erasure-cache"
             max_capacity_bytes = 4096
@@ -1127,6 +1876,11 @@ mod tests {
             cfg.erasure.reconstructed_cache.path.as_deref(),
             Some(Path::new("/tmp/pepper-config-erasure-cache"))
         );
+        assert_eq!(
+            cfg.erasure.transfer.strategy,
+            ErasureTransferStrategy::DistributedParity
+        );
+        assert_eq!(cfg.erasure.transfer.gateway_capacity_mbps, 10_000);
 
         let invalid: PepperConfig = toml::from_str(
             r#"
@@ -1169,5 +1923,70 @@ mod tests {
         )
         .unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validates_native_nvme_storage_configuration() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [storage]
+            engine = "native-nvme"
+            [storage.native]
+            segment_bytes = 268435456
+            owners = 8
+            io_uring_entries = 256
+            direct_io = true
+            require_io_uring = false
+            group_commit_delay_microseconds = 0
+            group_commit_max_requests = 64
+            compaction_dead_percent = 50
+            [[storage.locations]]
+            path = "/tmp/pepper-config-native-test"
+            max_capacity_bytes = 1073741824
+            [limits]
+            max_block_bytes = 67108864
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::NativeNvme);
+        assert_eq!(cfg.storage.native.owners, 8);
+        assert_eq!(cfg.storage.native.group_commit_max_requests, 64);
+
+        let mut undersized = cfg.clone();
+        undersized.storage.native.segment_bytes = 64 * 1024 * 1024;
+        assert!(validate(&undersized).is_err());
+
+        let mut unaligned = cfg;
+        unaligned.storage.native.segment_bytes += 1;
+        assert!(validate(&unaligned).is_err());
+    }
+
+    #[test]
+    fn validates_small_object_pack_configuration() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [storage.small_object_pack]
+            enabled = true
+            max_object_bytes = 1048576
+            segment_bytes = 67108864
+            owners = 8
+            io_uring_entries = 256
+            group_commit_delay_microseconds = 200
+            group_commit_max_requests = 256
+            compaction_dead_percent = 50
+            [[storage.locations]]
+            path = "/tmp/pepper-config-pack-test"
+            max_capacity_bytes = 1073741824
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.storage.small_object_pack.enabled);
+        assert_eq!(cfg.storage.small_object_pack.max_object_bytes, 1024 * 1024);
+
+        let mut invalid = cfg;
+        invalid.storage.small_object_pack.segment_bytes = 1024 * 1024;
+        assert!(validate(&invalid).is_err());
     }
 }

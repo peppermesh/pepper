@@ -13,9 +13,143 @@ use pepper_publication::{
 #[allow(dead_code)]
 pub(super) struct AgentDurabilityBackend(pub(super) AppState);
 
-#[async_trait]
-impl DurabilityBackend for AgentDurabilityBackend {
-    async fn ensure_durable(
+impl AgentDurabilityBackend {
+    pub(super) async fn ensure_at_placement(
+        &self,
+        cid: &Cid,
+        replication_factor: usize,
+        placement: PlacementReference,
+    ) -> Result<DurabilityReceipt, PublicationError> {
+        let block = get_block_at_placement(&self.0, cid, &placement)
+            .await
+            .map_err(|error| PublicationError::Storage(error.message))?;
+        let decision = self
+            .0
+            .placement
+            .decide(&placement)
+            .map_err(|error| PublicationError::Protection(error.to_string()))?;
+        let target_node_ids = decision.node_ids;
+        let payload = block.payload;
+        let encoded = self
+            .0
+            .block_store
+            .get_encoded(cid)
+            .or_else(|_| self.0.block_store.encode(cid.codec, &payload))
+            .map_err(|error| PublicationError::Storage(error.to_string()))?;
+        let encoded_size = encoded.logical_size_bytes();
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+
+        let local_node_id = self.0.status.node_id.clone();
+        let local_selected = target_node_ids.contains(&local_node_id);
+        let mut replica_nodes = Vec::new();
+        if local_selected && self.0.block_store.has(cid).unwrap_or(false) {
+            replica_nodes.push(local_node_id.clone());
+        }
+        let probes = target_node_ids
+            .clone()
+            .into_iter()
+            .filter(|node_id| node_id != &local_node_id)
+            .map(|node_id| {
+                let network = self.0.network.clone();
+                let cid = cid.clone();
+                async move {
+                    let address = fast_path::peer_address(&network, &node_id).await?;
+                    matches!(
+                        time::timeout(Duration::from_secs(5), network.block_has(address, &cid))
+                            .await,
+                        Ok(Ok(true))
+                    )
+                    .then_some((node_id, address))
+                }
+            });
+        let mut probes = stream::iter(probes).buffer_unordered(8);
+        while let Some(confirmed) = probes.next().await {
+            if let Some((node_id, _)) = confirmed {
+                replica_nodes.push(node_id);
+            }
+        }
+        replica_nodes.sort();
+        replica_nodes.dedup();
+        if replica_nodes.len() >= replication_factor {
+            return Ok(DurabilityReceipt {
+                cid: cid.clone(),
+                placement: Some(placement),
+                codec: cid.codec,
+                size: payload.len() as u64,
+                replicas_accepted: replica_nodes.len(),
+                replica_nodes,
+                status: "durable".to_string(),
+            });
+        }
+
+        // A failed node must not delay every CID in a namespace publication.
+        // Send missing replicas concurrently and stop as soon as the durability
+        // threshold is met; dropping the remaining futures cancels transfers to
+        // unavailable peers.
+        let confirmed_nodes = replica_nodes
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let transfers = target_node_ids
+            .into_iter()
+            .filter(|node_id| !confirmed_nodes.contains(node_id) && node_id != &local_node_id)
+            .map(|node_id| {
+                let state = self.0.clone();
+                let cid = cid.clone();
+                let encoded_payload = encoded_payload.clone();
+                async move {
+                    let transfer = async {
+                        let address = fast_path::peer_address(&state.network, &node_id).await?;
+                        let ack = state
+                            .network
+                            .block_put_replica_stream(
+                                address,
+                                cid.codec,
+                                &cid,
+                                encoded_size,
+                                encoded_payload,
+                            )
+                            .await
+                            .ok()?;
+                        parse_replica_ack(&node_id, &cid, cid.codec, encoded_size, &ack)
+                            .ok()
+                            .map(|provider| (node_id, provider))
+                    };
+                    time::timeout(Duration::from_secs(12), transfer)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            });
+        let mut transfers = stream::iter(transfers).buffer_unordered(8);
+        while let Some(confirmed) = transfers.next().await {
+            if let Some((node_id, _provider)) = confirmed {
+                replica_nodes.push(node_id);
+                replica_nodes.sort();
+                replica_nodes.dedup();
+                if replica_nodes.len() >= replication_factor {
+                    break;
+                }
+            }
+        }
+        let replicas_accepted = replica_nodes.len();
+        Ok(DurabilityReceipt {
+            cid: cid.clone(),
+            placement: Some(placement),
+            codec: cid.codec,
+            size: payload.len() as u64,
+            replicas_accepted,
+            replica_nodes,
+            status: if replicas_accepted >= replication_factor {
+                "durable"
+            } else {
+                "degraded"
+            }
+            .to_string(),
+        })
+    }
+
+    async fn ensure_legacy_durable(
         &self,
         cid: &Cid,
         replication_factor: usize,
@@ -33,11 +167,6 @@ impl DurabilityBackend for AgentDurabilityBackend {
         let encoded_size = encoded.logical_size_bytes();
         let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
 
-        // Object ingestion already persists signed provider records for every
-        // acknowledged replica. Confirm those replicas with a cheap authenticated
-        // BlockHas request before transferring the complete block again. This is
-        // particularly important for multipart publication, which walks every
-        // part chunk immediately after the upload path replicated it.
         let local_provider = self.0.network.local_provider_record(cid);
         self.0
             .network
@@ -59,7 +188,6 @@ impl DurabilityBackend for AgentDurabilityBackend {
             .map(|record| {
                 let network = self.0.network.clone();
                 async move {
-                    let mut confirmed = false;
                     for address in &record.addresses {
                         let Ok(address) = address.parse::<SocketAddr>() else {
                             continue;
@@ -72,11 +200,10 @@ impl DurabilityBackend for AgentDurabilityBackend {
                             .await,
                             Ok(Ok(true))
                         ) {
-                            confirmed = true;
-                            break;
+                            return Some(record);
                         }
                     }
-                    confirmed.then_some(record)
+                    None
                 }
             });
         let mut probes = stream::iter(probes).buffer_unordered(8);
@@ -91,98 +218,82 @@ impl DurabilityBackend for AgentDurabilityBackend {
         }
         providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         providers.dedup_by(|left, right| left.node_id == right.node_id);
-        if providers.len() >= replication_factor {
-            return Ok(DurabilityReceipt {
-                cid: cid.clone(),
-                codec: cid.codec,
-                size: payload.len() as u64,
-                replicas_accepted: providers.len(),
-                replica_nodes: providers
-                    .iter()
-                    .map(|provider| provider.node_id.clone())
-                    .collect(),
-                status: "durable".to_string(),
-                providers,
-            });
-        }
-
-        // A failed node must not delay every CID in a namespace publication.
-        // Send missing replicas concurrently and stop as soon as the durability
-        // threshold is met; dropping the remaining futures cancels transfers to
-        // unavailable peers.
-        let confirmed_nodes = providers
-            .iter()
-            .map(|provider| provider.node_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let transfers = self
-            .0
-            .network
-            .peers()
-            .await
-            .into_iter()
-            .filter(|peer| !confirmed_nodes.contains(&peer.node_id))
-            .map(|peer| {
-                let state = self.0.clone();
-                let cid = cid.clone();
-                let encoded_payload = encoded_payload.clone();
-                async move {
-                    let transfer = async {
-                        for address in &peer.addresses {
-                            let Ok(address) = address.parse::<SocketAddr>() else {
-                                continue;
-                            };
-                            let Ok(ack) = state
-                                .network
-                                .block_put_replica_stream(
-                                    address,
-                                    cid.codec,
+        if providers.len() < replication_factor {
+            let confirmed_nodes = providers
+                .iter()
+                .map(|provider| provider.node_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let transfers = self
+                .0
+                .network
+                .peers()
+                .await
+                .into_iter()
+                .filter(|peer| !confirmed_nodes.contains(&peer.node_id))
+                .map(|peer| {
+                    let state = self.0.clone();
+                    let cid = cid.clone();
+                    let encoded_payload = encoded_payload.clone();
+                    async move {
+                        let transfer = async {
+                            for address in &peer.addresses {
+                                let Ok(address) = address.parse::<SocketAddr>() else {
+                                    continue;
+                                };
+                                let Ok(ack) = state
+                                    .network
+                                    .block_put_replica_stream(
+                                        address,
+                                        cid.codec,
+                                        &cid,
+                                        encoded_size,
+                                        encoded_payload.clone(),
+                                    )
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                if let Ok(provider) = validate_replica_ack(
+                                    &state,
+                                    &peer.node_id,
                                     &cid,
+                                    cid.codec,
                                     encoded_size,
-                                    encoded_payload.clone(),
-                                )
-                                .await
-                            else {
-                                continue;
-                            };
-                            if let Ok(provider) = validate_replica_ack(
-                                &state,
-                                &peer.node_id,
-                                &cid,
-                                cid.codec,
-                                encoded_size,
-                                &ack,
-                            ) {
-                                return Some(provider);
+                                    &ack,
+                                ) {
+                                    return Some(provider);
+                                }
                             }
-                        }
-                        None
-                    };
-                    time::timeout(Duration::from_secs(12), transfer)
-                        .await
-                        .ok()
-                        .flatten()
-                }
-            });
-        let mut transfers = stream::iter(transfers).buffer_unordered(8);
-        while let Some(provider) = transfers.next().await {
-            if let Some(provider) = provider {
-                providers.push(provider);
-                providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-                providers.dedup_by(|left, right| left.node_id == right.node_id);
-                if providers.len() >= replication_factor {
-                    break;
+                            None
+                        };
+                        time::timeout(Duration::from_secs(12), transfer)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                });
+            let mut transfers = stream::iter(transfers).buffer_unordered(8);
+            while let Some(provider) = transfers.next().await {
+                if let Some(provider) = provider {
+                    providers.push(provider);
+                    providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+                    providers.dedup_by(|left, right| left.node_id == right.node_id);
+                    if providers.len() >= replication_factor {
+                        break;
+                    }
                 }
             }
         }
         let replicas_accepted = providers.len();
         Ok(DurabilityReceipt {
             cid: cid.clone(),
+            placement: None,
             codec: cid.codec,
             size: payload.len() as u64,
             replicas_accepted,
             replica_nodes: providers
-                .iter()
-                .map(|provider| provider.node_id.clone())
+                .into_iter()
+                .map(|provider| provider.node_id)
                 .collect(),
             status: if replicas_accepted >= replication_factor {
                 "durable"
@@ -190,8 +301,40 @@ impl DurabilityBackend for AgentDurabilityBackend {
                 "degraded"
             }
             .to_string(),
-            providers,
         })
+    }
+}
+
+#[async_trait]
+impl DurabilityBackend for AgentDurabilityBackend {
+    async fn ensure_durable(
+        &self,
+        cid: &Cid,
+        replication_factor: usize,
+        placement: Option<&PlacementReference>,
+    ) -> Result<DurabilityReceipt, PublicationError> {
+        let Some(map) = self.0.placement.current_map() else {
+            if self.0.s3.is_some() {
+                return Err(PublicationError::Protection(
+                    "authoritative placement map is not loaded".to_string(),
+                ));
+            }
+            return self.ensure_legacy_durable(cid, replication_factor).await;
+        };
+        if let Some(placement) = placement {
+            return self
+                .ensure_at_placement(cid, replication_factor, placement.clone())
+                .await;
+        }
+        let replicas = u16::try_from(replication_factor).map_err(|_| {
+            PublicationError::Protection("replication factor exceeds placement bounds".to_string())
+        })?;
+        self.ensure_at_placement(
+            cid,
+            replication_factor,
+            PlacementReference::replicated(map.epoch, cid.clone(), replicas),
+        )
+        .await
     }
 }
 

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod native;
+
 use fs2::FileExt;
-use pepper_config::StorageLocationConfig;
+use pepper_config::{SmallObjectPackConfig, StorageConfig, StorageEngine, StorageLocationConfig};
 use pepper_metadata::MetadataStore;
 use pepper_types::{
-    Block, BlockStatResponse, CODEC_MERKLE_NODE, CODEC_NAMESPACE_CHECKPOINT,
-    CODEC_NAMESPACE_COMMIT, CODEC_NAMESPACE_DESCRIPTOR, CODEC_RAW, Cid, Codec, GcReport, HashAlg,
-    PutBlockResponse,
+    Block, BlockStatResponse, CODEC_BUCKET_OBJECT, CODEC_MERKLE_NODE, CODEC_NAMESPACE_CHECKPOINT,
+    CODEC_NAMESPACE_COMMIT, CODEC_NAMESPACE_DESCRIPTOR, CODEC_RAW, CODEC_SMALL_OBJECT, Cid, Codec,
+    GcReport, HashAlg, PutBlockResponse,
 };
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -29,14 +31,11 @@ const BLOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("blocks");
 const INLINE_BLOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("inline_blocks");
 const BLOCKS_BY_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("blocks_by_retention");
-const BLOCKS_BY_LAST_ACCESSED: TableDefinition<&str, &str> =
-    TableDefinition::new("blocks_by_last_accessed");
 const STORAGE_LOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("storage_locations");
 const STORAGE_LOCATIONS_BY_PATH: TableDefinition<&str, &str> =
     TableDefinition::new("storage_locations_by_path");
 const SOFT_PRESSURE_PERCENT: u64 = 85;
 const HARD_PRESSURE_PERCENT: u64 = 95;
-const LAST_ACCESSED_UPDATE_INTERVAL_SECONDS: u64 = 60;
 const BLOCK_ENVELOPE_MAGIC: &[u8; 8] = b"PEPBLK01";
 const BLOCK_ENVELOPE_VERSION: u8 = 2;
 const BLOCK_ENCODING_RAW: u8 = 0;
@@ -52,8 +51,6 @@ const INLINE_INTERNAL_BLOCK_MAX_BYTES: u64 = 64 * 1024;
 const ZSTD_LEVEL: i32 = 1;
 static PROCESS_BLOCK_READS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_BLOCK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
-static PROCESS_LAST_ACCESSED_UPDATES: AtomicU64 = AtomicU64::new(0);
-static PROCESS_LAST_ACCESSED_UPDATES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_BLOCK_ENCODING_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_BLOCK_ENCODING_RAW: AtomicU64 = AtomicU64::new(0);
 static PROCESS_BLOCK_ENCODING_ZSTD: AtomicU64 = AtomicU64::new(0);
@@ -62,6 +59,10 @@ static PROCESS_BLOCK_ENCODING_STORED_BYTES: AtomicU64 = AtomicU64::new(0);
 static PROCESS_BLOCK_ENCODING_MICROS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_INLINE_BLOCK_WRITES: AtomicU64 = AtomicU64::new(0);
 static PROCESS_INLINE_BLOCK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PROCESS_PACKED_BLOCK_WRITES: AtomicU64 = AtomicU64::new(0);
+static PROCESS_PACKED_BLOCK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PROCESS_PACKED_BLOCK_READS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_PACKED_BLOCK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static PROCESS_DATA_DURABILITY_BARRIERS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_DATA_FILES_DURABLE: AtomicU64 = AtomicU64::new(0);
 static PROCESS_DIRECTORY_DURABILITY_BARRIERS: AtomicU64 = AtomicU64::new(0);
@@ -70,10 +71,12 @@ static PROCESS_DIRECTORY_DURABILITY_BARRIERS: AtomicU64 = AtomicU64::new(0);
 pub struct StorageIoStats {
     pub block_reads: u64,
     pub block_read_bytes: u64,
-    pub last_accessed_updates: u64,
-    pub last_accessed_updates_skipped: u64,
     pub inline_block_writes: u64,
     pub inline_block_write_bytes: u64,
+    pub packed_block_writes: u64,
+    pub packed_block_write_bytes: u64,
+    pub packed_block_reads: u64,
+    pub packed_block_read_bytes: u64,
     pub data_durability_barriers: u64,
     pub data_files_durable: u64,
     pub directory_durability_barriers: u64,
@@ -83,11 +86,12 @@ pub fn process_io_stats() -> StorageIoStats {
     StorageIoStats {
         block_reads: PROCESS_BLOCK_READS.load(Ordering::Relaxed),
         block_read_bytes: PROCESS_BLOCK_READ_BYTES.load(Ordering::Relaxed),
-        last_accessed_updates: PROCESS_LAST_ACCESSED_UPDATES.load(Ordering::Relaxed),
-        last_accessed_updates_skipped: PROCESS_LAST_ACCESSED_UPDATES_SKIPPED
-            .load(Ordering::Relaxed),
         inline_block_writes: PROCESS_INLINE_BLOCK_WRITES.load(Ordering::Relaxed),
         inline_block_write_bytes: PROCESS_INLINE_BLOCK_WRITE_BYTES.load(Ordering::Relaxed),
+        packed_block_writes: PROCESS_PACKED_BLOCK_WRITES.load(Ordering::Relaxed),
+        packed_block_write_bytes: PROCESS_PACKED_BLOCK_WRITE_BYTES.load(Ordering::Relaxed),
+        packed_block_reads: PROCESS_PACKED_BLOCK_READS.load(Ordering::Relaxed),
+        packed_block_read_bytes: PROCESS_PACKED_BLOCK_READ_BYTES.load(Ordering::Relaxed),
         data_durability_barriers: PROCESS_DATA_DURABILITY_BARRIERS.load(Ordering::Relaxed),
         data_files_durable: PROCESS_DATA_FILES_DURABLE.load(Ordering::Relaxed),
         directory_durability_barriers: PROCESS_DIRECTORY_DURABILITY_BARRIERS
@@ -114,6 +118,12 @@ pub fn process_encoding_stats() -> StorageEncodingStats {
         stored_bytes: PROCESS_BLOCK_ENCODING_STORED_BYTES.load(Ordering::Relaxed),
         encoding_micros: PROCESS_BLOCK_ENCODING_MICROS.load(Ordering::Relaxed),
     }
+}
+
+pub use native::NativeStats as NativeStorageStats;
+
+pub fn process_native_stats() -> NativeStorageStats {
+    native::stats()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +176,8 @@ pub enum StorageError {
     InvalidEncodedBlock(String),
     #[error("block compression failed: {0}")]
     Compression(String),
+    #[error("native storage engine failed: {0}")]
+    Native(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +191,6 @@ struct BlockMeta {
     storage_location_path: String,
     relative_path: String,
     created_at_unix_seconds: u64,
-    last_accessed_at_unix_seconds: Option<u64>,
     pin_state: String,
     replica_state: String,
     retention_class: String,
@@ -230,6 +241,7 @@ struct StorageLocationMeta {
 struct StorageLocationRuntime {
     id: String,
     path: PathBuf,
+    max_capacity_bytes: u64,
     _lock_file: Arc<File>,
 }
 
@@ -270,12 +282,50 @@ pub struct BlockInventoryPage {
 }
 
 #[derive(Clone)]
+enum PhysicalBackend {
+    Files { packed: Option<PackedBackend> },
+    Native(native::NativeEngine),
+}
+
+#[derive(Clone)]
+struct PackedBackend {
+    engine: native::NativeEngine,
+    max_object_bytes: u64,
+}
+
+impl PhysicalBackend {
+    fn native(&self) -> Option<&native::NativeEngine> {
+        match self {
+            Self::Files { packed } => packed.as_ref().map(|packed| &packed.engine),
+            Self::Native(engine) => Some(engine),
+        }
+    }
+
+    fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+
+    fn packs(&self, block: &EncodedBlock) -> bool {
+        match self {
+            Self::Files {
+                packed: Some(packed),
+            } => {
+                matches!(block.cid.codec, CODEC_SMALL_OBJECT | CODEC_BUCKET_OBJECT)
+                    && !inline_internal_block(block)
+                    && block.logical_size_bytes <= packed.max_object_bytes
+            }
+            Self::Files { packed: None } | Self::Native(_) => false,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct BlockStore {
     metadata: Arc<MetadataStore>,
     locations: Arc<Vec<StorageLocationRuntime>>,
     max_block_bytes: u64,
     write_lock: Arc<Mutex<()>>,
-    last_accessed_updates_in_flight: Arc<Mutex<HashSet<Cid>>>,
+    backend: PhysicalBackend,
 }
 
 impl BlockStore {
@@ -290,6 +340,33 @@ impl BlockStore {
         metadata: Arc<MetadataStore>,
         locations: &[StorageLocationConfig],
         max_block_bytes: u64,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(metadata, locations, max_block_bytes, None, None)
+    }
+
+    pub fn open_with_config(
+        metadata: Arc<MetadataStore>,
+        storage: &StorageConfig,
+        max_block_bytes: u64,
+    ) -> Result<Self, StorageError> {
+        let native = (storage.engine == StorageEngine::NativeNvme).then(|| storage.native.clone());
+        let packed = (storage.engine == StorageEngine::Files && storage.small_object_pack.enabled)
+            .then(|| storage.small_object_pack.clone());
+        Self::open_inner(
+            metadata,
+            &storage.locations,
+            max_block_bytes,
+            native,
+            packed,
+        )
+    }
+
+    fn open_inner(
+        metadata: Arc<MetadataStore>,
+        locations: &[StorageLocationConfig],
+        max_block_bytes: u64,
+        native_config: Option<pepper_config::NativeStorageConfig>,
+        packed_config: Option<SmallObjectPackConfig>,
     ) -> Result<Self, StorageError> {
         if locations.is_empty() {
             return Err(StorageError::NoStorageLocations);
@@ -307,14 +384,45 @@ impl BlockStore {
                 "duplicate canonical storage location".to_string(),
             ));
         }
+        let locations = Arc::new(runtimes);
+        let backend = match native_config {
+            Some(config) => PhysicalBackend::Native(native::NativeEngine::open(
+                locations.clone(),
+                config,
+                "segments",
+                "nvme",
+            )?),
+            None => {
+                let packed = match packed_config {
+                    Some(config) => Some(PackedBackend {
+                        engine: native::NativeEngine::open(
+                            locations.clone(),
+                            config.native_config(),
+                            "small-object-segments",
+                            "small-pack",
+                        )?,
+                        max_object_bytes: config.max_object_bytes,
+                    }),
+                    None => None,
+                };
+                PhysicalBackend::Files { packed }
+            }
+        };
         let store = Self {
             metadata,
-            locations: Arc::new(runtimes),
+            locations,
             max_block_bytes,
             write_lock: Arc::new(Mutex::new(())),
-            last_accessed_updates_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            backend,
         };
-        store.reconcile_metadata_with_files()?;
+        if store.backend.is_native() {
+            store.reconcile_metadata_with_native()?;
+        } else {
+            store.reconcile_metadata_with_files()?;
+            if store.backend.native().is_some() {
+                store.reconcile_missing_native_metadata()?;
+            }
+        }
         Ok(store)
     }
 
@@ -357,7 +465,12 @@ impl BlockStore {
         let meta = self
             .get_meta(cid)?
             .ok_or_else(|| StorageError::NotFound(cid.clone()))?;
-        let stored = if meta.inline {
+        let stored = if is_native_meta(&meta) {
+            self.backend
+                .native()
+                .ok_or_else(|| StorageError::NotFound(cid.clone()))?
+                .read(cid)?
+        } else if meta.inline {
             self.get_inline_block(cid)?
                 .ok_or_else(|| StorageError::NotFound(cid.clone()))?
         } else {
@@ -367,6 +480,7 @@ impl BlockStore {
                     .saturating_add(BLOCK_ENVELOPE_MAX_BYTES),
             )?
         };
+        self.record_packed_read(&meta, stored.len() as u64);
         decode_block_bytes(&stored, cid, self.max_block_bytes, Some(meta.size_bytes))?;
         Ok(EncodedBlock {
             cid: cid.clone(),
@@ -549,6 +663,56 @@ impl BlockStore {
         blocks: &[EncodedBlock],
         intent: WriteIntent,
     ) -> Result<Vec<PutBlockResponse>, StorageError> {
+        if self.backend.is_native() {
+            return self.put_native_encoded_batch(blocks, intent);
+        }
+        let packed_indices = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| self.backend.packs(block).then_some(index))
+            .collect::<Vec<_>>();
+        if packed_indices.is_empty() {
+            return self.put_files_encoded_batch_with_intent(blocks, intent);
+        }
+        if packed_indices.len() == blocks.len() {
+            let results = self.put_native_encoded_batch(blocks, intent)?;
+            record_packed_writes(blocks, &results);
+            return Ok(results);
+        }
+
+        let packed = packed_indices
+            .iter()
+            .map(|index| blocks[*index].clone())
+            .collect::<Vec<_>>();
+        let packed_set = packed_indices.iter().copied().collect::<HashSet<_>>();
+        let file_indices = (0..blocks.len())
+            .filter(|index| !packed_set.contains(index))
+            .collect::<Vec<_>>();
+        let files = file_indices
+            .iter()
+            .map(|index| blocks[*index].clone())
+            .collect::<Vec<_>>();
+        let packed_results = self.put_native_encoded_batch(&packed, intent)?;
+        record_packed_writes(&packed, &packed_results);
+        let file_results = self.put_files_encoded_batch_with_intent(&files, intent)?;
+        let mut results = vec![None; blocks.len()];
+        for (index, result) in packed_indices.into_iter().zip(packed_results) {
+            results[index] = Some(result);
+        }
+        for (index, result) in file_indices.into_iter().zip(file_results) {
+            results[index] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|result| result.ok_or(StorageError::BatchResultMissing))
+            .collect()
+    }
+
+    fn put_files_encoded_batch_with_intent(
+        &self,
+        blocks: &[EncodedBlock],
+        intent: WriteIntent,
+    ) -> Result<Vec<PutBlockResponse>, StorageError> {
         struct PreparedBlock {
             input_index: usize,
             meta: BlockMeta,
@@ -588,6 +752,10 @@ impl BlockStore {
                 let existing_valid = !meta.corrupt
                     && if meta.inline {
                         self.inline_block_is_valid(&meta)?
+                    } else if is_native_meta(&meta) {
+                        self.backend
+                            .native()
+                            .is_some_and(|native| native.contains(&cid).unwrap_or(false))
                     } else {
                         let path = self.block_path(&meta);
                         match verify_file(&path, &cid, self.max_block_bytes) {
@@ -602,7 +770,11 @@ impl BlockStore {
                     results[input_index] = Some(response);
                     continue;
                 }
-                if !meta.inline {
+                if is_native_meta(&meta) {
+                    if let Some(native) = self.backend.native() {
+                        native.delete(&meta.cid)?;
+                    }
+                } else if !meta.inline {
                     let path = self.block_path(&meta);
                     if path.exists() {
                         fs::remove_file(&path).map_err(|source| StorageError::Io {
@@ -650,7 +822,6 @@ impl BlockStore {
                 storage_location_path: location.path.display().to_string(),
                 relative_path,
                 created_at_unix_seconds: now,
-                last_accessed_at_unix_seconds: None,
                 pin_state: "none".to_string(),
                 replica_state: "none".to_string(),
                 retention_class: "cache".to_string(),
@@ -818,6 +989,78 @@ impl BlockStore {
             .collect()
     }
 
+    fn put_native_encoded_batch(
+        &self,
+        blocks: &[EncodedBlock],
+        _intent: WriteIntent,
+    ) -> Result<Vec<PutBlockResponse>, StorageError> {
+        let engine = self
+            .backend
+            .native()
+            .ok_or_else(|| StorageError::Native("native engine is not open".to_string()))?;
+        let mut metadata_missing = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if block.logical_size_bytes > self.max_block_bytes {
+                return Err(StorageError::BlockTooLarge {
+                    size_bytes: block.logical_size_bytes,
+                    max_bytes: self.max_block_bytes,
+                });
+            }
+            // EncodedBlock has no public unchecked constructor. Local paths
+            // create it from logical bytes, while public and wire replica
+            // paths verify it before entering this trusted internal method.
+            // Re-decoding here would hash every large block twice and made the
+            // native backend substantially slower than the files backend.
+            let present = engine.contains(block.cid())?;
+            let metadata = self.get_meta(block.cid())?;
+            if !present && let Some(stale) = metadata.as_ref() {
+                self.remove_block_meta(stale)?;
+            }
+            metadata_missing.push(metadata.is_none());
+        }
+        let records = engine.put_batch(blocks)?;
+        let now = unix_seconds();
+        let metas = records
+            .iter()
+            .map(|record| {
+                let location = self.locations.get(record.location_index).ok_or_else(|| {
+                    StorageError::Native("native record location is invalid".to_string())
+                })?;
+                Ok(BlockMeta {
+                    cid: record.cid.clone(),
+                    codec: record.cid.codec,
+                    hash_alg: record.cid.hash_alg,
+                    size_bytes: record.logical_size,
+                    stored_size_bytes: record.stored_size,
+                    storage_location_id: location.id.clone(),
+                    storage_location_path: location.path.display().to_string(),
+                    relative_path: native_relative_path(record),
+                    created_at_unix_seconds: now,
+                    pin_state: "none".to_string(),
+                    replica_state: "none".to_string(),
+                    retention_class: "cache".to_string(),
+                    verified_at_unix_seconds: Some(now),
+                    corrupt: false,
+                    inline: false,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        let new_metas = metas
+            .iter()
+            .zip(&records)
+            .zip(&metadata_missing)
+            .filter_map(|((meta, record), metadata_missing)| {
+                (!record.already_existed || *metadata_missing).then_some(meta.clone())
+            })
+            .collect::<Vec<_>>();
+        self.insert_block_metas(&new_metas)?;
+        Ok(metas
+            .into_iter()
+            .zip(records)
+            .map(|(meta, record)| meta.to_put_response(record.already_existed))
+            .collect())
+    }
+
     fn put_with_intent(
         &self,
         codec: Codec,
@@ -859,7 +1102,12 @@ impl BlockStore {
                 max_bytes: self.max_block_bytes,
             });
         }
-        let stored = if meta.inline {
+        let stored = if is_native_meta(&meta) {
+            self.backend
+                .native()
+                .ok_or_else(|| StorageError::NotFound(cid.clone()))?
+                .read(cid)?
+        } else if meta.inline {
             self.get_inline_block(cid)?
                 .ok_or_else(|| StorageError::NotFound(cid.clone()))?
         } else {
@@ -879,9 +1127,9 @@ impl BlockStore {
                 }
                 Err(error) => return Err(error),
             };
-        self.update_last_accessed(cid)?;
         PROCESS_BLOCK_READS.fetch_add(1, Ordering::Relaxed);
         PROCESS_BLOCK_READ_BYTES.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.record_packed_read(&meta, payload.len() as u64);
         Ok(Block {
             cid: cid.clone(),
             codec: meta.codec,
@@ -914,6 +1162,37 @@ impl BlockStore {
             }
             return Ok(payload[start as usize..end as usize].to_vec());
         }
+        if is_native_meta(&meta) {
+            let native = self
+                .backend
+                .native()
+                .ok_or_else(|| StorageError::NotFound(cid.clone()))?;
+            match read_native_raw_block_range(
+                native,
+                cid,
+                self.max_block_bytes,
+                meta.size_bytes,
+                start,
+                end,
+                meta.stored_size_bytes,
+            ) {
+                Ok(Some((payload, bytes_read))) => {
+                    PROCESS_BLOCK_READS.fetch_add(1, Ordering::Relaxed);
+                    PROCESS_BLOCK_READ_BYTES.fetch_add(bytes_read, Ordering::Relaxed);
+                    self.record_packed_read(&meta, bytes_read);
+                    return Ok(payload);
+                }
+                Ok(None) => {
+                    let payload = self.get(cid)?.payload;
+                    return Ok(payload[start as usize..end as usize].to_vec());
+                }
+                Err(StorageError::HashMismatch(_)) | Err(StorageError::InvalidEncodedBlock(_)) => {
+                    self.mark_corrupt(cid)?;
+                    return Err(StorageError::HashMismatch(cid.clone()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let path = self.block_path(&meta);
         match read_raw_block_range(
             &path,
@@ -924,7 +1203,6 @@ impl BlockStore {
             end,
         ) {
             Ok(Some((payload, bytes_read))) => {
-                self.update_last_accessed(cid)?;
                 PROCESS_BLOCK_READS.fetch_add(1, Ordering::Relaxed);
                 PROCESS_BLOCK_READ_BYTES.fetch_add(bytes_read, Ordering::Relaxed);
                 Ok(payload)
@@ -951,6 +1229,12 @@ impl BlockStore {
         if meta.inline {
             return self.inline_block_is_valid(&meta);
         }
+        if is_native_meta(&meta) {
+            return self
+                .backend
+                .native()
+                .map_or(Ok(false), |engine| engine.contains(cid));
+        }
         let path = self.block_path(&meta);
         let Ok(file_meta) = path.symlink_metadata() else {
             return Ok(false);
@@ -974,7 +1258,11 @@ impl BlockStore {
             return Ok(());
         };
         let path = self.block_path(&meta);
-        if !meta.inline
+        if is_native_meta(&meta) {
+            if let Some(native) = self.backend.native() {
+                native.delete(cid)?;
+            }
+        } else if !meta.inline
             && path.exists()
             && let Some(location) = self
                 .locations
@@ -985,6 +1273,39 @@ impl BlockStore {
         }
         self.remove_block_meta(&meta)?;
         self.rebuild_storage_location_usage()
+    }
+
+    /// Remove a verified stale repair/migration copy. Callers must first prove
+    /// that this node is neither a canonical owner nor an active exception
+    /// target and that the canonical placement is healthy.
+    pub fn delete_repair_extra(&self, cid: &Cid) -> Result<bool, StorageError> {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        let Some(meta) = self.get_meta(cid)? else {
+            return Ok(false);
+        };
+        if is_native_meta(&meta) {
+            if let Some(native) = self.backend.native() {
+                native.delete(cid)?;
+            }
+        } else if !meta.inline {
+            let path = self.block_path(&meta);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StorageError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        self.remove_block_meta(&meta)?;
+        self.rebuild_storage_location_usage()?;
+        Ok(true)
     }
 
     pub fn corruption_scan(&self) -> Result<(usize, Vec<Cid>), StorageError> {
@@ -1008,6 +1329,10 @@ impl BlockStore {
                     && if meta.inline {
                         self.get_inline_block(&meta.cid)
                             .is_ok_and(|value| value.is_some())
+                    } else if is_native_meta(meta) {
+                        self.backend
+                            .native()
+                            .is_some_and(|native| native.contains(&meta.cid).unwrap_or(false))
                     } else {
                         self.block_path(meta).exists()
                     }
@@ -1038,7 +1363,13 @@ impl BlockStore {
         let entries = matching
             .iter()
             .map(|meta| {
-                let stored_size_bytes = if meta.inline {
+                let stored_size_bytes = if is_native_meta(meta) {
+                    self.backend
+                        .native()
+                        .and_then(|native| native.contains(&meta.cid).ok())
+                        .filter(|present| *present)
+                        .map(|_| meta.stored_size_bytes)
+                } else if meta.inline {
                     self.get_inline_block(&meta.cid)
                         .ok()
                         .flatten()
@@ -1217,7 +1548,11 @@ impl BlockStore {
         let mut reclaimed_bytes = 0u64;
         for meta in blocks {
             if !dry_run {
-                if !meta.inline {
+                if is_native_meta(&meta) {
+                    if let Some(native) = self.backend.native() {
+                        native.delete(&meta.cid)?;
+                    }
+                } else if !meta.inline {
                     let path = self.block_path(&meta);
                     if path.exists() {
                         fs::remove_file(&path).map_err(|source| StorageError::Io {
@@ -1240,6 +1575,92 @@ impl BlockStore {
 
     pub fn parse_cid(value: &str) -> Result<Cid, StorageError> {
         Cid::from_str(value).map_err(StorageError::from)
+    }
+
+    fn reconcile_metadata_with_native(&self) -> Result<(), StorageError> {
+        let records = self.validated_native_records()?;
+        for meta in self.list_block_metas()? {
+            let present = if meta.inline {
+                self.inline_block_is_valid(&meta)?
+            } else {
+                is_native_meta(&meta) && records.contains_key(&meta.cid)
+            };
+            if !present {
+                self.remove_block_meta(&meta)?;
+            }
+        }
+        self.insert_missing_native_metadata(&records)?;
+        self.rebuild_storage_location_usage()
+    }
+
+    fn reconcile_missing_native_metadata(&self) -> Result<(), StorageError> {
+        let records = self.validated_native_records()?;
+        self.insert_missing_native_metadata(&records)?;
+        self.rebuild_storage_location_usage()
+    }
+
+    fn validated_native_records(&self) -> Result<HashMap<Cid, native::NativeRecord>, StorageError> {
+        let native = self
+            .backend
+            .native()
+            .ok_or_else(|| StorageError::Native("native engine is not open".to_string()))?;
+        let mut records = HashMap::<Cid, native::NativeRecord>::new();
+        for record in native.records()? {
+            let encoded = native.read(&record.cid)?;
+            if decode_block_bytes(
+                &encoded,
+                &record.cid,
+                self.max_block_bytes,
+                Some(record.logical_size),
+            )
+            .is_err()
+            {
+                native.delete(&record.cid)?;
+                continue;
+            }
+            records.insert(record.cid.clone(), record);
+        }
+        Ok(records)
+    }
+
+    fn insert_missing_native_metadata(
+        &self,
+        records: &HashMap<Cid, native::NativeRecord>,
+    ) -> Result<(), StorageError> {
+        let known = self
+            .list_block_metas()?
+            .into_iter()
+            .map(|meta| meta.cid)
+            .collect::<HashSet<_>>();
+        let now = unix_seconds();
+        let metas = records
+            .values()
+            .filter(|record| !known.contains(&record.cid))
+            .map(|record| {
+                let location = self.locations.get(record.location_index).ok_or_else(|| {
+                    StorageError::Native("native record location is invalid".to_string())
+                })?;
+                Ok(BlockMeta {
+                    cid: record.cid.clone(),
+                    codec: record.cid.codec,
+                    hash_alg: record.cid.hash_alg,
+                    size_bytes: record.logical_size,
+                    stored_size_bytes: record.stored_size,
+                    storage_location_id: location.id.clone(),
+                    storage_location_path: location.path.display().to_string(),
+                    relative_path: native_relative_path(record),
+                    created_at_unix_seconds: now,
+                    pin_state: "none".to_string(),
+                    replica_state: "none".to_string(),
+                    retention_class: "cache".to_string(),
+                    verified_at_unix_seconds: Some(now),
+                    corrupt: false,
+                    inline: false,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        self.insert_block_metas(&metas)?;
+        Ok(())
     }
 
     fn reconcile_metadata_with_files(&self) -> Result<(), StorageError> {
@@ -1266,6 +1687,10 @@ impl BlockStore {
         for meta in self.list_block_metas()? {
             let present = if meta.inline {
                 self.inline_block_is_valid(&meta)?
+            } else if is_native_meta(&meta) {
+                self.backend
+                    .native()
+                    .is_some_and(|native| native.contains(&meta.cid).unwrap_or(false))
             } else {
                 self.block_path(&meta).exists()
             };
@@ -1358,7 +1783,6 @@ impl BlockStore {
                     storage_location_path: location.path.display().to_string(),
                     relative_path,
                     created_at_unix_seconds: unix_seconds(),
-                    last_accessed_at_unix_seconds: None,
                     pin_state: "none".to_string(),
                     replica_state: "none".to_string(),
                     retention_class: "cache".to_string(),
@@ -1374,14 +1798,26 @@ impl BlockStore {
 
     fn rebuild_storage_location_usage(&self) -> Result<(), StorageError> {
         let mut used_by_location = HashMap::<String, u64>::new();
+        if let Some(native) = self.backend.native() {
+            for (index, location) in self.locations.iter().enumerate() {
+                used_by_location.insert(location.id.clone(), native.allocated_bytes(index));
+            }
+        }
         for meta in self.list_block_metas()? {
+            if is_native_meta(&meta) {
+                continue;
+            }
             let present = if meta.inline {
                 self.get_inline_block(&meta.cid)?.is_some()
+            } else if is_native_meta(&meta) {
+                self.backend
+                    .native()
+                    .is_some_and(|native| native.contains(&meta.cid).unwrap_or(false))
             } else {
                 self.block_path(&meta).exists()
             };
             if present && !meta.corrupt {
-                let stored_size = if meta.inline {
+                let stored_size = if meta.inline || is_native_meta(&meta) {
                     meta.stored_size_bytes
                 } else {
                     self.block_path(&meta)
@@ -1486,6 +1922,13 @@ impl BlockStore {
 
     fn block_path(&self, meta: &BlockMeta) -> PathBuf {
         PathBuf::from(&meta.storage_location_path).join(&meta.relative_path)
+    }
+
+    fn record_packed_read(&self, meta: &BlockMeta, bytes: u64) {
+        if !self.backend.is_native() && is_native_meta(meta) {
+            PROCESS_PACKED_BLOCK_READS.fetch_add(1, Ordering::Relaxed);
+            PROCESS_PACKED_BLOCK_READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     fn get_inline_block(&self, cid: &Cid) -> Result<Option<Vec<u8>>, StorageError> {
@@ -1626,13 +2069,20 @@ impl BlockStore {
             let mut locations = write_txn
                 .open_table(STORAGE_LOCATIONS)
                 .map_err(|source| StorageError::Table(Box::new(source)))?;
-            let mut added_by_location = HashMap::<String, u64>::new();
+            let mut updates = HashMap::<String, (u64, Option<u64>)>::new();
             for meta in metas {
-                *added_by_location
+                updates
                     .entry(meta.storage_location_id.clone())
-                    .or_default() += meta.stored_size_bytes;
+                    .or_default()
+                    .0 += meta.stored_size_bytes;
             }
-            for (location_id, added_bytes) in added_by_location {
+            if let Some(native) = self.backend.native() {
+                for (index, location) in self.locations.iter().enumerate() {
+                    updates.entry(location.id.clone()).or_default().1 =
+                        Some(native.allocated_bytes(index));
+                }
+            }
+            for (location_id, (added_bytes, physical_bytes)) in updates {
                 let mut location: StorageLocationMeta = {
                     let Some(location_value) = locations
                         .get(location_id.as_str())
@@ -1642,7 +2092,8 @@ impl BlockStore {
                     };
                     serde_json::from_slice(location_value.value())?
                 };
-                location.used_bytes = location.used_bytes.saturating_add(added_bytes);
+                location.used_bytes = physical_bytes
+                    .unwrap_or_else(|| location.used_bytes.saturating_add(added_bytes));
                 let location_bytes = serde_json::to_vec(&location)?;
                 locations
                     .insert(location_id.as_str(), location_bytes.as_slice())
@@ -1685,14 +2136,6 @@ impl BlockStore {
                 .remove(format!("{}:{}", meta.retention_class, meta.cid).as_str())
                 .map_err(|source| StorageError::RedbStorage(Box::new(source)))?;
         }
-        if let Some(last_accessed) = meta.last_accessed_at_unix_seconds {
-            let mut last_accessed_index = write_txn
-                .open_table(BLOCKS_BY_LAST_ACCESSED)
-                .map_err(|source| StorageError::Table(Box::new(source)))?;
-            last_accessed_index
-                .remove(format!("{}:{}", last_accessed, meta.cid).as_str())
-                .map_err(|source| StorageError::RedbStorage(Box::new(source)))?;
-        }
         {
             let mut locations = write_txn
                 .open_table(STORAGE_LOCATIONS)
@@ -1706,7 +2149,16 @@ impl BlockStore {
                     .transpose()?
             };
             if let Some(mut location) = location {
-                location.used_bytes = location.used_bytes.saturating_sub(meta.stored_size_bytes);
+                location.used_bytes = if let Some(native) = self.backend.native()
+                    && is_native_meta(meta)
+                {
+                    self.locations
+                        .iter()
+                        .position(|candidate| candidate.id == meta.storage_location_id)
+                        .map_or(location.used_bytes, |index| native.allocated_bytes(index))
+                } else {
+                    location.used_bytes.saturating_sub(meta.stored_size_bytes)
+                };
                 let bytes = serde_json::to_vec(&location)?;
                 locations
                     .insert(meta.storage_location_id.as_str(), bytes.as_slice())
@@ -1717,82 +2169,6 @@ impl BlockStore {
             .commit()
             .map_err(|source| StorageError::Commit(Box::new(source)))?;
         Ok(())
-    }
-
-    fn update_last_accessed(&self, cid: &Cid) -> Result<(), StorageError> {
-        {
-            let mut in_flight = self
-                .last_accessed_updates_in_flight
-                .lock()
-                .map_err(|_| StorageError::LockPoisoned)?;
-            if !in_flight.insert(cid.clone()) {
-                PROCESS_LAST_ACCESSED_UPDATES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-        }
-
-        let result = self.persist_last_accessed_if_stale(cid);
-        self.last_accessed_updates_in_flight
-            .lock()
-            .map_err(|_| StorageError::LockPoisoned)?
-            .remove(cid);
-        match result {
-            Ok(true) => {
-                PROCESS_LAST_ACCESSED_UPDATES.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Ok(false) => {
-                PROCESS_LAST_ACCESSED_UPDATES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn persist_last_accessed_if_stale(&self, cid: &Cid) -> Result<bool, StorageError> {
-        let Some(mut meta) = self.get_meta(cid)? else {
-            return Ok(false);
-        };
-        let now = unix_seconds();
-        if !last_accessed_update_is_due(meta.last_accessed_at_unix_seconds, now) {
-            return Ok(false);
-        }
-        let old_index_key = meta
-            .last_accessed_at_unix_seconds
-            .map(|ts| format!("{}:{}", ts, cid));
-        meta.last_accessed_at_unix_seconds = Some(now);
-        let new_index_key = format!("{now}:{cid}");
-        let write_txn = self
-            .metadata
-            .database()
-            .begin_write()
-            .map_err(|source| StorageError::Transaction(Box::new(source)))?;
-        {
-            let mut blocks = write_txn
-                .open_table(BLOCKS)
-                .map_err(|source| StorageError::Table(Box::new(source)))?;
-            let meta_bytes = serde_json::to_vec(&meta)?;
-            blocks
-                .insert(cid.to_string().as_str(), meta_bytes.as_slice())
-                .map_err(|source| StorageError::RedbStorage(Box::new(source)))?;
-        }
-        {
-            let mut index = write_txn
-                .open_table(BLOCKS_BY_LAST_ACCESSED)
-                .map_err(|source| StorageError::Table(Box::new(source)))?;
-            if let Some(old_key) = old_index_key {
-                index
-                    .remove(old_key.as_str())
-                    .map_err(|source| StorageError::RedbStorage(Box::new(source)))?;
-            }
-            index
-                .insert(new_index_key.as_str(), "")
-                .map_err(|source| StorageError::RedbStorage(Box::new(source)))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|source| StorageError::Commit(Box::new(source)))?;
-        Ok(true)
     }
 
     fn mark_corrupt(&self, cid: &Cid) -> Result<(), StorageError> {
@@ -1839,7 +2215,6 @@ impl BlockMeta {
             size: self.size_bytes,
             storage_location: self.storage_location_path.clone(),
             created_at_unix_seconds: self.created_at_unix_seconds,
-            last_accessed_at_unix_seconds: self.last_accessed_at_unix_seconds,
         }
     }
 }
@@ -1939,9 +2314,6 @@ fn initialize_location(
         write_txn
             .open_table(BLOCKS_BY_RETENTION)
             .map_err(|source| StorageError::Table(Box::new(source)))?;
-        write_txn
-            .open_table(BLOCKS_BY_LAST_ACCESSED)
-            .map_err(|source| StorageError::Table(Box::new(source)))?;
     }
     write_txn
         .commit()
@@ -1950,6 +2322,7 @@ fn initialize_location(
     Ok(StorageLocationRuntime {
         id,
         path: canonical,
+        max_capacity_bytes: location.max_capacity_bytes,
         _lock_file: Arc::new(lock_file),
     })
 }
@@ -2409,6 +2782,77 @@ fn read_raw_block_range(
     Ok(Some((result, (header_bytes + covered.len()) as u64)))
 }
 
+fn read_native_raw_block_range(
+    native: &native::NativeEngine,
+    expected_cid: &Cid,
+    max_logical_bytes: u64,
+    expected_logical_size: u64,
+    start: u64,
+    end: u64,
+    stored_size: u64,
+) -> Result<Option<(Vec<u8>, u64)>, StorageError> {
+    let stored_size = usize::try_from(stored_size).map_err(|_| {
+        StorageError::InvalidEncodedBlock("stored block size does not fit usize".to_string())
+    })?;
+    if stored_size as u64 > max_logical_bytes.saturating_add(BLOCK_ENVELOPE_MAX_BYTES) {
+        return Err(StorageError::BlockTooLarge {
+            size_bytes: stored_size as u64,
+            max_bytes: max_logical_bytes.saturating_add(BLOCK_ENVELOPE_MAX_BYTES),
+        });
+    }
+    let header_bytes = stored_size.min(BLOCK_ENVELOPE_MAX_BYTES as usize);
+    let (header, header_physical) = native.read_slice(expected_cid, 0, header_bytes)?;
+    let layout = parse_block_envelope(
+        &header,
+        stored_size,
+        expected_cid,
+        max_logical_bytes,
+        Some(expected_logical_size),
+    )?;
+    if layout.encoding == BLOCK_ENCODING_ZSTD {
+        return Ok(None);
+    }
+    if layout.encoding != BLOCK_ENCODING_RAW || layout.logical_size != layout.encoded_size {
+        return Err(StorageError::InvalidEncodedBlock(
+            "raw range envelope has incompatible lengths or encoding".to_string(),
+        ));
+    }
+    let start = usize::try_from(start)
+        .map_err(|_| StorageError::InvalidEncodedBlock("range start overflow".to_string()))?;
+    let end = usize::try_from(end)
+        .map_err(|_| StorageError::InvalidEncodedBlock("range end overflow".to_string()))?;
+    let first_chunk = start / BLOCK_CHECKSUM_CHUNK_BYTES;
+    let last_chunk = end.div_ceil(BLOCK_CHECKSUM_CHUNK_BYTES);
+    let covered_start = first_chunk * BLOCK_CHECKSUM_CHUNK_BYTES;
+    let covered_end = last_chunk
+        .saturating_mul(BLOCK_CHECKSUM_CHUNK_BYTES)
+        .min(layout.logical_size);
+    let (covered, payload_physical) = native.read_slice(
+        expected_cid,
+        layout.payload_offset + covered_start,
+        layout.payload_offset + covered_end,
+    )?;
+    for chunk_index in first_chunk..last_chunk {
+        let relative = (chunk_index - first_chunk) * BLOCK_CHECKSUM_CHUNK_BYTES;
+        let chunk_end = (relative + BLOCK_CHECKSUM_CHUNK_BYTES).min(covered.len());
+        let checksum_offset = layout.cid_end + chunk_index * std::mem::size_of::<u32>();
+        let expected = u32::from_be_bytes(
+            header[checksum_offset..checksum_offset + 4]
+                .try_into()
+                .expect("validated checksum table contains complete entries"),
+        );
+        if crc32c::crc32c(&covered[relative..chunk_end]) != expected {
+            return Err(StorageError::HashMismatch(expected_cid.clone()));
+        }
+    }
+    let requested_start = start - covered_start;
+    let requested_end = requested_start + (end - start);
+    Ok(Some((
+        covered[requested_start..requested_end].to_vec(),
+        header_physical.saturating_add(payload_physical),
+    )))
+}
+
 fn verify_file(path: &Path, cid: &Cid, max_bytes: u64) -> Result<bool, StorageError> {
     if !path.exists() {
         return Ok(false);
@@ -2427,6 +2871,30 @@ fn relative_block_path(cid: &Cid) -> PathBuf {
         .join(shard_a)
         .join(shard_b)
         .join(cid_filename(cid))
+}
+
+fn native_relative_path(record: &native::NativeRecord) -> String {
+    format!(
+        "@native/{}/{}/{}/{}",
+        record.owner, record.generation, record.segment_id, record.payload_offset
+    )
+}
+
+fn record_packed_writes(blocks: &[EncodedBlock], results: &[PutBlockResponse]) {
+    let mut writes = 0u64;
+    let mut bytes = 0u64;
+    for (block, result) in blocks.iter().zip(results) {
+        if !result.already_existed {
+            writes += 1;
+            bytes = bytes.saturating_add(block.bytes.len() as u64);
+        }
+    }
+    PROCESS_PACKED_BLOCK_WRITES.fetch_add(writes, Ordering::Relaxed);
+    PROCESS_PACKED_BLOCK_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn is_native_meta(meta: &BlockMeta) -> bool {
+    meta.relative_path.starts_with("@native/")
 }
 
 fn cid_filename(cid: &Cid) -> String {
@@ -2487,12 +2955,6 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn last_accessed_update_is_due(previous: Option<u64>, now: u64) -> bool {
-    previous.is_none_or(|previous| {
-        now.saturating_sub(previous) >= LAST_ACCESSED_UPDATE_INTERVAL_SECONDS && now >= previous
-    })
-}
-
 fn unix_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2504,6 +2966,7 @@ fn unix_nanos() -> u128 {
 mod tests {
     use super::*;
     use pepper_metadata::MetadataStore;
+    use std::os::unix::fs::FileExt as _;
 
     fn incompressible_bytes(size: usize) -> Vec<u8> {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -2519,13 +2982,470 @@ mod tests {
         logical
     }
 
+    fn native_config(root: &Path) -> StorageConfig {
+        StorageConfig {
+            engine: StorageEngine::NativeNvme,
+            native: pepper_config::NativeStorageConfig {
+                segment_bytes: 4 * 1024 * 1024,
+                owners: 2,
+                io_uring_entries: 32,
+                direct_io: false,
+                require_io_uring: false,
+                group_commit_delay_microseconds: 0,
+                group_commit_max_requests: 64,
+                compaction_dead_percent: 10,
+            },
+            small_object_pack: SmallObjectPackConfig::default(),
+            locations: vec![StorageLocationConfig {
+                path: root.join("native-store"),
+                max_capacity_bytes: 64 * 1024 * 1024,
+            }],
+        }
+    }
+
+    fn packed_files_config(root: &Path) -> StorageConfig {
+        StorageConfig {
+            engine: StorageEngine::Files,
+            native: pepper_config::NativeStorageConfig::default(),
+            small_object_pack: SmallObjectPackConfig {
+                enabled: true,
+                max_object_bytes: 1024 * 1024,
+                segment_bytes: 4 * 1024 * 1024,
+                owners: 2,
+                io_uring_entries: 32,
+                require_io_uring: false,
+                group_commit_delay_microseconds: 0,
+                group_commit_max_requests: 64,
+                compaction_dead_percent: 10,
+            },
+            locations: vec![StorageLocationConfig {
+                path: root.join("packed-files-store"),
+                max_capacity_bytes: 64 * 1024 * 1024,
+            }],
+        }
+    }
+
     #[test]
-    fn last_accessed_updates_are_coalesced() {
-        assert!(last_accessed_update_is_due(None, 100));
-        assert!(!last_accessed_update_is_due(Some(100), 100));
-        assert!(!last_accessed_update_is_due(Some(100), 159));
-        assert!(last_accessed_update_is_due(Some(100), 160));
-        assert!(!last_accessed_update_is_due(Some(200), 100));
+    fn verified_repair_extra_deletion_is_idempotent_for_files_inline_and_native() {
+        let files_dir = tempfile::tempdir().unwrap();
+        let files_metadata =
+            Arc::new(MetadataStore::open_or_create(files_dir.path().join("files.redb")).unwrap());
+        let files = BlockStore::open(
+            files_metadata,
+            &[StorageLocationConfig {
+                path: files_dir.path().join("files"),
+                max_capacity_bytes: 16 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+        let file = files.put_raw(&incompressible_bytes(128 * 1024)).unwrap();
+        let inline = files.put(CODEC_MERKLE_NODE, b"inline-extra").unwrap();
+        for cid in [&file.cid, &inline.cid] {
+            assert!(files.has(cid).unwrap());
+            assert!(files.delete_repair_extra(cid).unwrap());
+            assert!(!files.has(cid).unwrap());
+            assert!(!files.delete_repair_extra(cid).unwrap());
+        }
+
+        let native_dir = tempfile::tempdir().unwrap();
+        let native_metadata =
+            Arc::new(MetadataStore::open_or_create(native_dir.path().join("native.redb")).unwrap());
+        let native_config = native_config(native_dir.path());
+        let native =
+            BlockStore::open_with_config(native_metadata, &native_config, 4 * 1024 * 1024).unwrap();
+        let block = native.put_raw(&incompressible_bytes(128 * 1024)).unwrap();
+        assert!(native.delete_repair_extra(&block.cid).unwrap());
+        assert!(!native.has(&block.cid).unwrap());
+        drop(native);
+
+        let native_metadata =
+            Arc::new(MetadataStore::open_or_create(native_dir.path().join("native.redb")).unwrap());
+        let reopened =
+            BlockStore::open_with_config(native_metadata, &native_config, 4 * 1024 * 1024).unwrap();
+        assert!(!reopened.has(&block.cid).unwrap());
+    }
+
+    #[test]
+    fn files_backend_packs_small_object_records_and_recovers_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let config = packed_files_config(dir.path());
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let small = incompressible_bytes(4096);
+        let boundary = incompressible_bytes(1024 * 1024);
+        let large = incompressible_bytes(1024 * 1024 + 1);
+        let small_put = store.put(CODEC_SMALL_OBJECT, &small).unwrap();
+        let boundary_put = store.put(CODEC_SMALL_OBJECT, &boundary).unwrap();
+        let large_put = store.put(CODEC_SMALL_OBJECT, &large).unwrap();
+        assert_eq!(store.get(&small_put.cid).unwrap().payload, small);
+        assert_eq!(
+            store.get_range(&boundary_put.cid, 4096, 8192).unwrap(),
+            boundary[4096..8192]
+        );
+        assert!(
+            config.locations[0]
+                .path
+                .join("small-object-segments")
+                .exists()
+        );
+        assert_eq!(store.backend.native().unwrap().records().unwrap().len(), 2);
+        assert!(
+            store
+                .block_path(&store.get_meta(&large_put.cid).unwrap().unwrap())
+                .exists()
+        );
+        drop(store);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.get(&small_put.cid).unwrap().payload, small);
+        assert_eq!(reopened.get(&boundary_put.cid).unwrap().payload, boundary);
+        assert_eq!(reopened.get(&large_put.cid).unwrap().payload, large);
+    }
+
+    #[test]
+    fn native_segments_roundtrip_deduplicate_and_recover_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let config = native_config(dir.path());
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let payload = incompressible_bytes(512 * 1024);
+        let first = store.put_raw(&payload).unwrap();
+        let second = store.put_raw(&payload).unwrap();
+        assert!(second.already_existed);
+        assert_eq!(store.get(&first.cid).unwrap().payload, payload);
+        assert!(config.locations[0].path.join("segments").exists());
+        assert_eq!(
+            directory_regular_file_bytes(&config.locations[0].path.join("blocks")).unwrap(),
+            0
+        );
+        drop(store);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.get(&first.cid).unwrap().payload, payload);
+        assert_eq!(reopened.list_blocks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_recovery_ignores_torn_tail_and_rejects_corrupt_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let config = native_config(dir.path());
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let put = store.put_raw(&incompressible_bytes(256 * 1024)).unwrap();
+        let record = store
+            .backend
+            .native()
+            .unwrap()
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.cid == put.cid)
+            .unwrap();
+        drop(store);
+        let segment = config.locations[0]
+            .path
+            .join("segments")
+            .join(format!("owner-{}", record.owner))
+            .join(format!(
+                "segment-{:020}-{:020}.pepper",
+                record.generation, record.segment_id
+            ));
+        let file = OpenOptions::new().write(true).open(&segment).unwrap();
+        file.write_all_at(&vec![0xa5; 4096], record.payload_offset)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert!(!reopened.has(&put.cid).unwrap());
+        assert!(matches!(
+            reopened.get(&put.cid),
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(process_native_stats().torn_tails > 0);
+    }
+
+    #[test]
+    fn native_recovery_rewinds_to_the_last_committed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let mut config = native_config(dir.path());
+        config.native.owners = 1;
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let committed = store.put_raw(&incompressible_bytes(128 * 1024)).unwrap();
+        let abandoned_payload = incompressible_bytes(128 * 1024 + 1);
+        let abandoned = store.encode(CODEC_RAW, &abandoned_payload).unwrap();
+        store
+            .backend
+            .native()
+            .unwrap()
+            .append_uncommitted_for_test(&abandoned)
+            .unwrap();
+        drop(store);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert!(reopened.has(&committed.cid).unwrap());
+        assert!(!reopened.has(abandoned.cid()).unwrap());
+        let after_recovery = reopened
+            .put_raw(&incompressible_bytes(128 * 1024 + 2))
+            .unwrap();
+        drop(reopened);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let recovered_again =
+            BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert!(recovered_again.has(&committed.cid).unwrap());
+        assert!(recovered_again.has(&after_recovery.cid).unwrap());
+        assert!(!recovered_again.has(abandoned.cid()).unwrap());
+    }
+
+    #[test]
+    fn native_large_group_commit_splits_at_segment_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = native_config(dir.path());
+        config.native.owners = 1;
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let blocks = (0..3)
+            .map(|extra| (CODEC_RAW, incompressible_bytes(1536 * 1024 + extra)))
+            .collect::<Vec<_>>();
+        let before = process_native_stats();
+        let puts = store.put_batch(&blocks).unwrap();
+        let after = process_native_stats();
+        assert_eq!(puts.len(), blocks.len());
+        assert!(after.durability_barriers - before.durability_barriers >= 2);
+        for (put, (_, payload)) in puts.iter().zip(&blocks) {
+            assert_eq!(store.get(&put.cid).unwrap().payload, *payload);
+        }
+    }
+
+    #[test]
+    fn native_group_commit_uses_one_barrier_per_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = native_config(dir.path());
+        config.native.owners = 1;
+        config.native.segment_bytes = 8 * 1024 * 1024;
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+
+        // Create and durably initialize the active segment before measuring.
+        store.put_raw(&incompressible_bytes(64 * 1024)).unwrap();
+        let engine = store.backend.native().unwrap();
+        let before = engine.device_barriers();
+        let blocks = (0..8)
+            .map(|extra| (CODEC_RAW, incompressible_bytes(128 * 1024 + extra)))
+            .collect::<Vec<_>>();
+        let puts = store.put_batch(&blocks).unwrap();
+
+        assert_eq!(puts.len(), blocks.len());
+        assert_eq!(engine.device_barriers() - before, 1);
+    }
+
+    #[test]
+    fn native_concurrent_duplicate_put_has_one_creator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = native_config(dir.path());
+        config.native.owners = 1;
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store =
+            Arc::new(BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap());
+        let payload = Arc::new(incompressible_bytes(512 * 1024));
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let payload = Arc::clone(&payload);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.put_raw(payload.as_slice()).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let puts = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(puts.iter().filter(|put| !put.already_existed).count(), 1);
+        assert!(puts.iter().all(|put| put.cid == puts[0].cid));
+        assert_eq!(store.get(&puts[0].cid).unwrap().payload, *payload);
+        assert_eq!(store.backend.native().unwrap().records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_public_and_wire_ingress_reject_unverified_encoded_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = native_config(dir.path());
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let invalid = store
+            .encode_preverified_raw(Cid::new(CODEC_RAW, b"different"), b"payload")
+            .unwrap();
+
+        assert!(matches!(
+            store.put_encoded(&invalid),
+            Err(StorageError::HashMismatch(_))
+        ));
+        assert!(
+            store
+                .put_replica_encoded_wire_batch(vec![(
+                    invalid.cid().clone(),
+                    invalid.logical_size_bytes(),
+                    invalid.bytes().to_vec(),
+                )])
+                .is_err()
+        );
+        assert!(
+            store
+                .backend
+                .native()
+                .unwrap()
+                .records()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_independent_puts_share_a_cross_request_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = native_config(dir.path());
+        config.native.owners = 8;
+        // The deliberately wide test window makes the batching assertion
+        // deterministic even on a heavily loaded CI runner.
+        config.native.group_commit_delay_microseconds = 100_000;
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store =
+            Arc::new(BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap());
+        let engine = store.backend.native().unwrap();
+        let mut by_owner = HashMap::new();
+        for extra in 0..512 {
+            let payload = incompressible_bytes(128 * 1024 + extra);
+            let encoded = store.encode(CODEC_RAW, &payload).unwrap();
+            by_owner
+                .entry(engine.owner_for_test(encoded.cid()))
+                .or_insert(encoded);
+            if by_owner.len() == 8 {
+                break;
+            }
+        }
+        assert_eq!(by_owner.len(), 8);
+        let blocks = by_owner.into_values().collect::<Vec<_>>();
+        let start = Arc::new(std::sync::Barrier::new(blocks.len()));
+        let before = engine.device_barriers();
+        let threads = blocks
+            .into_iter()
+            .map(|block| {
+                let store = Arc::clone(&store);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.put_encoded(&block).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert!(!thread.join().unwrap().already_existed);
+        }
+
+        assert_eq!(engine.device_barriers() - before, 1);
+    }
+
+    #[test]
+    fn native_tombstones_survive_compaction_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let config = native_config(dir.path());
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let keep = store.put_raw(&incompressible_bytes(128 * 1024)).unwrap();
+        let remove_a = store
+            .put_raw(&incompressible_bytes(128 * 1024 + 1))
+            .unwrap();
+        let remove_b = store
+            .put_raw(&incompressible_bytes(128 * 1024 + 2))
+            .unwrap();
+        store
+            .garbage_collect(&HashSet::from([keep.cid.clone()]))
+            .unwrap();
+        store.backend.native().unwrap().compact_now().unwrap();
+        assert_eq!(store.get(&keep.cid).unwrap().size, 128 * 1024);
+        assert!(!store.has(&remove_a.cid).unwrap());
+        assert!(!store.has(&remove_b.cid).unwrap());
+        drop(store);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert!(reopened.has(&keep.cid).unwrap());
+        assert!(!reopened.has(&remove_a.cid).unwrap());
+        assert!(!reopened.has(&remove_b.cid).unwrap());
+        assert!(process_native_stats().compactions > 0);
+    }
+
+    #[test]
+    fn native_compaction_reclaims_fully_dead_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join("metadata.redb");
+        let mut config = native_config(dir.path());
+        config.native.owners = 1;
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        let put = store.put_raw(&incompressible_bytes(512 * 1024)).unwrap();
+        store.garbage_collect(&HashSet::new()).unwrap();
+        assert!(!store.has(&put.cid).unwrap());
+        store.backend.native().unwrap().compact_now().unwrap();
+        let segment_root = config.locations[0].path.join("segments").join("owner-0");
+        assert_eq!(fs::read_dir(&segment_root).unwrap().count(), 0);
+        drop(store);
+
+        let metadata = Arc::new(MetadataStore::open_or_create(&metadata_path).unwrap());
+        let reopened = BlockStore::open_with_config(metadata, &config, 4 * 1024 * 1024).unwrap();
+        assert!(!reopened.has(&put.cid).unwrap());
+        assert_eq!(reopened.list_blocks().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn native_aligned_range_read_avoids_full_block_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = native_config(dir.path());
+        config.native.segment_bytes = 8 * 1024 * 1024;
+        let metadata =
+            Arc::new(MetadataStore::open_or_create(dir.path().join("metadata.redb")).unwrap());
+        let store = BlockStore::open_with_config(metadata, &config, 8 * 1024 * 1024).unwrap();
+        let payload = incompressible_bytes(4 * 1024 * 1024);
+        let put = store.put_raw(&payload).unwrap();
+        let start = 1024 * 1024;
+        let end = 2 * 1024 * 1024;
+        let meta = store.get_meta(&put.cid).unwrap().unwrap();
+        let (range, physical) = read_native_raw_block_range(
+            store.backend.native().unwrap(),
+            &put.cid,
+            store.max_block_bytes,
+            meta.size_bytes,
+            start as u64,
+            end as u64,
+            meta.stored_size_bytes,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(range, payload[start..end]);
+        assert!(
+            physical < 2 * 1024 * 1024,
+            "one MiB range physically read {physical} bytes"
+        );
     }
 
     #[test]

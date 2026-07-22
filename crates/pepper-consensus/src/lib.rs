@@ -48,6 +48,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tracing::warn;
 
 const PROPOSAL_BATCH_MAX_COMMANDS: usize = 32;
 const PROPOSAL_BATCH_MAX_DELAY: Duration = Duration::from_micros(250);
@@ -293,6 +294,14 @@ pub trait ConsensusDataBackend: Send + Sync + 'static {
     async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String>;
     async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String>;
 
+    async fn get_from_replicas(
+        &self,
+        cid: &Cid,
+        _replica_node_ids: &[String],
+    ) -> Result<Vec<u8>, String> {
+        self.get(cid).await
+    }
+
     async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
         let mut cids = Vec::with_capacity(blocks.len());
         for (codec, payload) in blocks {
@@ -335,6 +344,46 @@ impl ConsensusDataStore {
 
     async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
         self.0.put_batch(blocks).await
+    }
+
+    async fn get_from_replicas(
+        &self,
+        cid: &Cid,
+        replica_node_ids: &[String],
+    ) -> Result<Vec<u8>, String> {
+        self.0.get_from_replicas(cid, replica_node_ids).await
+    }
+
+    async fn hydrate_merkle_tree(
+        &self,
+        root: &Cid,
+        replica_node_ids: &[String],
+    ) -> Result<(), String> {
+        pepper_merkle::validate_tree(
+            &ReplicaConsensusReadStore {
+                store: self,
+                replica_node_ids,
+            },
+            root,
+            pepper_merkle::MerkleLimits::default(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+}
+
+struct ReplicaConsensusReadStore<'a> {
+    store: &'a ConsensusDataStore,
+    replica_node_ids: &'a [String],
+}
+
+#[async_trait]
+impl MerkleReadStore for ReplicaConsensusReadStore<'_> {
+    async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+        self.store
+            .get_from_replicas(cid, self.replica_node_ids)
+            .await
     }
 }
 
@@ -428,8 +477,15 @@ pub struct NetworkBlockStoreDataBackend {
 #[async_trait]
 impl ConsensusDataBackend for NetworkBlockStoreDataBackend {
     async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
-        if let Ok(block) = self.block_store.get(cid) {
-            return Ok(block.payload);
+        match self.block_store.get(cid) {
+            Ok(block) => return Ok(block.payload),
+            Err(error) => {
+                warn!(
+                    cid = %cid,
+                    local_error = %error,
+                    "consensus data store required remote recovery"
+                );
+            }
         }
         let payload = self
             .network
@@ -451,6 +507,53 @@ impl ConsensusDataBackend for NetworkBlockStoreDataBackend {
             .put(codec, &payload)
             .map(|response| response.cid)
             .map_err(|error| error.to_string())
+    }
+
+    async fn get_from_replicas(
+        &self,
+        cid: &Cid,
+        replica_node_ids: &[String],
+    ) -> Result<Vec<u8>, String> {
+        if let Ok(block) = self.block_store.get(cid) {
+            return Ok(block.payload);
+        }
+        let local_node_id = self.network.local_descriptor().node_id;
+        let mut attempted = BTreeSet::new();
+        let mut last_error = None;
+        for node_id in replica_node_ids {
+            if node_id == &local_node_id || !attempted.insert(node_id.clone()) {
+                continue;
+            }
+            let Some(address) = self.network.peer_address(node_id).await else {
+                last_error = Some(format!("namespace replica {node_id} is not routable"));
+                continue;
+            };
+            match self.network.block_has(address, cid).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            }
+            match self.network.block_get(address, cid).await {
+                Ok(payload) => {
+                    if !cid.verify(&payload) {
+                        last_error = Some(format!(
+                            "namespace replica {node_id} returned corrupt block {cid}"
+                        ));
+                        continue;
+                    }
+                    self.block_store
+                        .put(cid.codec, &payload)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(payload);
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| format!("no namespace replica holds checkpoint Merkle block {cid}")))
     }
 
     async fn put_batch(&self, blocks: Vec<(Codec, Vec<u8>)>) -> Result<Vec<Cid>, String> {
@@ -948,7 +1051,7 @@ fn proposal_protection_intents(
                 .iter()
                 .filter_map(|mutation| match mutation {
                     NamespaceMutation::Put { value_cid, .. } => Some(value_cid.clone()),
-                    NamespaceMutation::Delete { .. } => None,
+                    NamespaceMutation::Assert { .. } | NamespaceMutation::Delete { .. } => None,
                 })
                 .map(|cid| PublicationIntentRecord {
                     intent_id: format!(
@@ -1016,6 +1119,7 @@ struct PersistedStateMachine {
 struct SnapshotPointer {
     checkpoint_cid: Cid,
     membership_epoch: u64,
+    replica_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1338,6 +1442,11 @@ impl RedbStateMachineStore {
 impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let state = self.state.read().await.clone();
+        let replica_node_ids = snapshot_replica_node_ids(&state);
+        self.data_store
+            .hydrate_merkle_tree(&state.namespace_state.current_root_cid, &replica_node_ids)
+            .await
+            .map_err(write_snapshot_error)?;
         let timestamp = state
             .namespace_state
             .history
@@ -1349,6 +1458,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachineStore {
         let pointer = SnapshotPointer {
             checkpoint_cid: checkpoint_cid.clone(),
             membership_epoch: state.membership_epoch,
+            replica_node_ids,
         };
         let data = serde_json::to_vec(&pointer).map_err(write_snapshot_error)?;
         let meta = SnapshotMeta {
@@ -1498,6 +1608,29 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         }
         let pointer: SnapshotPointer =
             serde_json::from_slice(snapshot.get_ref()).map_err(read_snapshot_error)?;
+        // Steady-state namespace membership has three voters. During a joint
+        // consensus transition the authoritative source set is the union of
+        // the old and new three-voter configurations, so a snapshot can
+        // legitimately name four through six replicas. Reject smaller or
+        // unbounded source sets, but never shut down a learner merely because
+        // its catch-up snapshot was built during replacement.
+        if !(3..=6).contains(&pointer.replica_node_ids.len())
+            || pointer
+                .replica_node_ids
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != pointer.replica_node_ids.len()
+        {
+            return Err(read_snapshot_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot must identify three to six namespace replicas",
+            )));
+        }
+        self.data_store
+            .get_from_replicas(&pointer.checkpoint_cid, &pointer.replica_node_ids)
+            .await
+            .map_err(read_snapshot_error)?;
         let namespace_state = load_checkpoint(
             &self.data_store,
             &pointer.checkpoint_cid,
@@ -1505,6 +1638,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         )
         .await
         .map_err(read_snapshot_error)?;
+        self.data_store
+            .hydrate_merkle_tree(&namespace_state.current_root_cid, &pointer.replica_node_ids)
+            .await
+            .map_err(read_snapshot_error)?;
         let next = PersistedStateMachine {
             last_applied_log: meta.last_log_id,
             membership_epoch: pointer.membership_epoch,
@@ -1539,6 +1676,22 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
             })
             .transpose()
     }
+}
+
+fn snapshot_replica_node_ids(state: &PersistedStateMachine) -> Vec<String> {
+    let voters = state.membership.voter_ids().collect::<BTreeSet<_>>();
+    let mut identities = state
+        .membership
+        .nodes()
+        .filter(|(node_id, _)| voters.contains(node_id))
+        .map(|(_, node)| node.addr.clone())
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        identities = state.namespace_state.descriptor.initial_replica_set.clone();
+    }
+    identities.sort();
+    identities.dedup();
+    identities
 }
 
 #[derive(Clone)]
@@ -2588,6 +2741,75 @@ impl NamespaceGroupManager {
         self.routed_linearizable_namespace_head(namespace_id).await
     }
 
+    /// Return the best locally known leader and committed voter identities
+    /// without performing discovery. Callers that just obtained a routed
+    /// linearizable state can use this route to fetch state-machine blocks
+    /// from the node that is guaranteed to have applied that state first.
+    pub async fn known_namespace_route(
+        &self,
+        namespace_id: &NamespaceId,
+    ) -> (Option<String>, Vec<String>) {
+        if let Ok(group) = self.group(namespace_id).await {
+            let metrics = group.raft.metrics().borrow().clone();
+            let leader = if let Some(leader) = metrics.current_leader {
+                *group.last_known_leader.write().await = Some((leader, metrics.current_term));
+                Some(leader)
+            } else {
+                group
+                    .last_known_leader
+                    .read()
+                    .await
+                    .filter(|(_, term)| *term == metrics.current_term)
+                    .map(|(leader, _)| leader)
+            };
+            let state = group.state_machine.state.read().await;
+            let voters = state.membership.voter_ids().collect::<BTreeSet<_>>();
+            let mut voter_identities = state
+                .membership
+                .nodes()
+                .filter(|(node_id, _)| voters.contains(node_id))
+                .map(|(_, node)| node.addr.clone())
+                .collect::<Vec<_>>();
+            if voter_identities.is_empty() {
+                voter_identities = state.namespace_state.descriptor.initial_replica_set.clone();
+            }
+            voter_identities.sort();
+            voter_identities.dedup();
+            let leader_identity = leader.and_then(|leader| {
+                state
+                    .membership
+                    .nodes()
+                    .find(|(node_id, _)| **node_id == leader)
+                    .map(|(_, node)| node.addr.clone())
+                    .or_else(|| {
+                        state
+                            .namespace_state
+                            .descriptor
+                            .initial_replica_set
+                            .iter()
+                            .find(|identity| raft_node_id(identity) == leader)
+                            .cloned()
+                    })
+            });
+            return (leader_identity, voter_identities);
+        }
+
+        let Ok(mut records) = self.discovery_records(&namespace_id.to_string()) else {
+            return (None, Vec::new());
+        };
+        records.sort_by(|left, right| {
+            right
+                .membership_epoch
+                .cmp(&left.membership_epoch)
+                .then_with(|| right.leader_term.cmp(&left.leader_term))
+        });
+        let Some(record) = records.into_iter().next() else {
+            return (None, Vec::new());
+        };
+        let leader = (!record.leader_node_id.is_empty()).then_some(record.leader_node_id);
+        (leader, record.replica_node_ids)
+    }
+
     pub async fn command_metrics(&self) -> Vec<ConsensusCommandMetric> {
         self.command_metrics
             .lock()
@@ -3325,6 +3547,28 @@ impl NamespaceGroupManager {
         statuses
     }
 
+    /// Return current states for groups led by this process. Background
+    /// partition maintenance uses this bounded local inventory rather than
+    /// discovering every namespace through peer RPCs.
+    pub async fn local_leader_namespace_states(&self) -> Vec<NamespaceState> {
+        let groups = self
+            .groups
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut states = Vec::new();
+        for group in groups {
+            let metrics = group.raft.metrics().borrow().clone();
+            if metrics.running_state.is_ok() && metrics.current_leader == Some(self.node_id) {
+                states.push(group.namespace_state().await);
+            }
+        }
+        states.sort_by_key(|state| state.namespace_id.to_string());
+        states
+    }
+
     /// Restart every locally assigned persisted group before the node serves
     /// namespace traffic. Storage recovery verifies checkpoint CIDs and replays
     /// committed logs before each handle is returned.
@@ -3813,6 +4057,15 @@ impl NetworkNamespaceService for NamespaceGroupManager {
                 "checkpoint does not belong to requested namespace",
             ));
         }
+        let hydration_replicas = if request.current_voters.len() == 3 {
+            request.current_voters.clone()
+        } else {
+            state.descriptor.initial_replica_set.clone()
+        };
+        data_store
+            .hydrate_merkle_tree(&state.current_root_cid, &hydration_replicas)
+            .await
+            .map_err(namespace_network_error)?;
         if request.recovery {
             if self.group(&namespace_id).await.is_ok() {
                 self.shutdown_group(&namespace_id)
@@ -4045,6 +4298,63 @@ mod tests {
     use pepper_types::{CODEC_RAW, PutBlockResponse};
     use std::time::Duration;
 
+    type SharedBlockMap = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+
+    #[derive(Clone)]
+    struct SnapshotHydrationBackend {
+        local: SharedBlockMap,
+        remote: Option<SharedBlockMap>,
+        remote_enabled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ConsensusDataBackend for SnapshotHydrationBackend {
+        async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+            self.local
+                .lock()
+                .await
+                .get(&cid.to_string())
+                .cloned()
+                .ok_or_else(|| "local block not found".to_string())
+        }
+
+        async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String> {
+            let cid = Cid::new(codec, &payload);
+            self.local.lock().await.insert(cid.to_string(), payload);
+            Ok(cid)
+        }
+
+        async fn get_from_replicas(
+            &self,
+            cid: &Cid,
+            _replica_node_ids: &[String],
+        ) -> Result<Vec<u8>, String> {
+            if let Ok(payload) = self.get(cid).await {
+                return Ok(payload);
+            }
+            if !self
+                .remote_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err("remote replica is disabled".to_string());
+            }
+            let payload = self
+                .remote
+                .as_ref()
+                .ok_or_else(|| "remote replica is absent".to_string())?
+                .lock()
+                .await
+                .get(&cid.to_string())
+                .cloned()
+                .ok_or_else(|| "remote block not found".to_string())?;
+            self.local
+                .lock()
+                .await
+                .insert(cid.to_string(), payload.clone());
+            Ok(payload)
+        }
+    }
+
     #[test]
     fn leader_read_lease_requires_current_leader_quorum_and_complete_apply() {
         assert!(leader_read_lease_current(
@@ -4142,11 +4452,23 @@ mod tests {
         let identity = NodeIdentity::generate_and_store(directory.path().join("identity")).unwrap();
         let identity_string = identity.node_id().to_string();
         let address = free_address();
+        let bulk_address = free_address();
         let network = NetworkHandle::start(
             PeerNetworkConfig {
                 node_name: name.to_string(),
                 listen_addr: address,
                 advertise_addr: address,
+                bulk_listen_addr: bulk_address,
+                bulk_advertise_addr: bulk_address,
+                bulk_worker_threads: 1,
+                bulk_inbound_connections: 32,
+                bulk_streams_per_connection: 32,
+                bulk_send_window_bytes: 128 * 1024 * 1024,
+                bulk_connection_receive_window_bytes: 128 * 1024 * 1024,
+                bulk_stream_receive_window_bytes: 68 * 1024 * 1024,
+                bulk_request_timeout_seconds: 60,
+                bulk_max_bytes_per_second: 0,
+                bulk_bandwidth_burst_bytes: 128 * 1024 * 1024,
                 bootstrap_peers: Vec::new(),
                 cluster_secret: Some(vec![7; 32]),
                 requests_per_minute: None,
@@ -4928,7 +5250,8 @@ mod tests {
             .unwrap();
         let committed = writes.await.unwrap();
         assert_eq!(committed, 8);
-        for _ in 0..160 {
+        let mut caught_up = false;
+        for _ in 0..1_200 {
             let leader_revision = leader_group.namespace_state().await.current_revision;
             let replacement_revision = replacement
                 .manager
@@ -4954,20 +5277,151 @@ mod tests {
                 && replacement_revision == 9
                 && replacement_is_voter
             {
+                caught_up = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let replacement_group = replacement.manager.group(&namespace_id).await.unwrap();
+        assert!(
+            caught_up,
+            "replacement did not apply the promoted membership and namespace log: {:?}",
+            replacement_group.raft.metrics().borrow().clone()
+        );
+        let replacement_state = replacement_group.namespace_state().await;
+        let leader_state = leader_group.namespace_state().await;
+        let replacement_entries = pepper_merkle::scan(
+            &replacement.data_store,
+            &replacement_state.current_root_cid,
+            pepper_merkle::ScanQuery {
+                limit: 32,
+                ..pepper_merkle::ScanQuery::default()
+            },
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap()
+        .entries;
+        let leader_entries = pepper_merkle::scan(
+            &leader.data_store,
+            &leader_state.current_root_cid,
+            pepper_merkle::ScanQuery {
+                limit: 32,
+                ..pepper_merkle::ScanQuery::default()
+            },
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap()
+        .entries;
+        assert_eq!(replacement_entries, leader_entries);
         assert_eq!(
-            replacement_group.namespace_state().await.current_root_cid,
-            leader_group.namespace_state().await.current_root_cid
+            replacement_state.current_root_cid,
+            leader_state.current_root_cid
         );
         let applied = replacement_group.state_machine.state.read().await;
         let voters = applied.membership.voter_ids().collect::<BTreeSet<_>>();
         assert!(voters.contains(&raft_node_id(&replacement.identity)));
         assert!(!voters.contains(&raft_node_id(&failed.identity)));
         assert_eq!(voters.len(), 3);
+        drop(applied);
+        let (known_leader, known_voters) =
+            leader.manager.known_namespace_route(&namespace_id).await;
+        assert!(known_leader.is_some());
+        assert_eq!(known_voters.len(), 3);
+        assert!(known_voters.contains(&replacement.identity));
+        assert!(!known_voters.contains(&failed.identity));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_install_hydrates_complete_merkle_tree_before_source_loss() {
+        let source_blocks = Arc::new(Mutex::new(BTreeMap::new()));
+        let source_store = ConsensusDataStore::new(SnapshotHydrationBackend {
+            local: source_blocks.clone(),
+            remote: None,
+            remote_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let created = create_namespace(
+            &source_store,
+            descriptor(1),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let initial_state = created.state.clone();
+        let mut state = created.state;
+        for index in 0..256 {
+            let key = format!("key-{index:04}");
+            let mut machine =
+                pepper_namespace::NamespaceStateMachine::new(source_store.clone(), state.clone())
+                    .unwrap();
+            machine
+                .apply(put_command(&state, &format!("hydrate-{index}"), &key))
+                .await
+                .unwrap();
+            state = machine.state().clone();
+        }
+        let checkpoint_cid = write_checkpoint(&source_store, &state, 300).await.unwrap();
+
+        let remote_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let target_store = ConsensusDataStore::new(SnapshotHydrationBackend {
+            local: Arc::new(Mutex::new(BTreeMap::new())),
+            remote: Some(source_blocks),
+            remote_enabled: remote_enabled.clone(),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
+        );
+        let namespace_id = initial_state.namespace_id.clone();
+        let bundle = StorageBundle::open(
+            metadata,
+            &namespace_id,
+            initial_state,
+            target_store.clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        let pointer = SnapshotPointer {
+            checkpoint_cid,
+            membership_epoch: 1,
+            replica_node_ids: vec!["node-a".into(), "node-b".into(), "node-c".into()],
+        };
+        let mut state_machine = bundle.state_machine;
+        state_machine
+            .install_snapshot(
+                &SnapshotMeta {
+                    last_log_id: None,
+                    last_membership: StoredMembership::default(),
+                    snapshot_id: "hydrated-snapshot".to_string(),
+                },
+                Box::new(Cursor::new(serde_json::to_vec(&pointer).unwrap())),
+            )
+            .await
+            .unwrap();
+
+        remote_enabled.store(false, std::sync::atomic::Ordering::Release);
+        let installed = state_machine.namespace_state().await;
+        let validation = pepper_merkle::validate_tree(
+            &target_store,
+            &installed.current_root_cid,
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(validation.entries, 256);
+        assert!(
+            pepper_merkle::get(
+                &target_store,
+                &installed.current_root_cid,
+                b"key-0255",
+                MerkleLimits::default(),
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,6 +4,8 @@ mod api_error;
 mod bucket_api;
 mod compute;
 mod diagnostics;
+mod ec_planner;
+mod fast_path;
 mod filesystem_api;
 mod http;
 mod metrics;
@@ -11,28 +13,40 @@ mod namespace_api;
 mod network_services;
 mod objects;
 mod pins;
+mod placement;
 mod publication;
 mod reconstructed_cache;
 mod repair;
 mod s3_api;
+mod small_object_pack;
 
 use api_error::ApiError;
 use bucket_api::*;
 use compute::*;
+use ec_planner::{EcPlanDecision, EcPlannerInputs, EcTransferPlan, ErasurePlanner};
+use fast_path::FastPathRuntime;
 use filesystem_api::*;
 use metrics::*;
 use namespace_api::*;
 use network_services::*;
 use objects::*;
 use pins::*;
+use placement::{PlacementRuntime, placement_map_from_candidates};
 use publication::*;
 use reconstructed_cache::ReconstructedStripeCache;
 use repair::*;
 use s3_api::*;
+use small_object_pack::*;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Bind jemalloc arenas to the CPU executing each per-core owner. This keeps
+// allocations and frees local without requiring a process-wide allocator lock.
+#[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
+#[unsafe(export_name = "malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,background_thread:true\0";
 
 use ::time::OffsetDateTime;
 use anyhow::{Context, Result};
@@ -50,12 +64,17 @@ use axum::{
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use pepper_bucket::BucketObjectCodecHandler;
+use pepper_bucket::{
+    BucketObjectCodecHandler, BucketPartition, BucketPartitionMap, BucketPartitionMapState,
+    DEFAULT_BUCKET_PARTITIONS, MAX_BUCKET_PARTITIONS,
+};
 use pepper_compute::validate_job_spec;
-use pepper_config::{LoadedConfig, default_config_path, load_from_path};
+use pepper_config::{LoadedConfig, SmallObjectPackConfig, default_config_path, load_from_path};
 use pepper_consensus::{ConsensusConfig, ConsensusDataStore, NamespaceGroupManager};
 use pepper_crypto::{NodeIdentity, verify_signature};
-use pepper_dag::{BlockResolver as DagBlockResolver, DagCodecRegistry, TraversalLimits};
+use pepper_dag::{
+    BlockResolver as DagBlockResolver, DagCodecHandler, DagCodecRegistry, DagError, TraversalLimits,
+};
 use pepper_filesystem::{FilesystemInodeCodecHandler, FilesystemRootCodecHandler};
 use pepper_merkle::MerkleNodeCodecHandler;
 use pepper_metadata::MetadataStore;
@@ -64,19 +83,24 @@ use pepper_namespace::{
     NamespaceId, NamespaceState, PinAction,
 };
 use pepper_network::{
-    NetworkBlockService, NetworkComputeService, NetworkConfig, NetworkError, NetworkHandle,
-    NetworkNamespaceAliasService, NetworkPinService, PeerStatus, proto,
+    ErasureChunkReceiver, NetworkBlockService, NetworkComputeService, NetworkConfig,
+    NetworkErasureService, NetworkError, NetworkHandle, NetworkNamespaceAliasService,
+    NetworkPinService, PeerStatus, proto,
 };
-use pepper_placement::{PlacementNode, select_replicas};
+use pepper_placement::{
+    AuthoritativePlacementError, PlacementException, PlacementMap, PlacementMapNodeState,
+    PlacementNode, select_replicas,
+};
 use pepper_publication::{PublicationLimits, PublicationRepository};
 use pepper_storage::{BlockStore, StorageError};
 use pepper_types::{
-    CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_RAW, Cid, Codec,
-    ComputeAttempt, ComputeJobSpec, ComputeJobStatus, ComputeLogsResponse, ComputeOffer,
+    CODEC_BUCKET_PARTITION_BARRIER, CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST,
+    CODEC_OBJECT_MANIFEST, CODEC_RAW, CODEC_SMALL_OBJECT, CODEC_SMALL_OBJECT_EXTENT_INDEX, Cid,
+    Codec, ComputeAttempt, ComputeJobSpec, ComputeJobStatus, ComputeLogsResponse, ComputeOffer,
     ComputeReceipt, DirEntry, DirManifest, DurabilityReceipt, ErasureManifest, ErasureShard,
     ErasureStripe, ErasureStripeEncoding, ErrorCode, GcReport, InitStatus, NodeStatus, ObjectChunk,
-    ObjectManifest, PinCreateRequest, PinRecord, PinStatusResponse, ProviderRecord,
-    PutBlockResponse, SubmitComputeResponse,
+    ObjectManifest, PinCreateRequest, PinRecord, PinStatusResponse, PlacedCid, PlacementReference,
+    PlacementRole, ProviderRecord, PutBlockResponse, SubmitComputeResponse,
 };
 use redb::{ReadableTable, TableDefinition};
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -94,7 +118,7 @@ use std::{
 };
 use tokio::{
     process::Command as TokioCommand,
-    sync::{RwLock, Semaphore, oneshot},
+    sync::{OnceCell, RwLock, Semaphore, oneshot},
     task::AbortHandle,
     time::{self, Duration},
 };
@@ -105,6 +129,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PIN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static READ_DIAGNOSTIC_COUNTER: AtomicU64 = AtomicU64::new(1);
 const STORAGE_SOFT_PRESSURE_PERCENT: u64 = 85;
 const STORAGE_HARD_PRESSURE_PERCENT: u64 = 95;
 const DEFAULT_MAX_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
@@ -165,9 +190,13 @@ struct AppState {
     _publication_limits: PublicationLimits,
     namespace_log_bytes: u64,
     replication_factor: usize,
+    placement: Arc<PlacementRuntime>,
+    fast_path: Option<Arc<FastPathRuntime>>,
     local_block_writer: BlockBatchWriter,
+    repair_block_writer: BlockBatchWriter,
     replicated_block_slots: Arc<Semaphore>,
     s3_write_slots: Arc<Semaphore>,
+    s3_write_capacity: usize,
     s3_write_queue_slots: Arc<Semaphore>,
     s3_write_queue_timeout: Duration,
     s3_write_service_micros: Arc<AtomicU64>,
@@ -207,11 +236,14 @@ struct AppState {
     s3: Option<Arc<S3RuntimeConfig>>,
     max_block_bytes: Option<u64>,
     max_object_bytes: Option<u64>,
+    small_object_max_bytes: Option<u64>,
+    small_object_pack: Option<SmallObjectPackConfig>,
     max_compute_timeout_seconds: Option<u64>,
     erasure_enabled: bool,
     erasure_min_size_bytes: u64,
     erasure_data_shards: u16,
     erasure_parity_shards: u16,
+    erasure_planner: Arc<ErasurePlanner>,
     reconstructed_stripe_cache: Option<Arc<ReconstructedStripeCache>>,
     erasure_stripe_read_slots: Arc<Semaphore>,
     http_requests_per_minute: Option<u64>,
@@ -220,6 +252,44 @@ struct AppState {
     erasure_repair_semaphore: Arc<Semaphore>,
     erasure_repair_bytes_per_second: u64,
     _identity_lock: Arc<std::fs::File>,
+}
+
+fn refresh_fast_path_placement(state: &AppState) {
+    if let Some(runtime) = &state.fast_path {
+        runtime.refresh_placement(state.placement.snapshot());
+    }
+}
+
+fn cache_fast_path_bucket(state: &AppState, bucket: &str, namespace_id: &NamespaceId) {
+    if let Some(runtime) = &state.fast_path {
+        runtime.cache_bucket_namespace(bucket, namespace_id.clone());
+    }
+}
+
+fn invalidate_fast_path_bucket(state: &AppState, bucket: &str) {
+    if let Some(runtime) = &state.fast_path {
+        runtime.invalidate_bucket_namespace(bucket);
+    }
+}
+
+fn record_read_diagnostic(
+    state: &AppState,
+    mut record: ReadDiagnosticRecord,
+) -> Result<(), ApiError> {
+    record.sequence = READ_DIAGNOSTIC_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let record = match fast_path::record_read_diagnostic(record) {
+        Ok(()) => return Ok(()),
+        Err(record) => record,
+    };
+    let mut records = state
+        .read_diagnostics
+        .lock()
+        .map_err(|_| ApiError::internal("read diagnostic lock poisoned"))?;
+    if records.len() == 512 {
+        records.pop_front();
+    }
+    records.push_back(record);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -269,8 +339,7 @@ struct GcQuery {
     dry_run: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
     let config_path = args.config.unwrap_or_else(default_config_path);
     let loaded = load_from_path(&config_path).with_context(|| {
@@ -286,8 +355,42 @@ async fn main() -> Result<()> {
         Some(Command::Init) => init_node(loaded),
         Some(Command::Backup { output }) => backup_metadata(loaded, output),
         Some(Command::Restore { input, force }) => restore_metadata(loaded, input, force),
-        None => run_agent(loaded).await,
+        None => {
+            let runtime = control_runtime(&loaded.config.fast_path)?;
+            runtime.block_on(run_agent(loaded))
+        }
     }
+}
+
+fn control_runtime(config: &pepper_config::FastPathConfig) -> Result<tokio::runtime::Runtime> {
+    let cpu_ids = fast_path::available_cpu_ids();
+    let control_threads = if config.enabled {
+        config.control_cores.min(cpu_ids.len()).max(1)
+    } else {
+        cpu_ids.len().max(1)
+    };
+    let control_cpus = Arc::new(
+        cpu_ids
+            .into_iter()
+            .take(control_threads)
+            .collect::<Vec<_>>(),
+    );
+    let next_cpu = Arc::new(AtomicU64::new(0));
+    let pin_cpus = config.pin_cpus;
+    let thread_cpus = control_cpus.clone();
+    let thread_index = next_cpu.clone();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(control_threads)
+        .thread_name("pepper-control")
+        .on_thread_start(move || {
+            if pin_cpus && !thread_cpus.is_empty() {
+                let index = thread_index.fetch_add(1, Ordering::Relaxed) as usize;
+                fast_path::pin_current_thread(thread_cpus[index % thread_cpus.len()]);
+            }
+        })
+        .enable_all()
+        .build()
+        .context("failed to construct reserved Pepper control runtime")
 }
 
 fn load_cluster_secret(path: Option<&PathBuf>) -> Result<Option<Vec<u8>>> {
@@ -580,9 +683,9 @@ fn init_node(loaded: LoadedConfig) -> Result<()> {
             )
         })?,
     );
-    let _block_store = BlockStore::open_with_limit(
+    let _block_store = BlockStore::open_with_config(
         metadata.clone(),
-        &loaded.config.storage.locations,
+        &loaded.config.storage,
         loaded
             .config
             .limits
@@ -622,9 +725,9 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         })?,
     );
     let block_store = Arc::new(
-        BlockStore::open_with_limit(
+        BlockStore::open_with_config(
             metadata.clone(),
-            &loaded.config.storage.locations,
+            &loaded.config.storage,
             loaded
                 .config
                 .limits
@@ -635,10 +738,11 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     );
     let operation_lock = Arc::new(RwLock::new(()));
     let local_block_writer = BlockBatchWriter::normal(block_store.clone());
+    let placement = Arc::new(PlacementRuntime::default());
     let replica_block_writer = BlockBatchWriter::replica(block_store.clone());
     let network_block_service = Arc::new(AgentBlockService {
         block_store: block_store.clone(),
-        replica_writer: replica_block_writer,
+        replica_writer: replica_block_writer.clone(),
         operation_lock: operation_lock.clone(),
     });
     let cluster_secret = load_cluster_secret(loaded.config.auth.cluster_secret_path.as_ref())?;
@@ -659,8 +763,10 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
                 .context("s3.access_key_id is required when S3 is enabled")?,
             secret_access_key: load_s3_secret(path)?,
             max_clock_skew_seconds: loaded.config.s3.max_clock_skew_seconds,
+            bucket_partitions: usize::from(loaded.config.s3.bucket_partitions),
             bucket_create_lock: Arc::new(tokio::sync::Mutex::new(())),
             bucket_catalog_lock: Arc::new(tokio::sync::Mutex::new(())),
+            placement_map_lock: Arc::new(tokio::sync::Mutex::new(())),
             multipart_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     } else {
@@ -684,6 +790,40 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         .unwrap_or(&loaded.config.node.listen_addr)
         .parse()
         .context("node advertise address should have been validated")?;
+    let bulk_p2p_addr: SocketAddr = loaded
+        .config
+        .node
+        .bulk_listen_addr
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .context("node.bulk_listen_addr should have been validated")?
+        .unwrap_or_else(|| {
+            SocketAddr::new(
+                p2p_addr.ip(),
+                p2p_addr
+                    .port()
+                    .checked_add(1)
+                    .expect("bulk listener derivation was validated"),
+            )
+        });
+    let bulk_advertise_addr: SocketAddr = loaded
+        .config
+        .node
+        .bulk_advertise_addr
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .context("node.bulk_advertise_addr should have been validated")?
+        .unwrap_or_else(|| {
+            SocketAddr::new(
+                advertise_addr.ip(),
+                advertise_addr
+                    .port()
+                    .checked_add(1)
+                    .expect("bulk advertise derivation was validated"),
+            )
+        });
     let storage_summary = block_store
         .storage_summary()
         .context("failed to summarize local storage")?;
@@ -692,6 +832,25 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
             node_name: loaded.config.node.name.clone(),
             listen_addr: p2p_addr,
             advertise_addr,
+            bulk_listen_addr: bulk_p2p_addr,
+            bulk_advertise_addr,
+            bulk_worker_threads: loaded.config.network.bulk.worker_threads,
+            bulk_inbound_connections: loaded.config.network.bulk.inbound_connections,
+            bulk_streams_per_connection: loaded.config.network.bulk.streams_per_connection,
+            bulk_send_window_bytes: loaded.config.network.bulk.send_window_bytes,
+            bulk_connection_receive_window_bytes: loaded
+                .config
+                .network
+                .bulk
+                .connection_receive_window_bytes,
+            bulk_stream_receive_window_bytes: loaded
+                .config
+                .network
+                .bulk
+                .stream_receive_window_bytes,
+            bulk_request_timeout_seconds: loaded.config.network.bulk.request_timeout_seconds,
+            bulk_max_bytes_per_second: loaded.config.network.bulk.max_bytes_per_second,
+            bulk_bandwidth_burst_bytes: loaded.config.network.bulk.bandwidth_burst_bytes,
             bootstrap_peers: loaded.config.network.bootstrap_peers.clone(),
             cluster_secret,
             requests_per_minute: loaded.config.limits.rpc_requests_per_minute,
@@ -717,6 +876,16 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     )
     .await
     .context("failed to start P2P network")?;
+    let fast_path = if loaded.config.fast_path.enabled && loaded.config.s3.enabled {
+        Some(FastPathRuntime::start(
+            &loaded.config.fast_path,
+            block_store.clone(),
+            placement.snapshot(),
+            Some(&network),
+        )?)
+    } else {
+        None
+    };
 
     let started_at = OffsetDateTime::now_utc();
     let status = NodeStatus {
@@ -737,6 +906,12 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     dag_registry
         .register(BucketObjectCodecHandler)
         .expect("bucket object codec must be registered exactly once");
+    dag_registry
+        .register(S3ListBarrierCodecHandler)
+        .expect("bucket partition barrier codec must be registered exactly once");
+    dag_registry
+        .register(SmallObjectExtentIndexCodecHandler)
+        .expect("small-object extent index codec must be registered exactly once");
     dag_registry
         .register(MerkleNodeCodecHandler)
         .expect("Merkle node codec must be registered exactly once");
@@ -811,7 +986,10 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         _publication_limits: publication_limits,
         namespace_log_bytes: loaded.config.namespace.max_consensus_log_bytes,
         replication_factor: loaded.config.replication.default_factor as usize,
+        placement,
+        fast_path,
         local_block_writer,
+        repair_block_writer: replica_block_writer,
         replicated_block_slots: Arc::new(Semaphore::new(REPLICATED_BLOCK_CONCURRENCY)),
         s3_write_slots: Arc::new(Semaphore::new(
             loaded
@@ -820,6 +998,11 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
                 .s3_write_concurrency
                 .unwrap_or(S3_WRITE_CONCURRENCY),
         )),
+        s3_write_capacity: loaded
+            .config
+            .limits
+            .s3_write_concurrency
+            .unwrap_or(S3_WRITE_CONCURRENCY),
         s3_write_queue_slots: Arc::new(Semaphore::new(
             loaded
                 .config
@@ -910,11 +1093,24 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
                 .max_object_bytes
                 .unwrap_or(DEFAULT_MAX_OBJECT_BYTES),
         ),
+        small_object_max_bytes: loaded
+            .config
+            .storage
+            .small_object_pack
+            .enabled
+            .then_some(loaded.config.storage.small_object_pack.max_object_bytes),
+        small_object_pack: loaded
+            .config
+            .storage
+            .small_object_pack
+            .enabled
+            .then(|| loaded.config.storage.small_object_pack.clone()),
         max_compute_timeout_seconds: loaded.config.limits.max_compute_timeout_seconds,
         erasure_enabled: loaded.config.erasure.enabled,
         erasure_min_size_bytes: loaded.config.erasure.min_size_bytes,
         erasure_data_shards: loaded.config.erasure.data_shards,
         erasure_parity_shards: loaded.config.erasure.parity_shards,
+        erasure_planner: Arc::new(ErasurePlanner::new(loaded.config.erasure.transfer.clone())),
         reconstructed_stripe_cache,
         erasure_stripe_read_slots: Arc::new(Semaphore::new(
             loaded
@@ -949,6 +1145,12 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
 
     state
         .network
+        .set_erasure_service(Arc::new(AgentErasureService {
+            state: state.clone(),
+        }))
+        .await;
+    state
+        .network
         .set_compute_service(Arc::new(AgentComputeService {
             state: state.clone(),
         }))
@@ -967,9 +1169,12 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         .await;
 
     recover_compute_jobs(&state).map_err(|error| anyhow::anyhow!(error.message))?;
+    initialize_repair_inventory_tables(&state).map_err(|error| anyhow::anyhow!(error.message))?;
     spawn_repair_loop(state.clone());
     spawn_publication_reconciler(state.clone());
     spawn_s3_lifecycle_reconciler(state.clone());
+    spawn_s3_placement_refresh_loop(state.clone());
+    spawn_small_object_pack_loop(state.clone());
 
     let shutdown_state = state.clone();
     let app = http::router(state);
@@ -981,8 +1186,8 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         .parse()
         .context("api.bind_addr should have been validated as a socket address")?;
     anyhow::ensure!(
-        addr.ip().is_loopback(),
-        "the built-in HTTP API must bind to loopback; use a TLS-authenticated reverse proxy for remote access"
+        addr.ip().is_loopback() || loaded.config.api.allow_insecure_remote,
+        "the built-in HTTP API must bind to loopback unless api.allow_insecure_remote is explicitly enabled"
     );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -1077,6 +1282,276 @@ async fn get_block_resolved_transient(
     get_block_resolved_with_policy(state, cid, false).await
 }
 
+async fn get_block_at_placement(
+    state: &AppState,
+    cid: &Cid,
+    reference: &PlacementReference,
+) -> Result<pepper_types::Block, ApiError> {
+    if state.s3.is_none() && state.placement.map(reference.epoch).is_none() {
+        return get_block_resolved_transient(state, cid).await;
+    }
+    let node_ids = placement_target_node_ids(state, cid, reference).await?;
+    get_block_with_placement_fallback(state, cid, reference, node_ids).await
+}
+
+async fn placement_target_node_ids(
+    state: &AppState,
+    cid: &Cid,
+    reference: &PlacementReference,
+) -> Result<Vec<String>, ApiError> {
+    if reference.seed != *cid && reference.role == PlacementRole::Replicated {
+        return Err(ApiError::bad_request(
+            "replicated placement reference does not match block CID",
+        ));
+    }
+    if state.placement.map(reference.epoch).is_none() && state.s3.is_some() {
+        s3_api::ensure_s3_placement_epoch_loaded(state, reference.epoch).await?;
+    }
+    metrics::PLACEMENT_CALCULATIONS.fetch_add(1, Ordering::Relaxed);
+    let decision = state
+        .placement
+        .decide(reference)
+        .map_err(authoritative_placement_error)?;
+    Ok(decision.node_ids)
+}
+
+async fn get_block_with_placement_fallback(
+    state: &AppState,
+    cid: &Cid,
+    reference: &PlacementReference,
+    canonical_node_ids: Vec<String>,
+) -> Result<pepper_types::Block, ApiError> {
+    let canonical_error =
+        match get_block_from_placement_targets(state, cid, canonical_node_ids.clone()).await {
+            Ok(block) => return Ok(block),
+            Err(error) => error,
+        };
+    if let Some(exception) = state
+        .placement
+        .exception(reference, unix_seconds())
+        .filter(|exception| exception.block_cid == *cid)
+    {
+        let exception_nodes = exception
+            .node_ids
+            .into_iter()
+            .filter(|node_id| !canonical_node_ids.contains(node_id))
+            .collect::<Vec<_>>();
+        if !exception_nodes.is_empty() {
+            metrics::PLACEMENT_EXCEPTION_HITS.fetch_add(1, Ordering::Relaxed);
+            return get_block_from_placement_targets(state, cid, exception_nodes).await;
+        }
+    }
+    Err(canonical_error)
+}
+
+async fn get_block_from_placement_targets(
+    state: &AppState,
+    cid: &Cid,
+    node_ids: Vec<String>,
+) -> Result<pepper_types::Block, ApiError> {
+    let local_node_id = state.network.local_descriptor().node_id;
+    let local_error = if node_ids.contains(&local_node_id) {
+        match tokio::task::block_in_place(|| state.block_store.get(cid)) {
+            Ok(block) => return Ok(block),
+            Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => Some(format!(
+                "authoritative placement node {local_node_id} does not hold {cid}"
+            )),
+            Err(error) => return Err(ApiError::from(error)),
+        }
+    } else {
+        None
+    };
+    let remote_node_ids = node_ids
+        .into_iter()
+        .filter(|node_id| node_id != &local_node_id)
+        .collect::<Vec<_>>();
+    if !remote_node_ids.is_empty() {
+        metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS
+            .fetch_add(remote_node_ids.len() as u64, Ordering::Relaxed);
+    }
+    let remote_result = if remote_node_ids.is_empty() {
+        Err(local_error.unwrap_or_else(|| format!("no authoritative placement holds {cid}")))
+    } else {
+        fetch_block_from_replica_targets(state, cid, remote_node_ids, Duration::from_secs(5)).await
+    };
+    match remote_result {
+        Ok((node_id, payload)) => {
+            metrics::PLACEMENT_DIRECT_TARGET_BYTES
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            record_read_diagnostic(
+                state,
+                ReadDiagnosticRecord {
+                    sequence: 0,
+                    cid: cid.clone(),
+                    source_node: node_id,
+                    route: "direct_placement".to_string(),
+                    verified_bytes: payload.len() as u64,
+                    timestamp_unix_seconds: unix_seconds(),
+                },
+            )?;
+            Ok(pepper_types::Block {
+                cid: cid.clone(),
+                codec: cid.codec,
+                size: payload.len() as u64,
+                payload,
+            })
+        }
+        Err(error) => {
+            metrics::PLACEMENT_DIRECT_TARGET_ERRORS.fetch_add(1, Ordering::Relaxed);
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                error,
+            ))
+        }
+    }
+}
+
+/// Fetch a block from the first healthy authoritative replica within one
+/// request-wide deadline. Starting all replica reads together prevents a dead
+/// target from charging its timeout once for every node in a Merkle traversal.
+async fn fetch_block_from_replica_targets(
+    state: &AppState,
+    cid: &Cid,
+    node_ids: Vec<String>,
+    deadline: Duration,
+) -> Result<(String, Vec<u8>), String> {
+    let mut fetches = stream::FuturesUnordered::new();
+    let mut unique = HashSet::new();
+    for node_id in node_ids {
+        if !unique.insert(node_id.clone()) {
+            continue;
+        }
+        let network = fast_path::io_network(&state.network);
+        let cid = cid.clone();
+        fetches.push(async move {
+            let Some(address) = fast_path::peer_address(&network, &node_id).await else {
+                return (
+                    node_id.clone(),
+                    Err(format!("replica {node_id} has no routable bulk address")),
+                );
+            };
+            let result = network
+                .block_get(address, &cid)
+                .await
+                .map_err(|error| error.to_string());
+            (node_id, result)
+        });
+    }
+    if fetches.is_empty() {
+        return Err(format!("no remote authoritative replica holds {cid}"));
+    }
+
+    match time::timeout(deadline, async {
+        let mut last_error = None;
+        while let Some((node_id, result)) = fetches.next().await {
+            match result {
+                Ok(payload) => return Ok((node_id, payload)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| format!("no authoritative replica holds {cid}")))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "authoritative replicas did not return {cid} within {}ms",
+            deadline.as_millis()
+        )),
+    }
+}
+
+/// Fetch namespace state-machine data from the leader first, hedging to the
+/// remaining voters after a short delay or an immediate failure. A newly
+/// committed Merkle node is present on the leader before a routed head can
+/// expose it, but an unreachable former leader must not consume the complete
+/// request deadline and prevent a healthy voter from serving the block.
+async fn fetch_block_from_ordered_replica_targets(
+    state: &AppState,
+    namespace_id: &str,
+    cid: &Cid,
+    node_ids: Vec<String>,
+    deadline: Duration,
+) -> Result<(String, Vec<u8>), String> {
+    let mut unique = HashSet::new();
+    let network = fast_path::io_network(&state.network);
+    let candidates = node_ids
+        .into_iter()
+        .filter(|node_id| unique.insert(node_id.clone()))
+        .collect::<Vec<_>>();
+    let Some((first, remaining)) = candidates.split_first() else {
+        return Err(format!("no authoritative replica holds {cid}"));
+    };
+    let fetch = |node_id: String| {
+        let network = network.clone();
+        let cid = cid.clone();
+        async move {
+            let Some(address) = fast_path::peer_address(&network, &node_id).await else {
+                return (
+                    node_id.clone(),
+                    Err(format!("replica {node_id} has no routable bulk address")),
+                );
+            };
+            let result = network
+                .block_get(address, &cid)
+                .await
+                .map_err(|error| error.to_string());
+            (node_id, result)
+        }
+    };
+    let mut fetches = stream::FuturesUnordered::new();
+    fetches.push(fetch(first.clone()));
+    let mut remaining = Some(remaining.to_vec());
+    match time::timeout(deadline, async {
+        let mut last_error = None;
+        let hedge = time::sleep(Duration::from_millis(100));
+        tokio::pin!(hedge);
+        loop {
+            tokio::select! {
+                result = fetches.next() => {
+                    let Some((node_id, result)) = result else {
+                        return Err(last_error.unwrap_or_else(|| {
+                            format!("no authoritative replica holds {cid}")
+                        }));
+                    };
+                    match result {
+                        Ok(payload) => return Ok((node_id, payload)),
+                        Err(error) => {
+                            warn!(
+                                namespace_id,
+                                cid = %cid,
+                                target_node_id = %node_id,
+                                error = %error,
+                                "namespace Merkle read target missed"
+                            );
+                            last_error = Some(error);
+                            if let Some(remaining) = remaining.take() {
+                                for node_id in remaining {
+                                    fetches.push(fetch(node_id));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if remaining.is_some() => {
+                    for node_id in remaining.take().expect("hedge candidates exist") {
+                        fetches.push(fetch(node_id));
+                    }
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "authoritative replicas did not return {cid} within {}ms",
+            deadline.as_millis()
+        )),
+    }
+}
+
 async fn get_block_resolved_with_policy(
     state: &AppState,
     cid: &Cid,
@@ -1085,8 +1560,7 @@ async fn get_block_resolved_with_policy(
     match tokio::task::block_in_place(|| state.block_store.get(cid)) {
         Ok(block) => Ok(block),
         Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {
-            let Some(resolution) = state
-                .network
+            let Some(resolution) = fast_path::io_network(&state.network)
                 .get_block_from_any_peer_with_source(cid)
                 .await?
             else {
@@ -1104,25 +1578,17 @@ async fn get_block_resolved_with_policy(
                     return Err(ApiError::internal("recovered block CID mismatch"));
                 }
             }
-            let mut records = state
-                .read_diagnostics
-                .lock()
-                .map_err(|_| ApiError::internal("read diagnostic lock poisoned"))?;
-            let sequence = records
-                .back()
-                .map_or(1, |record| record.sequence.saturating_add(1));
-            if records.len() == 512 {
-                records.pop_front();
-            }
-            records.push_back(ReadDiagnosticRecord {
-                sequence,
-                cid: cid.clone(),
-                source_node: resolution.source_node_id,
-                route: resolution.route,
-                verified_bytes: payload.len() as u64,
-                timestamp_unix_seconds: unix_seconds(),
-            });
-            drop(records);
+            record_read_diagnostic(
+                state,
+                ReadDiagnosticRecord {
+                    sequence: 0,
+                    cid: cid.clone(),
+                    source_node: resolution.source_node_id,
+                    route: resolution.route,
+                    verified_bytes: payload.len() as u64,
+                    timestamp_unix_seconds: unix_seconds(),
+                },
+            )?;
             Ok(pepper_types::Block {
                 cid: cid.clone(),
                 codec: cid.codec,
@@ -1134,27 +1600,160 @@ async fn get_block_resolved_with_policy(
     }
 }
 
-async fn get_block_range_resolved(
+async fn get_block_range_at_placement(
     state: &AppState,
     cid: &Cid,
+    placement: &PlacementReference,
     start: u64,
     end: u64,
 ) -> Result<Vec<u8>, ApiError> {
-    match tokio::task::block_in_place(|| state.block_store.get_range(cid, start, end)) {
-        Ok(payload) => Ok(payload),
-        Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {
-            let block = get_block_resolved(state, cid).await?;
-            let start = usize::try_from(start)
-                .map_err(|_| ApiError::bad_request("block range start is too large"))?;
-            let end = usize::try_from(end)
-                .map_err(|_| ApiError::bad_request("block range end is too large"))?;
-            block
-                .payload
-                .get(start..end)
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| ApiError::bad_request("block range exceeds recovered payload"))
+    if state.s3.is_none() && state.placement.map(placement.epoch).is_none() {
+        let block = get_block_resolved_transient(state, cid).await?;
+        let start = usize::try_from(start)
+            .map_err(|_| ApiError::bad_request("block range start is too large"))?;
+        let end = usize::try_from(end)
+            .map_err(|_| ApiError::bad_request("block range end is too large"))?;
+        return block
+            .payload
+            .get(start..end)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ApiError::bad_request("block range exceeds recovered payload"));
+    }
+    let node_ids = placement_target_node_ids(state, cid, placement).await?;
+    get_block_range_with_placement_fallback(state, cid, placement, node_ids, start, end).await
+}
+
+async fn get_block_range_with_placement_fallback(
+    state: &AppState,
+    cid: &Cid,
+    reference: &PlacementReference,
+    canonical_node_ids: Vec<String>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, ApiError> {
+    let canonical_error = match get_block_range_from_placement_targets(
+        state,
+        cid,
+        canonical_node_ids.clone(),
+        start,
+        end,
+    )
+    .await
+    {
+        Ok(payload) => return Ok(payload),
+        Err(error) => error,
+    };
+    if let Some(exception) = state
+        .placement
+        .exception(reference, unix_seconds())
+        .filter(|exception| exception.block_cid == *cid)
+    {
+        let exception_nodes = exception
+            .node_ids
+            .into_iter()
+            .filter(|node_id| !canonical_node_ids.contains(node_id))
+            .collect::<Vec<_>>();
+        if !exception_nodes.is_empty() {
+            metrics::PLACEMENT_EXCEPTION_HITS.fetch_add(1, Ordering::Relaxed);
+            return get_block_range_from_placement_targets(state, cid, exception_nodes, start, end)
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ErrorCode::Unavailable,
+                        error,
+                    )
+                });
         }
-        Err(error) => Err(ApiError::from(error)),
+    }
+    Err(ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+        canonical_error,
+    ))
+}
+
+async fn get_block_range_from_placement_targets(
+    state: &AppState,
+    cid: &Cid,
+    node_ids: Vec<String>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, String> {
+    let local_node_id = state.network.local_descriptor().node_id;
+    let local_error = if node_ids.contains(&local_node_id) {
+        match tokio::task::block_in_place(|| state.block_store.get_range(cid, start, end)) {
+            Ok(payload) => return Ok(payload),
+            Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => Some(format!(
+                "authoritative placement node {local_node_id} does not hold {cid}"
+            )),
+            Err(error) => return Err(error.to_string()),
+        }
+    } else {
+        None
+    };
+    let remote_node_ids = node_ids
+        .into_iter()
+        .filter(|node_id| node_id != &local_node_id)
+        .collect::<Vec<_>>();
+    if !remote_node_ids.is_empty() {
+        metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS
+            .fetch_add(remote_node_ids.len() as u64, Ordering::Relaxed);
+    }
+    let mut fetches = stream::FuturesUnordered::new();
+    let mut unique = HashSet::new();
+    for node_id in remote_node_ids {
+        if !unique.insert(node_id.clone()) {
+            continue;
+        }
+        let network = fast_path::io_network(&state.network);
+        let cid = cid.clone();
+        fetches.push(async move {
+            let Some(address) = fast_path::peer_address(&network, &node_id).await else {
+                return (
+                    node_id.clone(),
+                    Err(format!("replica {node_id} has no routable bulk address")),
+                );
+            };
+            let result = network
+                .block_get_range(address, &cid, start, end)
+                .await
+                .map_err(|error| error.to_string());
+            (node_id, result)
+        });
+    }
+    if fetches.is_empty() {
+        return Err(
+            local_error.unwrap_or_else(|| format!("no authoritative placement holds {cid}"))
+        );
+    }
+    match time::timeout(Duration::from_secs(5), async {
+        let mut last_error = local_error;
+        while let Some((_node_id, result)) = fetches.next().await {
+            match result {
+                Ok(payload) => return Ok(payload),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| format!("no authoritative placement holds {cid}")))
+    })
+    .await
+    {
+        Ok(Ok(payload)) => {
+            metrics::PLACEMENT_DIRECT_TARGET_BYTES
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            Ok(payload)
+        }
+        Ok(Err(error)) => {
+            metrics::PLACEMENT_DIRECT_TARGET_ERRORS.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+        Err(_) => {
+            metrics::PLACEMENT_DIRECT_TARGET_ERRORS.fetch_add(1, Ordering::Relaxed);
+            Err(format!(
+                "authoritative replicas did not return range for {cid} within 5000ms"
+            ))
+        }
     }
 }
 
@@ -1203,6 +1802,14 @@ fn placement_candidates(state: &AppState, peers: Vec<PeerStatus>) -> Vec<Placeme
     let mut seen_node_ids = HashSet::new();
     candidates.retain(|candidate| seen_node_ids.insert(candidate.node_id.clone()));
     candidates
+}
+
+fn authoritative_placement_error(error: AuthoritativePlacementError) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+        format!("authoritative placement failed: {error}"),
+    )
 }
 
 fn validate_replica_ack(
@@ -1264,16 +1871,34 @@ async fn put_replicated_block_with_factor(
     payload: Vec<u8>,
     replication_factor: usize,
 ) -> Result<DurabilityReceipt, ApiError> {
+    put_replicated_block_with_placement_map(
+        state,
+        codec,
+        payload,
+        replication_factor,
+        state.placement.current_map(),
+    )
+    .await
+}
+
+async fn put_replicated_block_with_placement_map(
+    state: &AppState,
+    codec: Codec,
+    payload: Vec<u8>,
+    replication_factor: usize,
+    placement_map: Option<Arc<PlacementMap>>,
+) -> Result<DurabilityReceipt, ApiError> {
     if replication_factor == 0 {
         return Err(ApiError::bad_request(
             "replication factor must be greater than zero",
         ));
     }
     let _publication_slot = if replication_factor > 1 {
+        let slots =
+            fast_path::replication_slots().unwrap_or_else(|| state.replicated_block_slots.clone());
         Some(
-            state
-                .replicated_block_slots
-                .acquire()
+            slots
+                .acquire_owned()
                 .await
                 .map_err(|_| ApiError::internal("replicated block scheduler is unavailable"))?,
         )
@@ -1281,15 +1906,27 @@ async fn put_replicated_block_with_factor(
         None
     };
     let local_put_started = time::Instant::now();
-    let local_put = if replication_factor > 1 {
-        state
-            .local_block_writer
+    let local_put = if placement_map.is_some() {
+        let encoded = tokio::task::block_in_place(|| state.block_store.encode(codec, &payload))?;
+        let put = PutBlockResponse {
+            cid: encoded.cid().clone(),
+            codec,
+            size: encoded.logical_size_bytes(),
+            already_existed: false,
+            storage_location: "authoritative-placement-pending".to_string(),
+        };
+        let wire = encoded.bytes().to_vec();
+        Ok((put, wire, Some(encoded)))
+    } else if replication_factor > 1 {
+        fast_path::local_block_writer()
+            .unwrap_or_else(|| state.local_block_writer.clone())
             .put_with_payload(codec, payload)
             .await
+            .map(|(put, wire)| (put, wire, None))
             .map_err(ApiError::internal)
     } else {
         tokio::task::block_in_place(|| state.block_store.put(codec, &payload))
-            .map(|put| (put, payload))
+            .map(|put| (put, payload, None))
             .map_err(ApiError::from)
     };
     metrics::observe_phase(
@@ -1297,69 +1934,104 @@ async fn put_replicated_block_with_factor(
         &metrics::S3_BLOCK_HASH_STORAGE_MICROS,
         local_put_started.elapsed(),
     );
-    let (local_put, payload) = local_put?;
-    let local_provider = state.network.local_provider_record(&local_put.cid);
-
+    let (local_put, payload, pending_local_encoded) = local_put?;
     let local_descriptor = state.network.local_descriptor();
-    let candidates = placement_candidates(state, state.network.peers().await);
 
-    let selected = select_replicas(&local_put.cid, &candidates, replication_factor);
-    // The ingress keeps a verified cache copy, but durability credit follows
-    // deterministic placement. Do not over-credit the local cache when the
-    // ingress is not one of the selected replicas.
-    let local_selected = selected.iter().any(|node| node.is_local);
+    let (placement, selected) = if let Some(map) = placement_map {
+        let replicas = u16::try_from(replication_factor)
+            .map_err(|_| ApiError::bad_request("replication factor exceeds placement bounds"))?;
+        let reference = PlacementReference::replicated(map.epoch, local_put.cid.clone(), replicas);
+        metrics::PLACEMENT_CALCULATIONS.fetch_add(1, Ordering::Relaxed);
+        let decision = pepper_placement::select_authoritative(&map, &reference)
+            .map_err(authoritative_placement_error)?;
+        let selected = decision
+            .node_ids
+            .into_iter()
+            .map(|node_id| {
+                let is_local = node_id == local_descriptor.node_id;
+                (node_id, is_local, None)
+            })
+            .collect::<Vec<_>>();
+        (Some(reference), selected)
+    } else {
+        let candidates = placement_candidates(state, state.network.peers().await);
+        let selected = select_replicas(&local_put.cid, &candidates, replication_factor)
+            .into_iter()
+            .map(|node| {
+                let address = node.addresses.iter().find_map(|address| {
+                    address.parse::<SocketAddr>().ok().filter(|address| {
+                        !address.ip().is_unspecified() && !address.ip().is_multicast()
+                    })
+                });
+                (node.node_id, node.is_local, address)
+            })
+            .collect();
+        (None, selected)
+    };
+    // The ingress persists the encoded block only when it is an authoritative
+    // owner. A non-owner gateway forwards the bytes without leaving an
+    // untracked durable copy behind.
+    let local_selected = selected.iter().any(|(_, is_local, _)| *is_local);
+    if local_selected && let Some(encoded) = pending_local_encoded.as_ref() {
+        tokio::task::block_in_place(|| state.block_store.put_encoded(encoded))?;
+    }
     let mut replica_nodes = local_selected
         .then(|| local_descriptor.node_id.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut providers = local_selected
-        .then_some(local_provider.clone())
         .into_iter()
         .collect::<Vec<_>>();
 
     let payload: Arc<[u8]> = Arc::from(payload);
     let writes = selected
         .into_iter()
-        .filter(|node| !node.is_local)
-        .filter_map(|node| {
-            let address = node.addresses.iter().find_map(|address| {
-                address.parse::<SocketAddr>().ok().filter(|address| {
-                    !address.ip().is_unspecified() && !address.ip().is_multicast()
-                })
-            })?;
-            Some((node, address))
-        })
-        .map(|(node, address)| {
-            let network = state.network.clone();
+        .filter(|(_, is_local, _)| !*is_local)
+        .map(|(node_id, _, address)| {
+            let network = fast_path::io_network(&state.network);
             let payload = payload.clone();
             let cid = local_put.cid.clone();
             async move {
-                let result = network
-                    .block_put_replica_stream(address, codec, &cid, local_put.size, payload)
-                    .await;
-                (node, result)
+                metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                let result = async {
+                    let address = match address {
+                        Some(address) => address,
+                        None => fast_path::peer_address(&network, &node_id)
+                            .await
+                            .ok_or_else(|| {
+                                format!("placement node {node_id} has no routable address")
+                            })?,
+                    };
+                    network
+                        .block_put_replica_stream(address, codec, &cid, local_put.size, payload)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                (node_id, result)
             }
         });
     let mut replica_writes = stream::iter(writes).buffered(8);
     let replica_transfer_started = time::Instant::now();
 
-    while let Some((node, result)) = replica_writes.next().await {
+    while let Some((node_id, result)) = replica_writes.next().await {
         match result {
             Ok(ack) => {
-                match parse_replica_ack(&node.node_id, &local_put.cid, codec, local_put.size, &ack)
-                {
+                match parse_replica_ack(&node_id, &local_put.cid, codec, local_put.size, &ack) {
                     Ok(record) => {
-                        replica_nodes.push(node.node_id.clone());
-                        providers.push(record.clone());
+                        metrics::PLACEMENT_DIRECT_TARGET_BYTES
+                            .fetch_add(local_put.size, Ordering::Relaxed);
+                        replica_nodes.push(node_id.clone());
+                        let _ = record;
                     }
                     Err(error) => warn!(
-                        node_id = %node.node_id,
+                        node_id = %node_id,
                         %error.message,
                         "replica acknowledgement validation failed"
                     ),
                 }
             }
-            Err(error) => warn!(%error, node_id = %node.node_id, "replica write failed"),
+            Err(error) => {
+                metrics::PLACEMENT_DIRECT_TARGET_ERRORS.fetch_add(1, Ordering::Relaxed);
+                warn!(%error, node_id = %node_id, "replica write failed");
+            }
         }
     }
 
@@ -1371,24 +2043,38 @@ async fn put_replicated_block_with_factor(
 
     replica_nodes.sort();
     replica_nodes.dedup();
-    providers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    providers.dedup_by(|left, right| left.node_id == right.node_id && left.cid == right.cid);
     let replicas_accepted = replica_nodes.len();
-    let status = if replicas_accepted >= replication_factor {
-        "durable"
-    } else {
-        "degraded"
+    if replicas_accepted < replication_factor {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            format!(
+                "authoritative placement durability was not met for {}: accepted {replicas_accepted} of {replication_factor}",
+                local_put.cid
+            ),
+        ));
     }
-    .to_string();
+    let status = "durable".to_string();
+    let placement = match placement {
+        Some(placement) => Some(placement),
+        None if state.s3.is_none() => Some(PlacementReference::replicated(
+            1,
+            local_put.cid.clone(),
+            u16::try_from(replication_factor).map_err(|_| {
+                ApiError::bad_request("replication factor exceeds placement bounds")
+            })?,
+        )),
+        None => None,
+    };
 
     Ok(DurabilityReceipt {
         cid: local_put.cid.clone(),
+        placement,
         codec: local_put.codec,
         size: local_put.size,
         replicas_accepted,
         replica_nodes,
         status,
-        providers,
     })
 }
 
@@ -1398,14 +2084,34 @@ struct StoredErasureStripe {
     distinct_nodes: usize,
 }
 
+struct ErasureStripeStoreContext {
+    data_shards: u16,
+    parity_shards: u16,
+    candidates: Vec<PlacementNode>,
+    request_plan: Arc<OnceCell<EcPlanDecision>>,
+    allow_compression: bool,
+}
+
+fn semaphore_pressure_milli(semaphore: &Semaphore, capacity: usize) -> u16 {
+    let active = capacity.saturating_sub(semaphore.available_permits());
+    active
+        .saturating_mul(1_000)
+        .checked_div(capacity.max(1))
+        .unwrap_or(1_000)
+        .min(1_000) as u16
+}
+
 async fn encode_and_store_erasure_stripe(
     state: &AppState,
     bytes: Vec<u8>,
     offset: u64,
-    data_shards: u16,
-    parity_shards: u16,
-    candidates: Vec<PlacementNode>,
+    context: Arc<ErasureStripeStoreContext>,
 ) -> Result<StoredErasureStripe, ApiError> {
+    let data_shards = context.data_shards;
+    let parity_shards = context.parity_shards;
+    let candidates = context.candidates.clone();
+    let request_plan = context.request_plan.clone();
+    let allow_compression = context.allow_compression;
     validate_erasure_policy(data_shards, parity_shards)?;
     let data_shards_usize = data_shards as usize;
     let parity_shards_usize = parity_shards as usize;
@@ -1414,8 +2120,16 @@ async fn encode_and_store_erasure_stripe(
     let logical_cid = Cid::new(CODEC_RAW, &bytes);
     let max_block_bytes = state.max_block_bytes.unwrap_or(DEFAULT_MAX_BLOCK_BYTES);
     let compression_started = std::time::Instant::now();
-    let (encoding, encoded_size, shard_size, mut shards) = tokio::task::spawn_blocking(move || {
-        let (encoding, encoded) = encode_erasure_stripe_payload(bytes)?;
+    let compression_scratch =
+        fast_path::take_buffer(ERASURE_COMPRESSION_PROBE_REGION_BYTES.saturating_mul(3));
+    let encoding_guard = state.erasure_planner.encoding_guard();
+    let (encoding, encoded_size, shard_size, encoded, systematic_shards, compression_scratch) =
+        tokio::task::spawn_blocking(move || {
+        let (encoding, encoded, compression_scratch) = if allow_compression {
+            encode_erasure_stripe_payload(bytes, compression_scratch)?
+        } else {
+            (ErasureStripeEncoding::Raw, bytes, compression_scratch)
+        };
         let encoded_size = encoded.len();
         let shard_size = std::cmp::max(1, encoded_size.div_ceil(data_shards_usize));
         if shard_size as u64 > max_block_bytes {
@@ -1431,50 +2145,161 @@ async fn encode_and_store_erasure_stripe(
                 "erasure encoding would exceed the 512 MiB memory safety limit",
             ));
         }
-        let mut shards = vec![vec![0u8; shard_size]; total_shards];
-        for (index, chunk) in encoded.chunks(shard_size).enumerate() {
-            shards[index][..chunk.len()].copy_from_slice(chunk);
-        }
-        let reed_solomon = ReedSolomon::new(data_shards_usize, parity_shards_usize)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        reed_solomon
-            .encode(&mut shards)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        Ok::<_, ApiError>((encoding, encoded_size, shard_size, shards))
+        // Split the systematic data before selecting a transfer plan, but do
+        // not calculate parity here. Distributed and hierarchical plans must
+        // actually move that CPU work off the gateway rather than recomputing
+        // parity after the gateway has already done it once.
+        let systematic_shards =
+            adaptive_systematic_shards(&encoded, data_shards_usize, shard_size);
+        Ok::<_, ApiError>((
+            encoding,
+            encoded_size,
+            shard_size,
+            encoded,
+            systematic_shards,
+            compression_scratch,
+        ))
     })
     .await
     .map_err(|error| ApiError::internal(format!("erasure encoder task failed: {error}")))??;
+    fast_path::recycle_buffer(compression_scratch);
     metrics::record_erasure_stripe_encoding(
         logical_size,
         encoded_size as u64,
         encoding,
         compression_started.elapsed(),
     );
+    drop(encoding_guard);
+    let encoded: Arc<[u8]> = encoded.into();
 
-    let mut manifest_shards = Vec::with_capacity(total_shards);
-    let mut receipts = Vec::with_capacity(total_shards);
-    let mut used_nodes = HashSet::new();
-    let mut used_constraint_values = HashSet::new();
-    for (index, shard) in shards.drain(..).enumerate() {
-        let cid = Cid::new(CODEC_RAW, &shard);
-        let (node_id, constraints, receipt) = store_erasure_shard(
-            state,
-            &candidates,
-            cid.clone(),
-            shard,
-            &used_nodes,
-            &used_constraint_values,
-        )
-        .await?;
-        used_nodes.insert(node_id);
-        used_constraint_values.extend(constraints);
-        receipts.push(receipt);
-        manifest_shards.push(ErasureShard {
-            index: index as u16,
-            cid,
-            size: shard_size as u64,
-        });
-    }
+    let transport = fast_path::io_network(&state.network).transport_metrics();
+    let failure_domains = candidates
+        .iter()
+        .map(primary_failure_domain_key)
+        .collect::<HashSet<_>>()
+        .len();
+    let decision = request_plan
+        .get_or_init(|| async {
+            state.erasure_planner.select(EcPlannerInputs {
+                logical_bytes: logical_size,
+                encoded_bytes: encoded_size as u64,
+                failure_domains,
+                active_bulk_streams: transport.bulk_streams_active,
+                bulk_stream_capacity: transport.bulk_stream_capacity,
+                bulk_stream_queue_micros: transport.bulk_stream_queue_ewma_microseconds,
+                write_queue_pressure_milli: fast_path::write_pressure_milli().unwrap_or_else(
+                    || semaphore_pressure_milli(&state.s3_write_slots, state.s3_write_capacity),
+                ),
+                target_queue_pressure_milli: state.erasure_planner.target_pressure_milli(
+                    candidates.iter().map(|node| node.node_id.as_str()),
+                    transport.bulk_stream_capacity,
+                ),
+                active_encoders: 0,
+                encoder_capacity: std::thread::available_parallelism().map_or(1, usize::from),
+            })
+        })
+        .await
+        .clone();
+    info!(
+        plan = %decision.plan,
+        candidate = %decision.candidate,
+        reasons = %decision.reasons,
+        gateway_pressure_milli = decision.estimated_gateway_pressure_milli,
+        encoded_ratio_milli = decision.encoded_ratio_milli,
+        logical_bytes = logical_size,
+        encoded_bytes = encoded_size,
+        "selected erasure transfer plan"
+    );
+    let (receipts, used_nodes) = if let Some(map) = state.placement.current_map() {
+        let mut plan_guard = state.erasure_planner.begin(decision.plan, logical_size);
+        let transfer_context = ErasureTransferContext {
+            candidates: &candidates,
+            logical_cid: &logical_cid,
+            epoch: map.epoch,
+            data_shards: data_shards_usize,
+            parity_shards: parity_shards_usize,
+            shard_size,
+            logical_size,
+            encoding,
+            encoded: &encoded,
+            systematic_shards: &systematic_shards,
+        };
+        match execute_erasure_transfer_plan(state, &transfer_context, decision.plan).await {
+            Ok(transfer) => {
+                plan_guard.add_gateway_bytes(transfer.gateway_bytes);
+                plan_guard.add_internal_bytes(transfer.internal_bytes);
+                plan_guard.add_cross_domain_bytes(transfer.cross_domain_bytes);
+                plan_guard.complete();
+                let nodes = receipt_nodes(&transfer.receipts);
+                (transfer.receipts, nodes)
+            }
+            Err(error) if decision.plan != EcTransferPlan::GatewayFanout => {
+                drop(plan_guard);
+                state.erasure_planner.record_fallback(decision.plan);
+                warn!(
+                    plan = %decision.plan,
+                    error = ?error,
+                    "adaptive erasure plan failed; retrying the identical placement with gateway fanout"
+                );
+                let mut fallback = state
+                    .erasure_planner
+                    .begin(EcTransferPlan::GatewayFanout, logical_size);
+                let shards = adaptive_encode_parity(
+                    systematic_shards.clone(),
+                    data_shards_usize,
+                    parity_shards_usize,
+                )
+                .await?;
+                let transfer =
+                    gateway_fanout_shards(state, &candidates, &logical_cid, map.epoch, shards)
+                        .await?;
+                fallback.add_gateway_bytes(transfer.gateway_bytes);
+                fallback.add_internal_bytes(transfer.internal_bytes);
+                fallback.add_cross_domain_bytes(transfer.cross_domain_bytes);
+                fallback.complete();
+                let nodes = receipt_nodes(&transfer.receipts);
+                (transfer.receipts, nodes)
+            }
+            Err(error) => return Err(error),
+        }
+    } else if state.s3.is_none() {
+        let shards =
+            adaptive_encode_parity(systematic_shards, data_shards_usize, parity_shards_usize)
+                .await?;
+        let mut receipts = Vec::with_capacity(total_shards);
+        let mut used_nodes = HashSet::new();
+        let mut used_constraint_values = HashSet::new();
+        for (index, shard) in shards.into_iter().enumerate() {
+            let cid = Cid::new(CODEC_RAW, &shard);
+            let placement = PlacementReference::erasure_shard(1, logical_cid.clone(), index as u16);
+            let (node_id, constraints, receipt) = store_erasure_shard_legacy(
+                state,
+                &candidates,
+                cid,
+                shard,
+                &used_nodes,
+                &used_constraint_values,
+                placement,
+            )
+            .await?;
+            used_nodes.insert(node_id);
+            used_constraint_values.extend(constraints);
+            receipts.push(receipt);
+        }
+        (receipts, used_nodes)
+    } else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "authoritative placement map is not loaded",
+        ));
+    };
+    let placement_epoch = receipts
+        .first()
+        .and_then(|receipt| receipt.placement.as_ref())
+        .map_or(1, |placement| placement.epoch);
+    let manifest_shards =
+        shards_for_manifest(&logical_cid, placement_epoch, shard_size, &receipts)?;
     Ok(StoredErasureStripe {
         stripe: ErasureStripe {
             offset,
@@ -1490,16 +2315,558 @@ async fn encode_and_store_erasure_stripe(
     })
 }
 
+fn receipt_nodes(receipts: &[DurabilityReceipt]) -> HashSet<String> {
+    receipts
+        .iter()
+        .flat_map(|receipt| receipt.replica_nodes.iter().cloned())
+        .collect()
+}
+
+fn shards_for_manifest(
+    logical_cid: &Cid,
+    epoch: u64,
+    shard_size: usize,
+    receipts: &[DurabilityReceipt],
+) -> Result<Vec<ErasureShard>, ApiError> {
+    let mut shards = receipts
+        .iter()
+        .map(|receipt| {
+            let placement = receipt
+                .placement
+                .clone()
+                .ok_or_else(|| ApiError::internal("erasure receipt is missing placement"))?;
+            if placement.epoch != epoch
+                || placement.seed != *logical_cid
+                || placement.role != PlacementRole::ErasureShard
+            {
+                return Err(ApiError::internal(
+                    "erasure receipt placement does not match stripe",
+                ));
+            }
+            Ok(ErasureShard {
+                index: placement.index,
+                cid: receipt.cid.clone(),
+                size: shard_size as u64,
+                placement,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    shards.sort_by_key(|shard| shard.index);
+    if shards
+        .iter()
+        .enumerate()
+        .any(|(index, shard)| usize::from(shard.index) != index)
+    {
+        return Err(ApiError::internal(
+            "adaptive erasure transfer returned incomplete shard indices",
+        ));
+    }
+    Ok(shards)
+}
+
+struct ErasureTransferContext<'a> {
+    candidates: &'a [PlacementNode],
+    logical_cid: &'a Cid,
+    epoch: u64,
+    data_shards: usize,
+    parity_shards: usize,
+    shard_size: usize,
+    logical_size: u64,
+    encoding: ErasureStripeEncoding,
+    encoded: &'a Arc<[u8]>,
+    systematic_shards: &'a [Vec<u8>],
+}
+
+impl ErasureTransferContext<'_> {
+    fn total_shards(&self) -> usize {
+        self.data_shards + self.parity_shards
+    }
+
+    fn request(
+        &self,
+        plan: EcTransferPlan,
+        pipeline: Vec<proto::ErasurePipelineHop>,
+    ) -> proto::ErasureTransferRequest {
+        proto::ErasureTransferRequest {
+            logical_cid: self.logical_cid.to_string(),
+            placement_epoch: self.epoch,
+            data_shards: self.data_shards as u32,
+            parity_shards: self.parity_shards as u32,
+            encoded_size: self.encoded.len() as u64,
+            shard_size: self.shard_size as u64,
+            data_cids: self.systematic_shards[..self.data_shards]
+                .iter()
+                .map(|shard| Cid::new(CODEC_RAW, shard).to_string())
+                .collect(),
+            pipeline,
+            plan: plan.as_str().to_string(),
+            logical_size: self.logical_size,
+            encoding: match self.encoding {
+                ErasureStripeEncoding::Raw => "raw",
+                ErasureStripeEncoding::Zstd => "zstd",
+            }
+            .to_string(),
+            completed_indices: Vec::new(),
+            encoded_cid: Cid::new(CODEC_RAW, self.encoded.as_ref()).to_string(),
+        }
+    }
+}
+
+async fn execute_erasure_transfer_plan(
+    state: &AppState,
+    transfer: &ErasureTransferContext<'_>,
+    plan: EcTransferPlan,
+) -> Result<ErasurePlanTransfer, ApiError> {
+    match plan {
+        EcTransferPlan::GatewayFanout => {
+            let shards = adaptive_encode_parity(
+                transfer.systematic_shards.to_vec(),
+                transfer.data_shards,
+                transfer.parity_shards,
+            )
+            .await?;
+            gateway_fanout_shards(
+                state,
+                transfer.candidates,
+                transfer.logical_cid,
+                transfer.epoch,
+                shards,
+            )
+            .await
+        }
+        EcTransferPlan::DistributedParity => distributed_parity_shards(state, transfer).await,
+        EcTransferPlan::Hierarchical | EcTransferPlan::Pipelined => {
+            remote_transfer_shards(state, transfer, plan).await
+        }
+    }
+}
+
+async fn gateway_fanout_shards(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    logical_cid: &Cid,
+    epoch: u64,
+    shards: Vec<Vec<u8>>,
+) -> Result<ErasurePlanTransfer, ApiError> {
+    let transfers = stream::iter(shards.into_iter().enumerate().map(|(index, shard)| {
+        let candidates = candidates.to_vec();
+        let logical_cid = logical_cid.clone();
+        async move {
+            let cid = Cid::new(CODEC_RAW, &shard);
+            let placement = PlacementReference::erasure_shard(epoch, logical_cid, index as u16);
+            let (_, receipt) =
+                store_erasure_shard(state, &candidates, cid, shard, placement).await?;
+            Ok::<_, ApiError>(receipt)
+        }
+    }))
+    .buffer_unordered(32)
+    .try_collect::<Vec<_>>()
+    .await?;
+    let (internal_bytes, cross_domain_bytes) =
+        receipt_transfer_bytes(state, candidates, &transfers);
+    Ok(ErasurePlanTransfer {
+        receipts: transfers,
+        gateway_bytes: internal_bytes,
+        internal_bytes,
+        cross_domain_bytes,
+    })
+}
+
+struct ErasurePlanTransfer {
+    receipts: Vec<DurabilityReceipt>,
+    gateway_bytes: u64,
+    internal_bytes: u64,
+    cross_domain_bytes: u64,
+}
+
+fn receipt_transfer_bytes(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    receipts: &[DurabilityReceipt],
+) -> (u64, u64) {
+    let local_domain = candidates
+        .iter()
+        .find(|node| node.node_id == state.status.node_id)
+        .map(primary_failure_domain_key);
+    receipts.iter().fold((0u64, 0u64), |mut totals, receipt| {
+        let Some(target) = receipt.replica_nodes.first() else {
+            return totals;
+        };
+        if target == &state.status.node_id {
+            return totals;
+        }
+        totals.0 = totals.0.saturating_add(receipt.size);
+        let target_domain = candidates
+            .iter()
+            .find(|node| &node.node_id == target)
+            .map(primary_failure_domain_key);
+        if target_domain != local_domain {
+            totals.1 = totals.1.saturating_add(receipt.size);
+        }
+        totals
+    })
+}
+
+fn placement_node_for_shard<'a>(
+    state: &AppState,
+    candidates: &'a [PlacementNode],
+    logical_cid: &Cid,
+    epoch: u64,
+    index: usize,
+) -> Result<&'a PlacementNode, ApiError> {
+    let reference = PlacementReference::erasure_shard(epoch, logical_cid.clone(), index as u16);
+    metrics::PLACEMENT_CALCULATIONS.fetch_add(1, Ordering::Relaxed);
+    let node_id = state
+        .placement
+        .decide(&reference)
+        .map_err(authoritative_placement_error)?
+        .node_ids
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::internal("erasure shard has no placement owner"))?;
+    candidates
+        .iter()
+        .find(|candidate| candidate.node_id == node_id)
+        .ok_or_else(|| ApiError::internal("erasure shard owner has no signed descriptor"))
+}
+
+fn coordinator_address(node: &PlacementNode) -> Result<SocketAddr, ApiError> {
+    node.addresses
+        .iter()
+        .find_map(|address| address.parse().ok())
+        .ok_or_else(|| ApiError::internal("erasure coordinator has no routable control address"))
+}
+
+fn choose_erasure_coordinator<'a>(
+    state: &AppState,
+    candidates: &'a [PlacementNode],
+    logical_cid: &Cid,
+    epoch: u64,
+    data_shards: usize,
+) -> Result<&'a PlacementNode, ApiError> {
+    let mut nodes = (0..data_shards)
+        .map(|index| placement_node_for_shard(state, candidates, logical_cid, epoch, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    nodes.sort_by(|left, right| {
+        left.is_local
+            .cmp(&right.is_local)
+            .then_with(|| {
+                right
+                    .storage_available_bytes
+                    .unwrap_or(0)
+                    .cmp(&left.storage_available_bytes.unwrap_or(0))
+            })
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    nodes
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::internal("erasure transfer has no data coordinator"))
+}
+
+fn choose_hierarchical_coordinator<'a>(
+    state: &AppState,
+    transfer: &'a ErasureTransferContext<'a>,
+) -> Result<&'a PlacementNode, ApiError> {
+    let owners = (0..transfer.total_shards())
+        .map(|index| {
+            placement_node_for_shard(
+                state,
+                transfer.candidates,
+                transfer.logical_cid,
+                transfer.epoch,
+                index,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let gateway_domain = transfer
+        .candidates
+        .iter()
+        .find(|node| node.node_id == state.status.node_id)
+        .map(primary_failure_domain_key)
+        .unwrap_or_else(|| format!("node:{}", state.status.node_id));
+    let owner_domains = owners
+        .iter()
+        .map(|owner| primary_failure_domain_key(owner))
+        .collect::<Vec<_>>();
+    let stream_capacity = state
+        .network
+        .transport_metrics()
+        .bulk_stream_capacity
+        .max(1);
+    let mut coordinators = owners[..transfer.data_shards]
+        .iter()
+        .copied()
+        .filter(|node| !node.is_local)
+        .collect::<Vec<_>>();
+    coordinators.sort_by(|left, right| {
+        let score = |coordinator: &PlacementNode| {
+            let domain = primary_failure_domain_key(coordinator);
+            hierarchical_cross_domain_bytes(
+                &gateway_domain,
+                &domain,
+                &owner_domains,
+                transfer.encoded.len() as u64,
+                transfer.shard_size as u64,
+            )
+        };
+        score(left)
+            .cmp(&score(right))
+            .then_with(|| {
+                state
+                    .erasure_planner
+                    .target_pressure_milli([left.node_id.as_str()], stream_capacity)
+                    .cmp(
+                        &state
+                            .erasure_planner
+                            .target_pressure_milli([right.node_id.as_str()], stream_capacity),
+                    )
+            })
+            .then_with(|| {
+                right
+                    .storage_available_bytes
+                    .unwrap_or(0)
+                    .cmp(&left.storage_available_bytes.unwrap_or(0))
+            })
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    coordinators
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::internal("hierarchical transfer has no remote data coordinator"))
+}
+
+fn hierarchical_cross_domain_bytes(
+    gateway_domain: &str,
+    coordinator_domain: &str,
+    owner_domains: &[String],
+    encoded_size: u64,
+    shard_size: u64,
+) -> u64 {
+    let ingress = u64::from(coordinator_domain != gateway_domain).saturating_mul(encoded_size);
+    owner_domains.iter().fold(ingress, |bytes, owner_domain| {
+        bytes.saturating_add(
+            u64::from(owner_domain != coordinator_domain).saturating_mul(shard_size),
+        )
+    })
+}
+
+fn validate_adaptive_response(
+    state: &AppState,
+    transfer: &ErasureTransferContext<'_>,
+    response: proto::ErasureTransferResponse,
+    expected_indices: std::ops::Range<usize>,
+) -> Result<Vec<DurabilityReceipt>, ApiError> {
+    let expected = expected_indices.collect::<HashSet<_>>();
+    if response.shards.len() != expected.len() {
+        return Err(ApiError::internal(
+            "adaptive erasure executor returned the wrong shard count",
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut receipts = Vec::with_capacity(response.shards.len());
+    for shard in response.shards {
+        let index = shard.index as usize;
+        if !expected.contains(&index) || !seen.insert(index) {
+            return Err(ApiError::internal(
+                "adaptive erasure executor returned an unexpected shard index",
+            ));
+        }
+        let cid = shard
+            .cid
+            .parse::<Cid>()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        if index >= transfer.total_shards() {
+            return Err(ApiError::internal(
+                "adaptive erasure executor returned an out-of-range shard",
+            ));
+        }
+        let expected_size = transfer
+            .systematic_shards
+            .first()
+            .map_or(0, |shard| shard.len() as u64);
+        let owner = placement_node_for_shard(
+            state,
+            transfer.candidates,
+            transfer.logical_cid,
+            transfer.epoch,
+            index,
+        )?;
+        let systematic_matches = index >= transfer.systematic_shards.len()
+            || cid == Cid::new(CODEC_RAW, &transfer.systematic_shards[index]);
+        if cid.codec != CODEC_RAW
+            || !systematic_matches
+            || shard.node_id != owner.node_id
+            || shard.size != expected_size
+        {
+            return Err(ApiError::internal(
+                "adaptive erasure executor changed the canonical layout",
+            ));
+        }
+        receipts.push(DurabilityReceipt {
+            cid,
+            placement: Some(PlacementReference::erasure_shard(
+                transfer.epoch,
+                transfer.logical_cid.clone(),
+                index as u16,
+            )),
+            codec: CODEC_RAW,
+            size: shard.size,
+            replicas_accepted: 1,
+            replica_nodes: vec![shard.node_id],
+            status: "durable".to_string(),
+        });
+    }
+    Ok(receipts)
+}
+
+async fn distributed_parity_shards(
+    state: &AppState,
+    transfer_context: &ErasureTransferContext<'_>,
+) -> Result<ErasurePlanTransfer, ApiError> {
+    let mut transfer = gateway_fanout_shards(
+        state,
+        transfer_context.candidates,
+        transfer_context.logical_cid,
+        transfer_context.epoch,
+        transfer_context.systematic_shards.to_vec(),
+    )
+    .await?;
+    let coordinator = choose_erasure_coordinator(
+        state,
+        transfer_context.candidates,
+        transfer_context.logical_cid,
+        transfer_context.epoch,
+        transfer_context.data_shards,
+    );
+    let coordinator = coordinator?;
+    let request = transfer_context.request(EcTransferPlan::DistributedParity, Vec::new());
+    let mut target_guard = state.erasure_planner.target_guard(&coordinator.node_id);
+    let response = state
+        .network
+        .erasure_encode_parity(coordinator_address(coordinator)?, request)
+        .await
+        .map_err(ApiError::network)?;
+    target_guard.complete();
+    let response_internal_bytes = response.internal_bytes;
+    let response_cross_domain_bytes = response.cross_domain_bytes;
+    transfer.receipts.extend(validate_adaptive_response(
+        state,
+        transfer_context,
+        response,
+        transfer_context.data_shards..transfer_context.total_shards(),
+    )?);
+    transfer.internal_bytes = transfer
+        .internal_bytes
+        .saturating_add(response_internal_bytes);
+    transfer.cross_domain_bytes = transfer
+        .cross_domain_bytes
+        .saturating_add(response_cross_domain_bytes);
+    Ok(transfer)
+}
+
+async fn remote_transfer_shards(
+    state: &AppState,
+    transfer: &ErasureTransferContext<'_>,
+    plan: EcTransferPlan,
+) -> Result<ErasurePlanTransfer, ApiError> {
+    let pipeline = if plan == EcTransferPlan::Pipelined {
+        let mut hops = (0..transfer.data_shards)
+            .map(|index| {
+                placement_node_for_shard(
+                    state,
+                    transfer.candidates,
+                    transfer.logical_cid,
+                    transfer.epoch,
+                    index,
+                )
+                .map(|node| proto::ErasurePipelineHop {
+                    index: index as u32,
+                    node_id: node.node_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        hops.sort_by(|left, right| {
+            let left_local = left.node_id == state.status.node_id;
+            let right_local = right.node_id == state.status.node_id;
+            left_local
+                .cmp(&right_local)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        hops.truncate(state.erasure_planner.pipeline_max_hops());
+        hops
+    } else {
+        Vec::new()
+    };
+    let ingress = if let Some(first) = pipeline.first() {
+        transfer
+            .candidates
+            .iter()
+            .find(|node| node.node_id == first.node_id)
+            .ok_or_else(|| ApiError::internal("pipeline ingress is unknown"))?
+    } else if plan == EcTransferPlan::Hierarchical {
+        choose_hierarchical_coordinator(state, transfer)?
+    } else {
+        choose_erasure_coordinator(
+            state,
+            transfer.candidates,
+            transfer.logical_cid,
+            transfer.epoch,
+            transfer.data_shards,
+        )?
+    };
+    if ingress.is_local {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "adaptive remote transfer selected the local gateway",
+        ));
+    }
+    let request = transfer.request(plan, pipeline);
+    let mut target_guard = state.erasure_planner.target_guard(&ingress.node_id);
+    let response = fast_path::io_network(&state.network)
+        .erasure_store_stripe_stream(
+            coordinator_address(ingress)?,
+            request,
+            Arc::clone(transfer.encoded),
+        )
+        .await
+        .map_err(ApiError::network)?;
+    target_guard.complete();
+    let executor_internal_bytes = response.internal_bytes;
+    let executor_cross_domain_bytes = response.cross_domain_bytes;
+    let receipts =
+        validate_adaptive_response(state, transfer, response, 0..transfer.total_shards())?;
+    let ingress_cross_domain = transfer
+        .candidates
+        .iter()
+        .find(|node| node.node_id == state.status.node_id)
+        .map(primary_failure_domain_key)
+        != Some(primary_failure_domain_key(ingress));
+    Ok(ErasurePlanTransfer {
+        receipts,
+        gateway_bytes: transfer.encoded.len() as u64,
+        internal_bytes: (transfer.encoded.len() as u64).saturating_add(executor_internal_bytes),
+        cross_domain_bytes: executor_cross_domain_bytes.saturating_add(if ingress_cross_domain {
+            transfer.encoded.len() as u64
+        } else {
+            0
+        }),
+    })
+}
+
 fn encode_erasure_stripe_payload(
     logical: Vec<u8>,
-) -> Result<(ErasureStripeEncoding, Vec<u8>), ApiError> {
+    mut sample: Vec<u8>,
+) -> Result<(ErasureStripeEncoding, Vec<u8>, Vec<u8>), ApiError> {
     let region = ERASURE_COMPRESSION_PROBE_REGION_BYTES.min(logical.len() / 3);
     if region == 0 {
-        return Ok((ErasureStripeEncoding::Raw, logical));
+        return Ok((ErasureStripeEncoding::Raw, logical, sample));
     }
     let middle = logical.len() / 2 - region / 2;
     let end = logical.len() - region;
-    let mut sample = Vec::with_capacity(region * 3);
+    sample.clear();
+    sample.reserve(region.saturating_mul(3).saturating_sub(sample.capacity()));
     sample.extend_from_slice(&logical[..region]);
     sample.extend_from_slice(&logical[middle..middle + region]);
     sample.extend_from_slice(&logical[end..]);
@@ -1512,7 +2879,7 @@ fn encode_erasure_stripe_payload(
         .saturating_mul(ERASURE_COMPRESSION_MIN_SAVINGS_PERCENT)
         / 100;
     if compressed_sample.len() > sample.len().saturating_sub(required_sample_savings) {
-        return Ok((ErasureStripeEncoding::Raw, logical));
+        return Ok((ErasureStripeEncoding::Raw, logical, sample));
     }
     let compressed = zstd::bulk::compress(&logical, ERASURE_COMPRESSION_LEVEL)
         .map_err(|error| ApiError::internal(format!("erasure compression failed: {error}")))?;
@@ -1521,9 +2888,9 @@ fn encode_erasure_stripe_payload(
         .saturating_mul(ERASURE_COMPRESSION_MIN_SAVINGS_PERCENT)
         / 100;
     if compressed.len() <= logical.len().saturating_sub(required_savings) {
-        Ok((ErasureStripeEncoding::Zstd, compressed))
+        Ok((ErasureStripeEncoding::Zstd, compressed, sample))
     } else {
-        Ok((ErasureStripeEncoding::Raw, logical))
+        Ok((ErasureStripeEncoding::Raw, logical, sample))
     }
 }
 
@@ -1560,10 +2927,6 @@ fn has_advertised_capacity(node: &PlacementNode, min_available_bytes: u64) -> bo
         .is_none_or(|available| available >= min_available_bytes)
 }
 
-fn capacity_score(node: &PlacementNode) -> u64 {
-    node.storage_available_bytes.unwrap_or(u64::MAX / 2)
-}
-
 fn choose_capacity_aware_target(
     selected: &[PlacementNode],
     predicate: impl Fn(&PlacementNode) -> bool,
@@ -1572,14 +2935,15 @@ fn choose_capacity_aware_target(
         .iter()
         .filter(|node| predicate(node))
         .max_by(|left, right| {
-            capacity_score(left)
-                .cmp(&capacity_score(right))
+            left.storage_available_bytes
+                .unwrap_or(u64::MAX / 2)
+                .cmp(&right.storage_available_bytes.unwrap_or(u64::MAX / 2))
                 .then_with(|| right.node_id.cmp(&left.node_id))
         })
         .cloned()
 }
 
-fn select_erasure_target(
+fn select_erasure_target_legacy(
     cid: &Cid,
     candidates: &[PlacementNode],
     excluded_node_ids: &HashSet<String>,
@@ -1606,40 +2970,14 @@ fn select_erasure_target(
     .or_else(|| selected.into_iter().next())
 }
 
-fn candidate_failure_domain(node_id: &str, candidates: &[PlacementNode]) -> String {
-    candidates
-        .iter()
-        .find(|node| node.node_id == node_id)
-        .map(primary_failure_domain_key)
-        .unwrap_or_else(|| format!("node:{node_id}"))
-}
-
-fn validate_erasure_policy(data_shards: u16, parity_shards: u16) -> Result<(), ApiError> {
-    if data_shards == 0 || parity_shards == 0 {
-        return Err(ApiError::bad_request(
-            "erasure data and parity shard counts must be greater than zero",
-        ));
-    }
-    if parity_shards > data_shards {
-        return Err(ApiError::bad_request(
-            "erasure parity shard count must not exceed data shard count",
-        ));
-    }
-    if data_shards.saturating_add(parity_shards) > 32 {
-        return Err(ApiError::bad_request(
-            "erasure data+parity shard count must be <= 32",
-        ));
-    }
-    Ok(())
-}
-
-async fn store_erasure_shard(
+async fn store_erasure_shard_legacy(
     state: &AppState,
     candidates: &[PlacementNode],
     cid: Cid,
     payload: Vec<u8>,
     excluded_node_ids: &HashSet<String>,
     used_constraint_values: &HashSet<String>,
+    placement: PlacementReference,
 ) -> Result<(String, HashSet<String>, DurabilityReceipt), ApiError> {
     let payload_size = payload.len() as u64;
     let encoded = state
@@ -1647,7 +2985,7 @@ async fn store_erasure_shard(
         .encode_preverified_raw(cid.clone(), &payload)?;
     drop(payload);
     let logical_size = encoded.logical_size_bytes();
-    let selected = select_erasure_target(
+    let selected = select_erasure_target_legacy(
         &cid,
         candidates,
         excluded_node_ids,
@@ -1662,7 +3000,7 @@ async fn store_erasure_shard(
             .find_map(|address| address.parse().ok())
     {
         let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
-        match state
+        if let Ok(ack) = state
             .network
             .block_put_replica_stream(
                 address,
@@ -1672,36 +3010,23 @@ async fn store_erasure_shard(
                 encoded_payload.clone(),
             )
             .await
+            && let Ok(record) =
+                validate_replica_ack(state, &node.node_id, &cid, CODEC_RAW, logical_size, &ack)
         {
-            Ok(ack) => match validate_replica_ack(
-                state,
-                &node.node_id,
-                &cid,
-                CODEC_RAW,
-                logical_size,
-                &ack,
-            ) {
-                Ok(record) => {
-                    state.network.announce_provider_to_peers(&record).await;
-                    return Ok((
-                        node.node_id.clone(),
-                        placement_constraint_values(&node),
-                        DurabilityReceipt {
-                            cid,
-                            codec: CODEC_RAW,
-                            size: logical_size,
-                            replicas_accepted: 1,
-                            replica_nodes: vec![node.node_id.clone()],
-                            status: "durable".to_string(),
-                            providers: vec![record],
-                        },
-                    ));
-                }
-                Err(error) => {
-                    warn!(%error.message, expected = %cid, "remote erasure shard acknowledgement failed validation; storing locally")
-                }
-            },
-            Err(error) => warn!(%error, "remote erasure shard write failed; storing locally"),
+            state.network.announce_provider_to_peers(&record).await;
+            return Ok((
+                node.node_id.clone(),
+                placement_constraint_values(&node),
+                DurabilityReceipt {
+                    cid,
+                    placement: Some(placement),
+                    codec: CODEC_RAW,
+                    size: logical_size,
+                    replicas_accepted: 1,
+                    replica_nodes: vec![node.node_id],
+                    status: "durable".to_string(),
+                },
+            ));
         }
         let encoded = state.block_store.validate_encoded_replica(
             cid.clone(),
@@ -1733,12 +3058,12 @@ async fn store_erasure_shard(
         placement_constraint_values(&local),
         DurabilityReceipt {
             cid,
+            placement: Some(placement),
             codec: CODEC_RAW,
             size: logical_size,
             replicas_accepted: 1,
             replica_nodes: vec![state.status.node_id.clone()],
             status: "durable".to_string(),
-            providers: vec![provider],
         },
     ))
 }
@@ -1754,47 +3079,678 @@ async fn copy_erasure_shard_to_node(
         .encode_preverified_raw(cid.clone(), &payload)?;
     drop(payload);
     if node.is_local {
-        let ack = state
-            .block_store
-            .put_replica_encoded_batch(std::slice::from_ref(&encoded))?[0]
-            .clone();
-        if ack.cid != *cid {
-            return Err(ApiError::internal(format!(
-                "local erasure shard CID mismatch: expected {cid}, got {}",
-                ack.cid
-            )));
-        }
-        let provider = state.network.local_provider_record(cid);
-        state.network.persist_provider_record(&provider)?;
-        state.network.announce_provider_to_peers(&provider).await;
+        state.block_store.put_encoded(&encoded)?;
         return Ok(());
     }
-
     let address = node
         .addresses
         .iter()
         .find_map(|address| address.parse().ok())
-        .ok_or_else(|| {
-            ApiError::internal(format!("node {} has no routable address", node.node_id))
-        })?;
-    let payload_len = encoded.logical_size_bytes();
-    let ack = time::timeout(
-        Duration::from_secs(2),
-        state.network.block_put_replica_stream(
+        .ok_or_else(|| ApiError::internal("erasure target has no routable address"))?;
+    let size = encoded.logical_size_bytes();
+    let ack = state
+        .network
+        .block_put_replica_stream(
             address,
             CODEC_RAW,
             cid,
-            payload_len,
+            size,
             Arc::from(encoded.into_bytes()),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        ApiError::internal(format!("erasure shard copy to {} timed out", node.node_id))
-    })??;
-    let record = validate_replica_ack(state, &node.node_id, cid, CODEC_RAW, payload_len, &ack)?;
+        )
+        .await?;
+    let record = validate_replica_ack(state, &node.node_id, cid, CODEC_RAW, size, &ack)?;
     state.network.announce_provider_to_peers(&record).await;
     Ok(())
+}
+
+fn validate_erasure_policy(data_shards: u16, parity_shards: u16) -> Result<(), ApiError> {
+    if data_shards == 0 || parity_shards == 0 {
+        return Err(ApiError::bad_request(
+            "erasure data and parity shard counts must be greater than zero",
+        ));
+    }
+    if parity_shards > data_shards {
+        return Err(ApiError::bad_request(
+            "erasure parity shard count must not exceed data shard count",
+        ));
+    }
+    if data_shards.saturating_add(parity_shards) > 32 {
+        return Err(ApiError::bad_request(
+            "erasure data+parity shard count must be <= 32",
+        ));
+    }
+    Ok(())
+}
+
+async fn store_erasure_shard(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    cid: Cid,
+    payload: Vec<u8>,
+    placement: PlacementReference,
+) -> Result<(String, DurabilityReceipt), ApiError> {
+    let encoded = state
+        .block_store
+        .encode_preverified_raw(cid.clone(), &payload)?;
+    drop(payload);
+    let logical_size = encoded.logical_size_bytes();
+    metrics::PLACEMENT_CALCULATIONS.fetch_add(1, Ordering::Relaxed);
+    let target_id = state
+        .placement
+        .decide(&placement)
+        .map_err(authoritative_placement_error)?
+        .node_ids
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::internal("erasure placement returned no owner"))?;
+    let node = candidates
+        .iter()
+        .find(|node| node.node_id == target_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                format!("erasure placement node {target_id} has no signed address descriptor"),
+            )
+        })?;
+    let mut target_guard = state.erasure_planner.target_guard(&target_id);
+    if !node.is_local {
+        let address = node
+            .addresses
+            .iter()
+            .find_map(|address| address.parse().ok())
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::Unavailable,
+                    format!("erasure placement node {target_id} has no routable address"),
+                )
+            })?;
+        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        let ack = fast_path::io_network(&state.network)
+            .block_put_replica_stream(
+                address,
+                CODEC_RAW,
+                &cid,
+                logical_size,
+                encoded_payload.clone(),
+            )
+            .await
+            .map_err(|error| {
+                metrics::PLACEMENT_DIRECT_TARGET_ERRORS.fetch_add(1, Ordering::Relaxed);
+                ApiError::network(error)
+            })?;
+        parse_replica_ack(&node.node_id, &cid, CODEC_RAW, logical_size, &ack)?;
+        metrics::PLACEMENT_DIRECT_TARGET_BYTES.fetch_add(logical_size, Ordering::Relaxed);
+        target_guard.complete();
+        return Ok((
+            node.node_id.clone(),
+            DurabilityReceipt {
+                cid,
+                placement: Some(placement),
+                codec: CODEC_RAW,
+                size: logical_size,
+                replicas_accepted: 1,
+                replica_nodes: vec![node.node_id.clone()],
+                status: "durable".to_string(),
+            },
+        ));
+    }
+    state.block_store.put_encoded(&encoded)?;
+    target_guard.complete();
+    Ok((
+        state.status.node_id.clone(),
+        DurabilityReceipt {
+            cid,
+            placement: Some(placement),
+            codec: CODEC_RAW,
+            size: logical_size,
+            replicas_accepted: 1,
+            replica_nodes: vec![state.status.node_id.clone()],
+            status: "durable".to_string(),
+        },
+    ))
+}
+
+fn parse_adaptive_erasure_request(
+    request: &proto::ErasureTransferRequest,
+) -> Result<(Cid, usize, usize, usize), ApiError> {
+    let logical_cid = request
+        .logical_cid
+        .parse::<Cid>()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let data_shards = request.data_shards as usize;
+    let parity_shards = request.parity_shards as usize;
+    validate_erasure_policy(request.data_shards as u16, request.parity_shards as u16)?;
+    let shard_size = usize::try_from(request.shard_size)
+        .map_err(|_| ApiError::bad_request("adaptive erasure shard size does not fit usize"))?;
+    if logical_cid.codec != CODEC_RAW
+        || request.placement_epoch == 0
+        || request.encoded_size == 0
+        || request.logical_size == 0
+        || request.data_cids.len() != data_shards
+        || request.shard_size
+            != request
+                .encoded_size
+                .div_ceil(u64::from(request.data_shards))
+        || !matches!(request.encoding.as_str(), "raw" | "zstd")
+    {
+        return Err(ApiError::bad_request(
+            "invalid adaptive erasure transfer request",
+        ));
+    }
+    Ok((logical_cid, data_shards, parity_shards, shard_size))
+}
+
+fn validate_adaptive_encoded_payload(
+    request: &proto::ErasureTransferRequest,
+    logical_cid: &Cid,
+    encoded: &[u8],
+) -> Result<(), ApiError> {
+    if encoded.len() as u64 != request.encoded_size {
+        return Err(ApiError::bad_request(
+            "adaptive erasure encoded payload size mismatch",
+        ));
+    }
+    let encoded_cid = request
+        .encoded_cid
+        .parse::<Cid>()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if encoded_cid.codec != CODEC_RAW || !encoded_cid.verify(encoded) {
+        return Err(ApiError::bad_request(
+            "adaptive erasure encoded CID verification failed",
+        ));
+    }
+    if request.encoding == "raw"
+        && (request.logical_size != request.encoded_size || encoded_cid != *logical_cid)
+    {
+        return Err(ApiError::bad_request("raw adaptive erasure CID mismatch"));
+    }
+    Ok(())
+}
+
+fn adaptive_systematic_shards(
+    encoded: &[u8],
+    data_shards: usize,
+    shard_size: usize,
+) -> Vec<Vec<u8>> {
+    let mut shards = vec![vec![0u8; shard_size]; data_shards];
+    for (index, chunk) in encoded.chunks(shard_size).enumerate() {
+        shards[index][..chunk.len()].copy_from_slice(chunk);
+    }
+    shards
+}
+
+async fn adaptive_all_shards(
+    encoded: Vec<u8>,
+    data_shards: usize,
+    parity_shards: usize,
+    shard_size: usize,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    let systematic = adaptive_systematic_shards(&encoded, data_shards, shard_size);
+    adaptive_encode_parity(systematic, data_shards, parity_shards).await
+}
+
+async fn adaptive_encode_parity(
+    mut systematic: Vec<Vec<u8>>,
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        if systematic.len() != data_shards
+            || systematic.is_empty()
+            || systematic
+                .iter()
+                .any(|shard| shard.len() != systematic[0].len())
+        {
+            return Err(ApiError::bad_request(
+                "adaptive erasure systematic geometry is invalid",
+            ));
+        }
+        let shard_size = systematic[0].len();
+        systematic.extend((0..parity_shards).map(|_| vec![0u8; shard_size]));
+        ReedSolomon::new(data_shards, parity_shards)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?
+            .encode(&mut systematic)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok(systematic)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("adaptive erasure task failed: {error}")))?
+}
+
+async fn adaptive_store_shard(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    logical_cid: &Cid,
+    epoch: u64,
+    index: usize,
+    payload: Vec<u8>,
+) -> Result<proto::ErasureTransferShard, ApiError> {
+    let cid = Cid::new(CODEC_RAW, &payload);
+    let placement = PlacementReference::erasure_shard(epoch, logical_cid.clone(), index as u16);
+    let (node_id, receipt) =
+        store_erasure_shard(state, candidates, cid.clone(), payload, placement).await?;
+    Ok(proto::ErasureTransferShard {
+        index: index as u32,
+        cid: cid.to_string(),
+        node_id,
+        size: receipt.size,
+    })
+}
+
+async fn execute_distributed_parity(
+    state: &AppState,
+    request: proto::ErasureTransferRequest,
+) -> Result<proto::ErasureTransferResponse, ApiError> {
+    let (logical_cid, data_shards, parity_shards, shard_size) =
+        parse_adaptive_erasure_request(&request)?;
+    if request.plan != EcTransferPlan::DistributedParity.as_str() || !request.pipeline.is_empty() {
+        return Err(ApiError::bad_request(
+            "distributed parity request contains an invalid plan",
+        ));
+    }
+    let candidates = placement_candidates(state, state.network.peers().await);
+    let sources = request
+        .data_cids
+        .iter()
+        .enumerate()
+        .map(|(index, cid)| {
+            let owner = placement_node_for_shard(
+                state,
+                &candidates,
+                &logical_cid,
+                request.placement_epoch,
+                index,
+            )?
+            .node_id
+            .clone();
+            Ok::<_, ApiError>((
+                cid.parse::<Cid>()
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?,
+                PlacementReference::erasure_shard(
+                    request.placement_epoch,
+                    logical_cid.clone(),
+                    index as u16,
+                ),
+                owner,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fetched = stream::iter(
+        sources
+            .into_iter()
+            .map(|(cid, placement, owner)| async move {
+                let payload = get_block_at_placement(state, &cid, &placement)
+                    .await?
+                    .payload;
+                if payload.len() != shard_size || !cid.verify(&payload) {
+                    return Err(ApiError::bad_request(
+                        "distributed parity source shard failed verification",
+                    ));
+                }
+                Ok::<_, ApiError>((payload, owner))
+            }),
+    )
+    .buffered(data_shards.min(16))
+    .try_collect::<Vec<_>>()
+    .await?;
+    let local_domain = candidates
+        .iter()
+        .find(|node| node.node_id == state.status.node_id)
+        .map(primary_failure_domain_key);
+    let (fetch_internal_bytes, fetch_cross_domain_bytes) =
+        fetched
+            .iter()
+            .fold((0u64, 0u64), |mut totals, (payload, owner)| {
+                if owner != &state.status.node_id {
+                    totals.0 = totals.0.saturating_add(payload.len() as u64);
+                    let owner_domain = candidates
+                        .iter()
+                        .find(|node| &node.node_id == owner)
+                        .map(primary_failure_domain_key);
+                    if owner_domain != local_domain {
+                        totals.1 = totals.1.saturating_add(payload.len() as u64);
+                    }
+                }
+                totals
+            });
+    let data = fetched
+        .into_iter()
+        .map(|(payload, _)| payload)
+        .collect::<Vec<_>>();
+    let mut shards = data;
+    shards.extend((0..parity_shards).map(|_| vec![0u8; shard_size]));
+    let encoding_guard = state.erasure_planner.encoding_guard();
+    let shards = tokio::task::spawn_blocking(move || {
+        ReedSolomon::new(data_shards, parity_shards)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?
+            .encode(&mut shards)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok::<_, ApiError>(shards)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("distributed parity task failed: {error}")))??;
+    drop(encoding_guard);
+    let candidates_ref = &candidates;
+    let logical_cid_ref = &logical_cid;
+    let placement_epoch = request.placement_epoch;
+    let stored = stream::iter(shards.into_iter().enumerate().skip(data_shards).map(
+        move |(index, shard)| async move {
+            adaptive_store_shard(
+                state,
+                candidates_ref,
+                logical_cid_ref,
+                placement_epoch,
+                index,
+                shard,
+            )
+            .await
+        },
+    ))
+    .buffer_unordered(parity_shards.min(16))
+    .try_collect::<Vec<_>>()
+    .await?;
+    let (store_internal_bytes, store_cross_domain_bytes) =
+        proto_transfer_bytes(state, &candidates, &stored);
+    Ok(proto::ErasureTransferResponse {
+        shards: stored,
+        executor_node_id: state.status.node_id.clone(),
+        internal_bytes: fetch_internal_bytes.saturating_add(store_internal_bytes),
+        cross_domain_bytes: fetch_cross_domain_bytes.saturating_add(store_cross_domain_bytes),
+    })
+}
+
+async fn execute_remote_erasure_transfer(
+    state: &AppState,
+    request: proto::ErasureTransferRequest,
+    encoded: Vec<u8>,
+) -> Result<proto::ErasureTransferResponse, ApiError> {
+    let (logical_cid, data_shards, parity_shards, shard_size) =
+        parse_adaptive_erasure_request(&request)?;
+    validate_adaptive_encoded_payload(&request, &logical_cid, &encoded)?;
+    let candidates = placement_candidates(state, state.network.peers().await);
+    if request.plan != EcTransferPlan::Hierarchical.as_str()
+        || !request.pipeline.is_empty()
+        || !request.completed_indices.is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "hierarchical erasure transfer has invalid routing state",
+        ));
+    }
+    let encoding_guard = state.erasure_planner.encoding_guard();
+    let shards = adaptive_all_shards(encoded, data_shards, parity_shards, shard_size).await?;
+    drop(encoding_guard);
+    let candidates_ref = &candidates;
+    let logical_cid_ref = &logical_cid;
+    let placement_epoch = request.placement_epoch;
+    let stored = stream::iter(shards.into_iter().enumerate().map(
+        move |(index, shard)| async move {
+            adaptive_store_shard(
+                state,
+                candidates_ref,
+                logical_cid_ref,
+                placement_epoch,
+                index,
+                shard,
+            )
+            .await
+        },
+    ))
+    .buffer_unordered((data_shards + parity_shards).min(32))
+    .try_collect::<Vec<_>>()
+    .await?;
+    let (internal_bytes, cross_domain_bytes) = proto_transfer_bytes(state, &candidates, &stored);
+    Ok(proto::ErasureTransferResponse {
+        shards: stored,
+        executor_node_id: state.status.node_id.clone(),
+        internal_bytes,
+        cross_domain_bytes,
+    })
+}
+
+async fn execute_pipelined_erasure_transfer(
+    state: &AppState,
+    mut request: proto::ErasureTransferRequest,
+    mut chunks: ErasureChunkReceiver,
+) -> Result<proto::ErasureTransferResponse, ApiError> {
+    let (logical_cid, data_shards, parity_shards, shard_size) =
+        parse_adaptive_erasure_request(&request)?;
+    if request.plan != EcTransferPlan::Pipelined.as_str() {
+        return Err(ApiError::bad_request(
+            "streaming pipeline received an invalid plan",
+        ));
+    }
+    let candidates = placement_candidates(state, state.network.peers().await);
+    let hop = request
+        .pipeline
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("pipelined transfer has no next hop"))?;
+    if hop.node_id != state.status.node_id {
+        return Err(ApiError::bad_request(
+            "pipelined transfer reached the wrong owner",
+        ));
+    }
+    let index = hop.index as usize;
+    let expected_systematic = request.data_cids[index]
+        .parse::<Cid>()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let encoded_cid = request
+        .encoded_cid
+        .parse::<Cid>()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let mut verifier = encoded_cid
+        .stream_verifier(request.encoded_size)
+        .ok_or_else(|| ApiError::bad_request("invalid pipelined encoded CID"))?;
+    let encoded_size = usize::try_from(request.encoded_size)
+        .map_err(|_| ApiError::bad_request("pipelined encoded size does not fit usize"))?;
+    let systematic_start = index
+        .checked_mul(shard_size)
+        .ok_or_else(|| ApiError::bad_request("pipelined systematic offset overflow"))?;
+    let systematic_end = systematic_start.saturating_add(shard_size);
+    let mut systematic = vec![0u8; shard_size];
+
+    request.pipeline.remove(0);
+    request.completed_indices.push(index as u32);
+    let next = request.pipeline.first().cloned();
+    let mut forwarded_cross_domain = false;
+    let (forward_sender, forward_task) = if let Some(next) = next {
+        let next_node = candidates
+            .iter()
+            .find(|node| node.node_id == next.node_id)
+            .ok_or_else(|| ApiError::internal("pipeline target is unknown"))?;
+        let target = coordinator_address(next_node)?;
+        forwarded_cross_domain = primary_failure_domain_key(next_node)
+            != candidates
+                .iter()
+                .find(|node| node.node_id == state.status.node_id)
+                .map(primary_failure_domain_key)
+                .unwrap_or_else(|| format!("node:{}", state.status.node_id));
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let network = state.network.clone();
+        let forwarded_request = request.clone();
+        let task = tokio::spawn(async move {
+            network
+                .erasure_relay_stripe_stream(target, forwarded_request, receiver)
+                .await
+        });
+        (Some(sender), Some(PipelineRelayTask::new(task)))
+    } else {
+        (None, None)
+    };
+    let mut terminal_encoded = forward_task
+        .is_none()
+        .then(|| Vec::with_capacity(encoded_size));
+    let mut received = 0usize;
+    while let Some(chunk) = chunks.recv().await {
+        let chunk_start = received;
+        received = received
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::bad_request("pipelined stream size overflow"))?;
+        if received > encoded_size {
+            return Err(ApiError::bad_request(
+                "pipelined stream exceeded declared size",
+            ));
+        }
+        verifier.update(&chunk);
+        let overlap_start = chunk_start.max(systematic_start);
+        let overlap_end = received.min(systematic_end).min(encoded_size);
+        if overlap_start < overlap_end {
+            let source_start = overlap_start - chunk_start;
+            let target_start = overlap_start - systematic_start;
+            let length = overlap_end - overlap_start;
+            systematic[target_start..target_start + length]
+                .copy_from_slice(&chunk[source_start..source_start + length]);
+        }
+        if let Some(sender) = &forward_sender {
+            sender.send(chunk).await.map_err(|_| {
+                ApiError::network(NetworkError::TransportTask(
+                    "erasure pipeline relay closed".to_string(),
+                ))
+            })?;
+        } else if let Some(encoded) = &mut terminal_encoded {
+            encoded.extend_from_slice(&chunk);
+        }
+    }
+    drop(forward_sender);
+    if received != encoded_size || !verifier.finish() {
+        return Err(ApiError::bad_request(
+            "pipelined encoded CID verification failed",
+        ));
+    }
+    if Cid::new(CODEC_RAW, &systematic) != expected_systematic {
+        return Err(ApiError::bad_request(
+            "pipelined systematic shard CID mismatch",
+        ));
+    }
+
+    let local_store = adaptive_store_shard(
+        state,
+        &candidates,
+        &logical_cid,
+        request.placement_epoch,
+        index,
+        systematic,
+    );
+    if let Some(mut forward_task) = forward_task {
+        let forward_task = forward_task.take();
+        let forward = async {
+            forward_task
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("pipeline relay task failed: {error}"))
+                })?
+                .map_err(ApiError::network)
+        };
+        let (local, mut response) = tokio::try_join!(local_store, forward)?;
+        response.internal_bytes = response.internal_bytes.saturating_add(request.encoded_size);
+        if forwarded_cross_domain {
+            response.cross_domain_bytes = response
+                .cross_domain_bytes
+                .saturating_add(request.encoded_size);
+        }
+        response.shards.push(local);
+        return Ok(response);
+    }
+
+    let encoded = terminal_encoded.expect("terminal pipeline retains encoded bytes");
+    let completed = request
+        .completed_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let placement_epoch = request.placement_epoch;
+    let tail = async {
+        let encoding_guard = state.erasure_planner.encoding_guard();
+        let shards = adaptive_all_shards(encoded, data_shards, parity_shards, shard_size).await?;
+        drop(encoding_guard);
+        let candidates_ref = &candidates;
+        let logical_cid_ref = &logical_cid;
+        stream::iter(
+            shards
+                .into_iter()
+                .enumerate()
+                .filter_map(|(shard_index, shard)| {
+                    (!completed.contains(&(shard_index as u32))).then_some((shard_index, shard))
+                })
+                .map(move |(shard_index, shard)| async move {
+                    adaptive_store_shard(
+                        state,
+                        candidates_ref,
+                        logical_cid_ref,
+                        placement_epoch,
+                        shard_index,
+                        shard,
+                    )
+                    .await
+                }),
+        )
+        .buffer_unordered((data_shards + parity_shards).min(32))
+        .try_collect::<Vec<_>>()
+        .await
+    };
+    let (local, mut stored) = tokio::try_join!(local_store, tail)?;
+    stored.push(local);
+    let (internal_bytes, cross_domain_bytes) = proto_transfer_bytes(state, &candidates, &stored);
+    Ok(proto::ErasureTransferResponse {
+        shards: stored,
+        executor_node_id: state.status.node_id.clone(),
+        internal_bytes,
+        cross_domain_bytes,
+    })
+}
+
+struct PipelineRelayTask {
+    task: Option<tokio::task::JoinHandle<Result<proto::ErasureTransferResponse, NetworkError>>>,
+}
+
+impl PipelineRelayTask {
+    fn new(
+        task: tokio::task::JoinHandle<Result<proto::ErasureTransferResponse, NetworkError>>,
+    ) -> Self {
+        Self { task: Some(task) }
+    }
+
+    fn take(
+        &mut self,
+    ) -> tokio::task::JoinHandle<Result<proto::ErasureTransferResponse, NetworkError>> {
+        self.task.take().expect("pipeline relay task exists")
+    }
+}
+
+impl Drop for PipelineRelayTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+fn proto_transfer_bytes(
+    state: &AppState,
+    candidates: &[PlacementNode],
+    shards: &[proto::ErasureTransferShard],
+) -> (u64, u64) {
+    let local_domain = candidates
+        .iter()
+        .find(|node| node.node_id == state.status.node_id)
+        .map(primary_failure_domain_key);
+    shards.iter().fold((0u64, 0u64), |mut totals, shard| {
+        if shard.node_id == state.status.node_id {
+            return totals;
+        }
+        totals.0 = totals.0.saturating_add(shard.size);
+        let target_domain = candidates
+            .iter()
+            .find(|node| node.node_id == shard.node_id)
+            .map(primary_failure_domain_key);
+        if target_domain != local_domain {
+            totals.1 = totals.1.saturating_add(shard.size);
+        }
+        totals
+    })
 }
 
 async fn run_gc(
@@ -1935,7 +3891,7 @@ async fn admin_erasure(State(state): State<AppState>) -> Result<Json<serde_json:
             total_shards += stripe.shards.len();
             let mut healthy = 0usize;
             for shard in &stripe.shards {
-                if has_healthy_provider(&state, &shard.cid).await {
+                if placed_block_is_healthy(&state, &shard.cid, &shard.placement).await? {
                     healthy += 1;
                 }
             }
@@ -2076,11 +4032,49 @@ struct AgentDagResolver<'a> {
 #[async_trait]
 impl DagBlockResolver for AgentDagResolver<'_> {
     async fn resolve(&self, cid: &Cid) -> Result<Vec<u8>, String> {
-        get_block_resolved(self.state, cid)
+        get_dag_block_from_authoritative_placement(self.state, cid)
             .await
             .map(|block| block.payload)
             .map_err(|error| error.message)
     }
+}
+
+async fn get_dag_block_from_authoritative_placement(
+    state: &AppState,
+    cid: &Cid,
+) -> Result<pepper_types::Block, ApiError> {
+    match tokio::task::block_in_place(|| state.block_store.get(cid)) {
+        Ok(block) => return Ok(block),
+        Err(StorageError::NotFound(_)) | Err(StorageError::HashMismatch(_)) => {}
+        Err(error) => return Err(ApiError::from(error)),
+    }
+
+    let mut epochs = state.placement.epochs_descending();
+    if epochs.is_empty() && state.s3.is_some() {
+        s3_api::ensure_s3_current_placement_loaded(state).await?;
+        epochs = state.placement.epochs_descending();
+    }
+    if epochs.is_empty() {
+        return get_block_resolved_transient(state, cid).await;
+    }
+
+    let replication_factor = u16::try_from(state.replication_factor)
+        .map_err(|_| ApiError::internal("replication factor exceeds placement limits"))?;
+    let mut last_error = None;
+    for epoch in epochs {
+        let reference = PlacementReference::replicated(epoch, cid.clone(), replication_factor);
+        match get_block_at_placement(state, cid, &reference).await {
+            Ok(block) => return Ok(block),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            format!("no retained authoritative placement holds DAG block {cid}"),
+        )
+    }))
 }
 
 async fn traverse_reachable(state: &AppState, root: Cid) -> Result<HashSet<Cid>, ApiError> {
@@ -2104,6 +4098,7 @@ fn unix_seconds() -> i64 {
 
 async fn object_bytes(state: &AppState, cid: &Cid) -> Result<Vec<u8>, ApiError> {
     match cid.codec {
+        CODEC_SMALL_OBJECT => Ok(get_block_resolved(state, cid).await?.payload),
         CODEC_OBJECT_MANIFEST => {
             let manifest_block = get_block_resolved(state, cid).await?;
             let manifest: ObjectManifest =
@@ -2214,37 +4209,48 @@ async fn read_raw_systematic_erasure_range(
     }
     let selected = (first..=last)
         .map(|index| {
-            stripe
+            let shard = stripe
                 .shards
                 .iter()
                 .find(|shard| usize::from(shard.index) == index)
                 .cloned()
-                .ok_or_else(|| ApiError::bad_request("erasure manifest is missing a data shard"))
+                .ok_or_else(|| ApiError::bad_request("erasure manifest is missing a data shard"))?;
+            let shard_start = index * shard_size;
+            let overlap_start = range.start.max(shard_start) - shard_start;
+            let overlap_end = range.end.min(shard_start + shard_size) - shard_start;
+            Ok::<_, ApiError>((shard, overlap_start as u64, overlap_end as u64))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut fetches = stream::FuturesUnordered::new();
-    for shard in selected {
-        fetches.push(fetch_erasure_shard(state.clone(), shard));
+    for (shard, start, end) in selected {
+        let state = state.clone();
+        fetches.push(async move {
+            let started = std::time::Instant::now();
+            let result =
+                get_block_range_at_placement(&state, &shard.cid, &shard.placement, start, end)
+                    .await;
+            let sample = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            let _ = metrics::ERASURE_SHARD_FETCH_EWMA_MICROS.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_mul(7).saturating_add(sample) / 8),
+            );
+            (shard, result)
+        });
     }
     let mut blocks = vec![None::<Vec<u8>>; last - first + 1];
     while let Some((shard, result)) = fetches.next().await {
-        let Ok(block) = result else {
+        let Ok(payload) = result else {
             return Ok(None);
         };
-        if block.payload.len() != shard_size {
-            return Ok(None);
-        }
-        blocks[usize::from(shard.index) - first] = Some(block.payload);
+        blocks[usize::from(shard.index) - first] = Some(payload);
     }
     let mut output = Vec::with_capacity(range.end - range.start);
-    for (relative_index, block) in blocks.into_iter().enumerate() {
+    for block in blocks {
         let Some(block) = block else {
             return Ok(None);
         };
-        let shard_start = (first + relative_index) * shard_size;
-        let overlap_start = range.start.max(shard_start) - shard_start;
-        let overlap_end = range.end.min(shard_start + shard_size) - shard_start;
-        output.extend_from_slice(&block[overlap_start..overlap_end]);
+        output.extend_from_slice(&block);
     }
     if output.len() != range.end - range.start {
         return Err(ApiError::internal(
@@ -2584,9 +4590,8 @@ async fn acquire_erasure_stripe_read_slot(
     state: &AppState,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
     let started = time::Instant::now();
-    let permit = state
-        .erasure_stripe_read_slots
-        .clone()
+    let permit = fast_path::stripe_read_slots()
+        .unwrap_or_else(|| state.erasure_stripe_read_slots.clone())
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("erasure read scheduler is unavailable"))?;
@@ -2611,7 +4616,7 @@ async fn fetch_erasure_shard(
     shard: ErasureShard,
 ) -> (ErasureShard, Result<pepper_types::Block, ApiError>) {
     let started = std::time::Instant::now();
-    let result = get_block_resolved_transient(&state, &shard.cid).await;
+    let result = get_block_at_placement(&state, &shard.cid, &shard.placement).await;
     let sample = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     let _ = metrics::ERASURE_SHARD_FETCH_EWMA_MICROS.fetch_update(
         Ordering::Relaxed,
@@ -2671,7 +4676,9 @@ async fn restore_dir_manifest(state: &AppState, cid: &Cid, path: &FsPath) -> Res
         } else if let Some(cid) = entry.cid {
             let bytes = match cid.codec {
                 CODEC_RAW => get_block_resolved(state, &cid).await?.payload,
-                CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => object_bytes(state, &cid).await?,
+                CODEC_SMALL_OBJECT | CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => {
+                    object_bytes(state, &cid).await?
+                }
                 _ => return Err(ApiError::bad_request("unsupported directory file codec")),
             };
             write_bytes(&target, &bytes)?;
@@ -2840,6 +4847,51 @@ async fn put_policy_object_stream_receipts(
     content_length: Option<u64>,
     force_erasure: bool,
 ) -> Result<ObjectWriteReceipts, ApiError> {
+    if !force_erasure
+        && content_length.is_some_and(|length| {
+            state
+                .small_object_max_bytes
+                .is_some_and(|maximum| length <= maximum)
+        })
+    {
+        return put_small_object_stream_receipts(state, body).await;
+    }
+    if content_length.is_none()
+        && !force_erasure
+        && let Some(maximum) = state.small_object_max_bytes
+    {
+        let mut source = body.into_data_stream();
+        let mut prefix = Vec::<Bytes>::new();
+        let mut prefix_bytes = 0u64;
+        loop {
+            let Some(chunk) = source.next().await else {
+                let body = Body::from_stream(stream::iter(
+                    prefix
+                        .into_iter()
+                        .map(Ok::<Bytes, std::convert::Infallible>),
+                ));
+                return put_small_object_stream_receipts(state, body).await;
+            };
+            let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
+            prefix_bytes = prefix_bytes.saturating_add(chunk.len() as u64);
+            prefix.push(chunk);
+            if prefix_bytes > maximum {
+                let body = Body::from_stream(
+                    stream::iter(prefix.into_iter().map(Ok::<Bytes, axum::Error>)).chain(source),
+                );
+                return put_non_small_policy_stream_receipts(state, body, None, false).await;
+            }
+        }
+    }
+    put_non_small_policy_stream_receipts(state, body, content_length, force_erasure).await
+}
+
+async fn put_non_small_policy_stream_receipts(
+    state: &AppState,
+    body: Body,
+    content_length: Option<u64>,
+    force_erasure: bool,
+) -> Result<ObjectWriteReceipts, ApiError> {
     if !state.erasure_enabled {
         return put_object_stream_receipts(state, body).await;
     }
@@ -2885,11 +4937,43 @@ async fn put_policy_object_stream_receipts(
     .await
 }
 
+async fn put_small_object_stream_receipts(
+    state: &AppState,
+    body: Body,
+) -> Result<ObjectWriteReceipts, ApiError> {
+    let maximum = state
+        .small_object_max_bytes
+        .ok_or_else(|| ApiError::internal("small-object packing is disabled"))?;
+    let payload = read_body_limited(body, Some(maximum), "small object").await?;
+    let receipt = put_replicated_block(state, CODEC_SMALL_OBJECT, payload).await?;
+    Ok(ObjectWriteReceipts {
+        receipt: receipt.clone(),
+        blocks: vec![receipt],
+    })
+}
+
 async fn put_erasure_object_stream_receipts(
     state: &AppState,
     body: Body,
     data_shards: u16,
     parity_shards: u16,
+) -> Result<ObjectWriteReceipts, ApiError> {
+    put_erasure_object_stream_receipts_with_compression(
+        state,
+        body,
+        data_shards,
+        parity_shards,
+        true,
+    )
+    .await
+}
+
+async fn put_erasure_object_stream_receipts_with_compression(
+    state: &AppState,
+    body: Body,
+    data_shards: u16,
+    parity_shards: u16,
+    allow_compression: bool,
 ) -> Result<ObjectWriteReceipts, ApiError> {
     validate_erasure_policy(data_shards, parity_shards)?;
     let max_block_bytes = state.max_block_bytes.unwrap_or(DEFAULT_MAX_BLOCK_BYTES);
@@ -2912,6 +4996,14 @@ async fn put_erasure_object_stream_receipts(
     let mut total = 0u64;
     let mut next_offset = 0u64;
     let mut all_stripes_durable = true;
+    let request_plan = Arc::new(OnceCell::new());
+    let stripe_context = Arc::new(ErasureStripeStoreContext {
+        data_shards,
+        parity_shards,
+        candidates,
+        request_plan,
+        allow_compression,
+    });
 
     loop {
         let streaming_started = time::Instant::now();
@@ -2939,9 +5031,7 @@ async fn put_erasure_object_stream_receipts(
                     state,
                     payload,
                     next_offset,
-                    data_shards,
-                    parity_shards,
-                    candidates.clone(),
+                    stripe_context.clone(),
                 ));
                 next_offset = next_offset.saturating_add(stripe_size as u64);
                 if transfers.len() >= pipeline_depth {
@@ -2962,9 +5052,7 @@ async fn put_erasure_object_stream_receipts(
             state,
             pending,
             next_offset,
-            data_shards,
-            parity_shards,
-            candidates,
+            stripe_context,
         ));
     }
     while let Some(stored) = transfers.next().await {
@@ -3119,11 +5207,19 @@ async fn put_object_chunk(
 ) -> Result<(ObjectChunk, DurabilityReceipt), ApiError> {
     let size = payload.len() as u64;
     let receipt = put_replicated_block(state, CODEC_RAW, payload).await?;
+    let placement = receipt.placement.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "object chunk was stored without authoritative placement",
+        )
+    })?;
     Ok((
         ObjectChunk {
             offset,
             size,
             cid: receipt.cid.clone(),
+            placement,
         },
         receipt,
     ))
@@ -3261,9 +5357,19 @@ async fn readyz(State(state): State<AppState>) -> Response {
     } else {
         Vec::new()
     };
-    let ready = statuses
-        .iter()
-        .all(|status| status.running && status.log_lag == 0 && status.leader_raft_id.is_some());
+    // A healthy follower commonly trails the last appended entry while a
+    // write is in flight. Requiring exact zero lag made readiness oscillate on
+    // every busy namespace even though the gateway could route linearizable
+    // I/O to the known leader. Readiness describes whether the group can
+    // serve/reroute requests; exact apply lag remains an admin metric and a
+    // benchmark health assertion.
+    let ready = statuses.iter().all(|status| {
+        status.running
+            && status.leader_raft_id.is_some()
+            && status.voter_count == 3
+            && !status.membership_joint
+            && (status.role != "leader" || status.quorum_recently_acknowledged)
+    });
     let status = if ready {
         StatusCode::OK
     } else {
@@ -3288,25 +5394,29 @@ async fn require_http_auth_and_rate_limit(
     let s3_request = state.s3.is_some()
         && !request.uri().path().starts_with("/v1/")
         && !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
-    let permit = match state.http_concurrency.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) if s3_request => {
-            metrics::S3_HTTP_ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Ok(S3Error::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "SlowDown",
-                "the bounded S3 request queue is full",
-                request.uri().path(),
-            )
-            .into_response());
-        }
-        Err(_) => {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::Unavailable,
-                "HTTP concurrency limit exceeded",
-            ));
-        }
+    let permit = if s3_request && state.fast_path.is_some() {
+        None
+    } else {
+        Some(match state.http_concurrency.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) if s3_request => {
+                metrics::S3_HTTP_ADMISSION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                return Ok(S3Error::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SlowDown",
+                    "the bounded S3 request queue is full",
+                    request.uri().path(),
+                )
+                .into_response());
+            }
+            Err(_) => {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::Unavailable,
+                    "HTTP concurrency limit exceeded",
+                ));
+            }
+        })
     };
     if let Some(token) = &state.api_bearer_token
         && !s3_request
@@ -3411,10 +5521,30 @@ mod security_tests {
     use super::*;
 
     #[test]
+    fn hierarchical_coordinator_minimizes_cross_domain_bytes() {
+        let owners = [
+            "rack-a", "rack-a", "rack-b", "rack-b", "rack-b", "rack-b", "rack-c",
+        ]
+        .map(str::to_string);
+        let local_rack = hierarchical_cross_domain_bytes("rack-a", "rack-a", &owners, 60, 10);
+        let remote_dense_rack =
+            hierarchical_cross_domain_bytes("rack-a", "rack-b", &owners, 60, 10);
+        assert_eq!(local_rack, 50);
+        assert_eq!(remote_dense_rack, 90);
+
+        let from_other_gateway =
+            hierarchical_cross_domain_bytes("rack-d", "rack-b", &owners, 60, 10);
+        let sparse_rack = hierarchical_cross_domain_bytes("rack-d", "rack-a", &owners, 60, 10);
+        assert_eq!(from_other_gateway, 90);
+        assert_eq!(sparse_rack, 110);
+    }
+
+    #[test]
     fn erasure_stripe_compression_is_canonical_and_checksum_bound() {
         let compressible = vec![b'a'; 1024 * 1024];
         let logical_cid = Cid::new(CODEC_RAW, &compressible);
-        let (encoding, encoded) = encode_erasure_stripe_payload(compressible.clone()).unwrap();
+        let (encoding, encoded, _) =
+            encode_erasure_stripe_payload(compressible.clone(), Vec::new()).unwrap();
         assert_eq!(encoding, ErasureStripeEncoding::Zstd);
         assert!(encoded.len() < compressible.len() / 10);
         assert_eq!(
@@ -3431,7 +5561,8 @@ mod security_tests {
             value ^= value << 17;
             *byte = value as u8;
         }
-        let (encoding, encoded) = encode_erasure_stripe_payload(incompressible.clone()).unwrap();
+        let (encoding, encoded, _) =
+            encode_erasure_stripe_payload(incompressible.clone(), Vec::new()).unwrap();
         assert_eq!(encoding, ErasureStripeEncoding::Raw);
         assert_eq!(encoded, incompressible);
     }

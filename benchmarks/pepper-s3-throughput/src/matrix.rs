@@ -22,7 +22,33 @@ const METRIC_FAMILIES: &[&str] = &[
     "pepper_namespace_linearizable_reads_total",
     "pepper_rpc_request_bytes_total",
     "pepper_rpc_response_bytes_total",
+    "pepper_rpc_requests_total",
     "pepper_rpc_errors_total",
+    "pepper_placement_calculations_total",
+    "pepper_placement_direct_target_attempts_total",
+    "pepper_placement_direct_target_errors_total",
+    "pepper_placement_direct_target_bytes_total",
+    "pepper_placement_exception_hits_total",
+    "pepper_placement_map_refreshes_total",
+    "pepper_placement_map_refresh_failures_total",
+    "pepper_placement_repair_inventory_events_total",
+    "pepper_placement_repair_inventory_push_errors_total",
+    "pepper_placement_repair_health_batches_total",
+    "pepper_placement_repair_health_blocks_total",
+    "pepper_placement_repair_health_batch_errors_total",
+    "pepper_placement_repair_owner_runs_total",
+    "pepper_placement_repair_standby_deferrals_total",
+    "pepper_placement_repair_leases_acquired_total",
+    "pepper_placement_repair_lease_renewals_total",
+    "pepper_placement_repair_lease_conflicts_total",
+    "pepper_placement_repair_fence_rejections_total",
+    "pepper_placement_repair_tasks_started_total",
+    "pepper_placement_repair_tasks_completed_total",
+    "pepper_placement_repair_tasks_already_healthy_total",
+    "pepper_placement_repair_task_errors_total",
+    "pepper_placement_repair_destination_reconstructions_total",
+    "pepper_placement_repair_temporary_exceptions_total",
+    "pepper_placement_repair_stale_extras_collected_total",
     "pepper_merkle_nodes_written_total",
     "pepper_merkle_mutations_total",
     "pepper_block_write_batch_requests_total",
@@ -52,9 +78,36 @@ const METRIC_FAMILIES: &[&str] = &[
     "pepper_storage_block_read_bytes_total",
     "pepper_storage_inline_block_writes_total",
     "pepper_storage_inline_block_write_bytes_total",
+    "pepper_storage_packed_block_writes_total",
+    "pepper_storage_packed_block_write_bytes_total",
+    "pepper_storage_packed_block_reads_total",
+    "pepper_storage_packed_block_read_bytes_total",
+    "pepper_small_object_pack_extents_written_total",
+    "pepper_small_object_pack_extent_bytes_total",
+    "pepper_small_object_pack_records_transitioned_total",
+    "pepper_small_object_pack_logical_bytes_transitioned_total",
+    "pepper_small_object_pack_extents_compacted_total",
+    "pepper_small_object_pack_records_compacted_total",
+    "pepper_small_object_pack_bytes_reclaimed_total",
+    "pepper_small_object_pack_index_hits_total",
+    "pepper_small_object_pack_index_misses_total",
+    "pepper_small_object_pack_failures_total",
     "pepper_storage_data_durability_barriers_total",
     "pepper_storage_data_files_durable_total",
     "pepper_storage_directory_durability_barriers_total",
+    "pepper_storage_native_writes_total",
+    "pepper_storage_native_write_bytes_total",
+    "pepper_storage_native_reads_total",
+    "pepper_storage_native_read_bytes_total",
+    "pepper_storage_native_durability_barriers_total",
+    "pepper_storage_native_durability_groups_total",
+    "pepper_storage_native_durability_group_requests_total",
+    "pepper_storage_native_io_uring_submissions_total",
+    "pepper_storage_native_sync_fallbacks_total",
+    "pepper_storage_native_recovered_records_total",
+    "pepper_storage_native_torn_tails_total",
+    "pepper_storage_native_compactions_total",
+    "pepper_storage_native_compacted_bytes_total",
     "pepper_erasure_stripes_encoded_total",
     "pepper_erasure_stripes_compressed_total",
     "pepper_erasure_stripe_logical_bytes_total",
@@ -80,6 +133,40 @@ const METRIC_FAMILIES: &[&str] = &[
     "pepper_s3_list_cache_hits_total",
     "pepper_s3_list_cache_misses_total",
     "pepper_s3_list_cache_coalesced_total",
+    "pepper_s3_partition_routes_total",
+    "pepper_s3_list_barriers_total",
+    "pepper_s3_list_partitions_scanned_total",
+    "pepper_s3_partition_reconfigurations_total",
+    "pepper_fast_path_dispatches_total",
+    "pepper_fast_path_rejections_total",
+    "pepper_fast_path_owner_failovers_total",
+    "pepper_fast_path_cross_core_hops_total",
+    "pepper_fast_path_owner_requests_total",
+    "pepper_fast_path_owner_queue_microseconds_total",
+    "pepper_fast_path_owner_execution_microseconds_total",
+    "pepper_fast_path_owner_response_bytes_total",
+    "pepper_fast_path_owner_buffer_hits_total",
+    "pepper_fast_path_owner_buffer_misses_total",
+    "pepper_transport_connections_active",
+    "pepper_transport_connections_total",
+    "pepper_transport_streams_active",
+    "pepper_transport_streams_total",
+    "pepper_transport_errors_total",
+    "pepper_transport_control_cancellations_total",
+    "pepper_transport_bulk_cancellations_total",
+    "pepper_transport_bulk_bytes_total",
+    "pepper_transport_bulk_throttle_microseconds_total",
+    "pepper_transport_bulk_stream_capacity",
+    "pepper_transport_bulk_stream_queue_ewma_microseconds",
+    "pepper_erasure_transfer_plan_selected_total",
+    "pepper_erasure_transfer_plan_completed_total",
+    "pepper_erasure_transfer_plan_failures_total",
+    "pepper_erasure_transfer_plan_fallback_total",
+    "pepper_erasure_transfer_plan_completion_microseconds_total",
+    "pepper_erasure_transfer_plan_logical_bytes_total",
+    "pepper_erasure_transfer_plan_gateway_bytes_total",
+    "pepper_erasure_transfer_plan_internal_bytes_total",
+    "pepper_erasure_transfer_plan_cross_domain_bytes_total",
 ];
 const PHASES: &[&str] = &[
     "request_streaming",
@@ -90,6 +177,7 @@ const PHASES: &[&str] = &[
     "raft_namespace_publication",
 ];
 const BENCHMARK_BUCKET: &str = "pepper-s3-throughput";
+const BENCHMARK_SMALL_OBJECT_MAX_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Args)]
 pub struct MatrixArgs {
@@ -115,10 +203,19 @@ pub struct MatrixArgs {
     routing: Option<String>,
     #[arg(long)]
     topologies: Option<String>,
+    /// Comma-separated Pepper storage engines: files,files-direct,native-nvme.
+    #[arg(long)]
+    storage_engines: Option<String>,
     #[arg(long)]
     operations: Option<String>,
     #[arg(long)]
     payload_profiles: Option<String>,
+    /// Comma-separated nine-node EC transfer plans.
+    #[arg(long)]
+    erasure_transfer_plans: Option<String>,
+    /// Comma-separated nine-node gateway link shapes in megabits per second.
+    #[arg(long)]
+    gateway_capacities_mbps: Option<String>,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -154,9 +251,15 @@ struct Matrix {
     concurrency: Vec<usize>,
     routing: Vec<String>,
     topologies: Vec<String>,
+    #[serde(default = "default_storage_engines")]
+    storage_engines: Vec<String>,
     operations: Vec<String>,
     #[serde(default = "default_payload_profiles")]
     payload_profiles: Vec<String>,
+    #[serde(default = "default_erasure_transfer_plans")]
+    erasure_transfer_plans: Vec<String>,
+    #[serde(default = "default_gateway_capacities_mbps")]
+    gateway_capacities_mbps: Vec<u64>,
     range_bytes: u64,
     minimum_duration_seconds: u64,
     cold_dataset_memory_ratio: f64,
@@ -165,15 +268,30 @@ struct Matrix {
 #[derive(Debug, Clone)]
 struct Cell {
     topology: String,
+    storage_engine: String,
     size: u64,
     concurrency: usize,
     routing: String,
     operation: String,
     payload_profile: String,
+    erasure_transfer_plan: String,
+    gateway_capacity_mbps: u64,
 }
 
 fn default_payload_profiles() -> Vec<String> {
     vec!["incompressible".to_string()]
+}
+
+fn default_storage_engines() -> Vec<String> {
+    vec!["files".to_string()]
+}
+
+fn default_erasure_transfer_plans() -> Vec<String> {
+    vec!["adaptive".to_string()]
+}
+
+fn default_gateway_capacities_mbps() -> Vec<u64> {
+    vec![0]
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -223,13 +341,173 @@ pub(crate) fn prepare_benchmark_root(root: &Path) -> Result<PathBuf> {
         "benchmark root {} is on the OS root filesystem; select a dedicated data mount",
         root.display()
     );
+    prepare_runtime_configs(&root, "files", "adaptive", 0)?;
     Ok(root)
+}
+
+fn prepare_runtime_configs(
+    root: &Path,
+    engine: &str,
+    erasure_transfer_plan: &str,
+    gateway_capacity_mbps: u64,
+) -> Result<()> {
+    ensure!(
+        matches!(engine, "files" | "files-direct" | "native-nvme"),
+        "unsupported storage engine {engine}"
+    );
+    let source = here().join("config");
+    let target = root.join(".runtime-config");
+    fs::create_dir_all(&target)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+    for entry in fs::read_dir(&source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "toml") {
+            continue;
+        }
+        let mut config = toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?;
+        let storage = config
+            .as_table_mut()
+            .context("benchmark node config is not a TOML table")?
+            .entry("storage")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .context("benchmark storage config is not a TOML table")?;
+        storage.insert(
+            "engine".to_string(),
+            toml::Value::String(if engine == "files-direct" {
+                "files".to_string()
+            } else {
+                engine.to_string()
+            }),
+        );
+        storage.insert(
+            "small_object_pack".to_string(),
+            toml::Value::Table(toml::map::Map::from_iter([
+                (
+                    "enabled".to_string(),
+                    toml::Value::Boolean(engine != "files-direct"),
+                ),
+                (
+                    "max_object_bytes".to_string(),
+                    // The OPT-14 crossover matrix found packed reads ahead at
+                    // 4 KiB but 25-53% behind direct placement from 16-256
+                    // KiB. Keep the benchmark on the measured production
+                    // threshold instead of silently packing every 1 MiB cell.
+                    toml::Value::Integer(BENCHMARK_SMALL_OBJECT_MAX_BYTES as i64),
+                ),
+                (
+                    "segment_bytes".to_string(),
+                    toml::Value::Integer(67_108_864),
+                ),
+                ("owners".to_string(), toml::Value::Integer(8)),
+                ("io_uring_entries".to_string(), toml::Value::Integer(256)),
+                ("require_io_uring".to_string(), toml::Value::Boolean(false)),
+                (
+                    "group_commit_delay_microseconds".to_string(),
+                    toml::Value::Integer(200),
+                ),
+                (
+                    "group_commit_max_requests".to_string(),
+                    toml::Value::Integer(256),
+                ),
+                (
+                    "compaction_dead_percent".to_string(),
+                    toml::Value::Integer(50),
+                ),
+            ])),
+        );
+        storage.insert(
+            "native".to_string(),
+            toml::Value::Table(toml::map::Map::from_iter([
+                (
+                    "segment_bytes".to_string(),
+                    toml::Value::Integer(268_435_456),
+                ),
+                ("owners".to_string(), toml::Value::Integer(8)),
+                ("io_uring_entries".to_string(), toml::Value::Integer(256)),
+                ("direct_io".to_string(), toml::Value::Boolean(true)),
+                (
+                    "require_io_uring".to_string(),
+                    toml::Value::Boolean(engine == "native-nvme"),
+                ),
+                (
+                    "group_commit_delay_microseconds".to_string(),
+                    toml::Value::Integer(0),
+                ),
+                (
+                    "group_commit_max_requests".to_string(),
+                    toml::Value::Integer(64),
+                ),
+                (
+                    "compaction_dead_percent".to_string(),
+                    toml::Value::Integer(50),
+                ),
+            ])),
+        );
+        if erasure_transfer_plan != "not-applicable" {
+            let root_table = config
+                .as_table_mut()
+                .context("benchmark node config is not a TOML table")?;
+            if let Some(erasure) = root_table
+                .get_mut("erasure")
+                .and_then(toml::Value::as_table_mut)
+                .filter(|erasure| {
+                    erasure
+                        .get("enabled")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false)
+                })
+            {
+                let transfer = erasure
+                    .entry("transfer")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .context("benchmark erasure transfer config is not a TOML table")?;
+                transfer.insert(
+                    "strategy".to_string(),
+                    toml::Value::String(erasure_transfer_plan.to_string()),
+                );
+                transfer.insert(
+                    "gateway_capacity_mbps".to_string(),
+                    toml::Value::Integer(i64::try_from(gateway_capacity_mbps)?),
+                );
+            }
+        }
+        if gateway_capacity_mbps > 0 {
+            let network = config
+                .as_table_mut()
+                .context("benchmark node config is not a TOML table")?
+                .entry("network")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .context("benchmark network config is not a TOML table")?;
+            let bulk = network
+                .entry("bulk")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .context("benchmark bulk network config is not a TOML table")?;
+            let bytes_per_second = gateway_capacity_mbps
+                .checked_mul(1_000_000)
+                .context("gateway capacity overflow")?
+                / 8;
+            bulk.insert(
+                "max_bytes_per_second".to_string(),
+                toml::Value::Integer(i64::try_from(bytes_per_second)?),
+            );
+        }
+        let generated = target.join(entry.file_name());
+        fs::write(&generated, toml::to_string_pretty(&config)?)?;
+        fs::set_permissions(generated, fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn docker(root: &Path) -> Command {
     let mut command = Command::new("docker");
     command
         .env("PEPPER_BENCH_ROOT", root)
+        .env("PEPPER_BENCH_CONFIG_DIR", root.join(".runtime-config"))
         .args(["compose", "-f"])
         .arg(compose());
     command
@@ -272,6 +550,27 @@ fn payload_profiles(selected: &Option<String>, defaults: &[String]) -> Result<Ve
         );
     }
     Ok(profiles)
+}
+
+fn erasure_transfer_plans(selected: &Option<String>, defaults: &[String]) -> Result<Vec<String>> {
+    let plans = selected.as_ref().map_or_else(
+        || defaults.to_vec(),
+        |selected| selected.split(',').map(str::to_string).collect(),
+    );
+    ensure!(
+        !plans.is_empty(),
+        "at least one erasure transfer plan is required"
+    );
+    for plan in &plans {
+        ensure!(
+            matches!(
+                plan.as_str(),
+                "adaptive" | "gateway-fanout" | "distributed-parity" | "hierarchical" | "pipelined"
+            ),
+            "unknown erasure transfer plan: {plan}"
+        );
+    }
+    Ok(plans)
 }
 
 fn filter_numbers<T>(selected: &Option<String>, all: &[T]) -> Result<Vec<T>>
@@ -389,6 +688,48 @@ pub(crate) fn topology_services(topology: &str) -> Vec<&'static str> {
     }
 }
 
+fn regular_file_count(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut pending = vec![path.to_path_buf()];
+    let mut count = 0u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn storage_file_count(root: &Path, topology: &str) -> Result<u64> {
+    if topology == "raw" {
+        return regular_file_count(&root.join("raw"));
+    }
+    topology_services(topology)
+        .into_iter()
+        .try_fold(0u64, |total, service| {
+            let output = run_command(docker(root).args([
+                "exec",
+                "-T",
+                "--user",
+                "0",
+                service,
+                "sh",
+                "-c",
+                "find /var/lib/pepper -type f -print | wc -l",
+            ]))?;
+            let count = String::from_utf8(output.stdout)?.trim().parse::<u64>()?;
+            Ok(total.saturating_add(count))
+        })
+}
+
 async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
     Ok(client
         .get(url)
@@ -498,6 +839,41 @@ pub(crate) async fn wait_quorum(client: &reqwest::Client, endpoints: &[String]) 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     bail!("namespace quorum did not remain stable for three samples")
+}
+
+async fn settle_small_object_pack(client: &reqwest::Client, endpoints: &[String]) -> Result<()> {
+    ensure!(
+        !endpoints.is_empty(),
+        "small-object pack requires an endpoint"
+    );
+    let mut last_error = String::new();
+    for attempt in 0..128usize {
+        let endpoint = &endpoints[attempt % endpoints.len()];
+        match client
+            .post(format!(
+                "{endpoint}/v1/admin/s3/buckets/{BENCHMARK_BUCKET}/pack"
+            ))
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let report = response.json::<Value>().await?;
+                let transitioned = report["records_transitioned"].as_u64().unwrap_or(0);
+                if transitioned == 0 {
+                    return Ok(());
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_error = format!("{status}: {body}");
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("small-object packing did not settle: {last_error}")
 }
 
 pub(crate) fn stop_topology(root: &Path) {
@@ -999,29 +1375,78 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     let concurrencies = filter_numbers(&args.concurrency, &matrix.concurrency)?;
     let routings = filter_strings(&args.routing, &matrix.routing)?;
     let topologies = filter_strings(&args.topologies, &matrix.topologies)?;
+    let mut storage_engine_choices = matrix.storage_engines.clone();
+    if args
+        .storage_engines
+        .as_deref()
+        .is_some_and(|selected| selected.split(',').any(|engine| engine == "files-direct"))
+    {
+        storage_engine_choices.push("files-direct".to_string());
+    }
+    let storage_engines = filter_strings(&args.storage_engines, &storage_engine_choices)?;
     let operations = filter_strings(&args.operations, &matrix.operations)?;
     let payload_profiles = payload_profiles(&args.payload_profiles, &matrix.payload_profiles)?;
+    let erasure_transfer_plans =
+        erasure_transfer_plans(&args.erasure_transfer_plans, &matrix.erasure_transfer_plans)?;
+    let gateway_capacities_mbps = filter_numbers(
+        &args.gateway_capacities_mbps,
+        &matrix.gateway_capacities_mbps,
+    )?;
     let cold_bytes = if args.cold_bytes == 0 {
         (mem_total()? as f64 * matrix.cold_dataset_memory_ratio) as u64
     } else {
         args.cold_bytes
     };
     let mut cells = Vec::new();
-    for topology in &topologies {
-        for size in &sizes {
-            for concurrency in &concurrencies {
-                for routing in &routings {
-                    for operation in &operations {
-                        for payload_profile in &payload_profiles {
-                            if topology != "raw" || routing == "leader" {
-                                cells.push(Cell {
-                                    topology: topology.clone(),
-                                    size: *size,
-                                    concurrency: *concurrency,
-                                    routing: routing.clone(),
-                                    operation: operation.clone(),
-                                    payload_profile: payload_profile.clone(),
-                                });
+    for storage_engine in &storage_engines {
+        for topology in &topologies {
+            // The raw topology is a direct local-filesystem ceiling and has
+            // no Pepper engine. Include it once even when comparing engines.
+            if topology == "raw" && storage_engine != &storage_engines[0] {
+                continue;
+            }
+            let topology_plans = if topology == "nine-ec" {
+                erasure_transfer_plans.clone()
+            } else {
+                vec!["not-applicable".to_string()]
+            };
+            for erasure_transfer_plan in &topology_plans {
+                // Apply the same physical link shape to both adaptive and
+                // forced plans. Otherwise a forced-plan comparison silently
+                // removes the bottleneck that the adaptive selector is meant
+                // to respond to and cannot establish whether its choice was
+                // actually better.
+                let plan_capacities = if topology == "nine-ec" {
+                    gateway_capacities_mbps.clone()
+                } else {
+                    vec![0]
+                };
+                for gateway_capacity_mbps in &plan_capacities {
+                    for size in &sizes {
+                        for concurrency in &concurrencies {
+                            for routing in &routings {
+                                for operation in &operations {
+                                    for payload_profile in &payload_profiles {
+                                        if topology != "raw" || routing == "leader" {
+                                            cells.push(Cell {
+                                                topology: topology.clone(),
+                                                storage_engine: if topology == "raw" {
+                                                    "raw-local".to_string()
+                                                } else {
+                                                    storage_engine.clone()
+                                                },
+                                                size: *size,
+                                                concurrency: *concurrency,
+                                                routing: routing.clone(),
+                                                operation: operation.clone(),
+                                                payload_profile: payload_profile.clone(),
+                                                erasure_transfer_plan: erasure_transfer_plan
+                                                    .clone(),
+                                                gateway_capacity_mbps: *gateway_capacity_mbps,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1095,7 +1520,10 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
         "restart_leader_at_seconds": args.restart_leader_at_seconds,
         "leader_outage_seconds": args.leader_outage_seconds,
         "matrix": {"object_sizes": sizes, "concurrency": concurrencies, "routing": routings,
-            "topologies": topologies, "operations": operations, "payload_profiles": payload_profiles}});
+            "topologies": topologies, "storage_engines": storage_engines,
+            "operations": operations, "payload_profiles": payload_profiles,
+            "erasure_transfer_plans": erasure_transfer_plans,
+            "gateway_capacities_mbps": gateway_capacities_mbps}});
     fs::write(
         artifacts.join("manifest.json"),
         serde_json::to_string_pretty(&manifest)? + "\n",
@@ -1113,36 +1541,76 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
     let max_concurrency = concurrencies.iter().copied().max().unwrap_or(1) as u64;
     let mut current = String::new();
     let mut prepared = BTreeSet::new();
+    let mut built = BTreeSet::new();
     let result = async {
         for (cell_index, cell) in cells.iter().enumerate() {
-            if cell.topology != current {
+            let target = format!(
+                "{}:{}:{}:{}",
+                cell.storage_engine,
+                cell.topology,
+                cell.erasure_transfer_plan,
+                cell.gateway_capacity_mbps
+            );
+            if target != current {
                 stop_topology(&root);
-                if !args.no_build {
+                if cell.topology != "raw" {
+                    prepare_runtime_configs(
+                        &root,
+                        &cell.storage_engine,
+                        &cell.erasure_transfer_plan,
+                        cell.gateway_capacity_mbps,
+                    )?;
+                }
+                if !args.no_build && built.insert(cell.topology.clone()) {
                     build_topology(&cell.topology, &root)?;
                 }
-                if args.fresh {
+                let engine_marker = root.join(format!(".storage-engine-{}", cell.topology));
+                let engine_changed = cell.topology != "raw"
+                    && fs::read_to_string(&engine_marker)
+                        .map(|value| {
+                            value.trim()
+                                != format!(
+                                    "{}:{}:{}",
+                                    cell.storage_engine,
+                                    cell.erasure_transfer_plan,
+                                    cell.gateway_capacity_mbps
+                                )
+                        })
+                        .unwrap_or(true);
+                if args.fresh || engine_changed {
                     reset_data(&cell.topology, &root)?;
                     for entry in fs::read_dir(&prepared_root)? {
                         let path = entry?.path();
-                        if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&format!("{}-", cell.topology))) { fs::remove_file(path)?; }
+                        if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&format!("{}-{}-", cell.storage_engine, cell.topology))) { fs::remove_file(path)?; }
                     }
                 } else if args.clear_reconstructed_cache {
                     clear_reconstructed_cache(&cell.topology, &root)?;
                 }
+                if cell.topology != "raw" {
+                    fs::write(
+                        &engine_marker,
+                        format!(
+                            "{}:{}:{}\n",
+                            cell.storage_engine,
+                            cell.erasure_transfer_plan,
+                            cell.gateway_capacity_mbps
+                        ),
+                    )?;
+                }
                 start_topology(&client, &cell.topology, &root).await?;
-                current.clone_from(&cell.topology);
+                current = target;
                 if cell.topology != "raw" {
                     let endpoints = topology_endpoints(&cell.topology); ensure_bucket(&endpoints)?; wait_quorum(&client, &endpoints).await?;
                 }
             }
-            let cell_id = format!("{}-s{}-c{}-{}-{}-{}", cell.topology, cell.size, cell.concurrency, cell.routing, cell.operation, cell.payload_profile);
+            let cell_id = format!("{}-{}-{}-gw{}-s{}-c{}-{}-{}-{}", cell.storage_engine, cell.topology, cell.erasure_transfer_plan, cell.gateway_capacity_mbps, cell.size, cell.concurrency, cell.routing, cell.operation, cell.payload_profile);
             let output = artifacts.join("cells").join(format!("{cell_id}.json"));
             if output.exists() { println!("[{}/{}] resume: {cell_id}", cell_index + 1, cells.len()); continue; }
             let object_count = max_concurrency.max(cold_bytes.div_ceil(cell.size));
             let needs_data = matches!(cell.operation.as_str(), "get" | "range-get" | "head" | "list" | "mixed");
-            let marker = prepared_root.join(format!("{}-{}-{}-{object_count}", cell.topology, cell.size, cell.payload_profile));
-            if marker.exists() { prepared.insert((cell.topology.clone(), cell.size, cell.payload_profile.clone())); }
-            if needs_data && !prepared.contains(&(cell.topology.clone(), cell.size, cell.payload_profile.clone())) {
+            let marker = prepared_root.join(format!("{}-{}-{}-{}-{}-{}-{object_count}", cell.storage_engine, cell.topology, cell.erasure_transfer_plan, cell.gateway_capacity_mbps, cell.size, cell.payload_profile));
+            if marker.exists() { prepared.insert((cell.storage_engine.clone(), cell.topology.clone(), cell.erasure_transfer_plan.clone(), cell.gateway_capacity_mbps, cell.size, cell.payload_profile.clone())); }
+            if needs_data && !prepared.contains(&(cell.storage_engine.clone(), cell.topology.clone(), cell.erasure_transfer_plan.clone(), cell.gateway_capacity_mbps, cell.size, cell.payload_profile.clone())) {
                 println!("[{}/{}] preload {} size={} objects={object_count}", cell_index + 1, cells.len(), cell.topology, cell.size);
                 let mut command = loadgen_command()?;
                 command.args(["--backend", if cell.topology == "raw" { "raw" } else { "s3" }, "--operation", "put",
@@ -1152,8 +1620,15 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
                 if cell.topology == "raw" { command.args(["--raw-root"]).arg(root.join("raw")); }
                 else { command.args(["--endpoints", &topology_endpoints(&cell.topology).join(",")]); }
                 run_command(&mut command)?;
-                prepared.insert((cell.topology.clone(), cell.size, cell.payload_profile.clone()));
-                fs::write(marker, serde_json::to_vec(&json!({"topology": cell.topology, "size": cell.size, "objects": object_count}))?)?;
+                prepared.insert((cell.storage_engine.clone(), cell.topology.clone(), cell.erasure_transfer_plan.clone(), cell.gateway_capacity_mbps, cell.size, cell.payload_profile.clone()));
+                fs::write(marker, serde_json::to_vec(&json!({"storage_engine": cell.storage_engine, "topology": cell.topology, "erasure_transfer_plan": cell.erasure_transfer_plan, "gateway_capacity_mbps": cell.gateway_capacity_mbps, "size": cell.size, "objects": object_count}))?)?;
+            }
+            if needs_data
+                && cell.topology != "raw"
+                && cell.storage_engine != "files-direct"
+                && cell.size <= BENCHMARK_SMALL_OBJECT_MAX_BYTES
+            {
+                settle_small_object_pack(&client, &topology_endpoints(&cell.topology)).await?;
             }
             let endpoints = routed_endpoints(&client, &cell.topology, &cell.routing, &topology_endpoints(&cell.topology)).await;
             let loadgen_output = output.with_extension("loadgen.json");
@@ -1172,6 +1647,7 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             let metrics_endpoints = topology_endpoints(&cell.topology);
             let (metrics_before, raw_before) = scrape(&client, &metrics_endpoints).await;
             let disk_before = block_stats(&root)?;
+            let storage_files_before = storage_file_count(&root, &cell.topology)?;
             let cpu_before = host_cpu()?; let ticks_before = proc_ticks(&pids);
             println!("[{}/{}] run {cell_id}", cell_index + 1, cells.len());
             let started = Instant::now();
@@ -1219,6 +1695,7 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
             }
             let elapsed = started.elapsed().as_secs_f64();
             let cpu_after = host_cpu()?; let ticks_after = proc_ticks(&pids); let disk_after = block_stats(&root)?;
+            let storage_files_after = storage_file_count(&root, &cell.topology)?;
             let (metrics_after, raw_after) = scrape(&client, &metrics_endpoints).await;
             let mut report: Value = serde_json::from_slice(&fs::read(&loadgen_output)?)?;
             let logical = report["results"]["logical_bytes"].as_u64().unwrap_or(0);
@@ -1235,10 +1712,13 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
                 phase_averages.insert((*phase).to_string(), if count > 0.0 { json!(duration / count) } else { Value::Null });
             }
             let qd = nearest_qd(cell.concurrency); let fio_rate = fio.get(&format!("durable_qd{qd}")).copied().unwrap_or(0.0);
-            report["matrix"] = json!({"topology": cell.topology, "routing": cell.routing, "cell_id": cell_id});
+            report["matrix"] = json!({"topology": cell.topology, "storage_engine": cell.storage_engine, "erasure_transfer_plan": cell.erasure_transfer_plan, "gateway_capacity_mbps": cell.gateway_capacity_mbps, "routing": cell.routing, "cell_id": cell_id});
             report["telemetry"] = json!({"block_devices": disk_before.keys().collect::<Vec<_>>(),
                 "host_cpu_percent": if total > 0 { 100.0 * (total - idle) as f64 / total as f64 } else { 0.0 },
                 "pepper_cpu_cores": ticks_after.saturating_sub(ticks_before) as f64 / tick_rate / elapsed,
+                "storage_files_before": storage_files_before,
+                "storage_files_after": storage_files_after,
+                "storage_files_delta": i128::from(storage_files_after) - i128::from(storage_files_before),
                 "disk": disk, "write_amplification": if logical > 0 { Some(physical_write_bytes as f64 / logical as f64) } else { None },
                 "raft_term_changes": samples.last().map_or(0, |sample| sample.term_changes),
                 "raft_term_increments": raft_term_increments(&metrics_before, &metrics_after),

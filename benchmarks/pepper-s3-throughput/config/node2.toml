@@ -11,7 +11,8 @@ path = "/var/lib/pepper/metadata"
 key_path = "/var/lib/pepper/identity/node.key"
 generate_if_missing = true
 [api]
-bind_addr = "127.0.0.1:9080"
+bind_addr = "0.0.0.0:9080"
+allow_insecure_remote = true
 [auth]
 cluster_secret_path = "/var/lib/pepper/identity/cluster.secret"
 [[storage.locations]]
@@ -27,7 +28,7 @@ election_timeout_min_ms = 3000
 election_timeout_max_ms = 6000
 [replication]
 default_factor = 3
-repair_interval_seconds = 3600
+repair_interval_seconds = 30
 [compute]
 enabled = false
 runtime = "firecracker"
@@ -39,6 +40,17 @@ region = "us-east-1"
 access_key_id = "pepper-benchmark"
 secret_access_key_path = "/var/lib/pepper/identity/s3.secret"
 max_clock_skew_seconds = 900
+bucket_partitions = 16
+[fast_path]
+workers = 8
+control_cores = 2
+queue_depth = 256
+requests_per_worker = 128
+writes_per_worker = 4
+replications_per_worker = 8
+stripe_reads_per_worker = 32
+response_frames = 8
+pin_cpus = false
 [limits]
 max_block_bytes = 67108864
 max_object_bytes = 5368709120

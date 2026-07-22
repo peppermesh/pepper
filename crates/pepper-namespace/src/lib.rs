@@ -233,6 +233,13 @@ pub enum KeyPrecondition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NamespaceMutation {
+    /// Verify a key at the transaction's linearization point without changing it.
+    /// This is used by higher-level protocols to fence a data mutation against
+    /// a separately committed routing epoch.
+    Assert {
+        key_hex: String,
+        precondition: KeyPrecondition,
+    },
     Put {
         key_hex: String,
         value_cid: Cid,
@@ -250,14 +257,18 @@ pub enum NamespaceMutation {
 impl NamespaceMutation {
     fn key(&self) -> Result<Vec<u8>, NamespaceError> {
         let key_hex = match self {
-            Self::Put { key_hex, .. } | Self::Delete { key_hex, .. } => key_hex,
+            Self::Assert { key_hex, .. }
+            | Self::Put { key_hex, .. }
+            | Self::Delete { key_hex, .. } => key_hex,
         };
         hex::decode(key_hex).map_err(|error| NamespaceError::InvalidMutation(error.to_string()))
     }
 
     fn precondition(&self) -> &KeyPrecondition {
         match self {
-            Self::Put { precondition, .. } | Self::Delete { precondition, .. } => precondition,
+            Self::Assert { precondition, .. }
+            | Self::Put { precondition, .. }
+            | Self::Delete { precondition, .. } => precondition,
         }
     }
 }
@@ -950,6 +961,7 @@ where
             pepper_merkle::get(store, &state.current_root_cid, &key, merkle_limits).await?;
         check_precondition(&key, current.as_ref(), mutation.precondition())?;
         match mutation {
+            NamespaceMutation::Assert { .. } => {}
             NamespaceMutation::Put {
                 value_cid,
                 value_kind,
@@ -1412,6 +1424,9 @@ fn idempotency_fingerprint(
     #[derive(Serialize)]
     #[serde(tag = "op", rename_all = "snake_case")]
     enum IntentMutation<'a> {
+        Assert {
+            key_hex: &'a str,
+        },
         Put {
             key_hex: &'a str,
             value_cid: &'a Cid,
@@ -1455,6 +1470,7 @@ fn idempotency_fingerprint(
                 .mutations
                 .iter()
                 .map(|mutation| match mutation {
+                    NamespaceMutation::Assert { key_hex, .. } => IntentMutation::Assert { key_hex },
                     NamespaceMutation::Put {
                         key_hex,
                         value_cid,
@@ -1919,6 +1935,93 @@ mod tests {
         .await
         .unwrap();
         NamespaceStateMachine::new(store, created.state).unwrap()
+    }
+
+    #[tokio::test]
+    async fn assertions_fence_a_mutation_without_changing_the_asserted_key() {
+        let mut machine = machine().await;
+        machine
+            .apply(put_command(
+                machine.state(),
+                "fence-1",
+                "z-fence",
+                "epoch-1",
+                KeyPrecondition::Absent,
+                2,
+            ))
+            .await
+            .unwrap();
+        let fence = machine.get(None, b"z-fence").await.unwrap().unwrap();
+        let command = CommandEnvelope {
+            request_id: "fenced-write".to_string(),
+            writer_identity: "writer".to_string(),
+            timestamp_unix_seconds: 3,
+            signature_hex: "00".to_string(),
+            command: NamespaceCommand::ApplyTransaction {
+                transaction: TransactionCommand {
+                    base_revision: machine.state().current_revision,
+                    base_root_cid: machine.state().current_root_cid.clone(),
+                    mutations: vec![
+                        NamespaceMutation::Put {
+                            key_hex: hex::encode("a-object"),
+                            value_cid: Cid::new(CODEC_RAW, b"value"),
+                            value_kind: "raw".to_string(),
+                            metadata: BTreeMap::new(),
+                            precondition: KeyPrecondition::Absent,
+                        },
+                        NamespaceMutation::Assert {
+                            key_hex: hex::encode("z-fence"),
+                            precondition: KeyPrecondition::Match {
+                                generation: fence.generation,
+                                cid: fence.cid.clone(),
+                            },
+                        },
+                    ],
+                    message: None,
+                },
+            },
+        };
+        machine.apply(command).await.unwrap();
+        let unchanged = machine.get(None, b"z-fence").await.unwrap().unwrap();
+        assert_eq!(unchanged, fence);
+
+        machine
+            .apply(put_command(
+                machine.state(),
+                "fence-2",
+                "z-fence",
+                "epoch-2",
+                KeyPrecondition::Match {
+                    generation: fence.generation,
+                    cid: fence.cid.clone(),
+                },
+                4,
+            ))
+            .await
+            .unwrap();
+        let mut stale = put_command(
+            machine.state(),
+            "stale-fenced-write",
+            "a-second",
+            "value",
+            KeyPrecondition::Absent,
+            5,
+        );
+        let NamespaceCommand::ApplyTransaction { transaction } = &mut stale.command else {
+            unreachable!();
+        };
+        transaction.mutations.push(NamespaceMutation::Assert {
+            key_hex: hex::encode("z-fence"),
+            precondition: KeyPrecondition::Match {
+                generation: fence.generation,
+                cid: fence.cid,
+            },
+        });
+        assert!(matches!(
+            machine.apply(stale).await,
+            Err(NamespaceError::GenerationConflict(_))
+        ));
+        assert!(machine.get(None, b"a-second").await.unwrap().is_none());
     }
 
     fn put_command(

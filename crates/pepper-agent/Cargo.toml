@@ -25,6 +25,7 @@ futures-util = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+libc = { workspace = true }
 md5 = { workspace = true }
 memmap2 = { workspace = true }
 multer = { workspace = true }

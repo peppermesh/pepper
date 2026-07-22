@@ -43,6 +43,7 @@ message NodeDescriptor {
   uint64 namespace_group_count = 13;
   uint64 max_consensus_log_bytes = 14;
   uint64 max_namespace_write_rate = 15;
+  repeated string bulk_addresses = 16;
 }
 
 message HandshakeRequest {
@@ -76,6 +77,7 @@ message PeerInfo {
   uint64 namespace_group_count = 12;
   uint64 max_consensus_log_bytes = 13;
   uint64 max_namespace_write_rate = 14;
+  repeated string bulk_addresses = 15;
 }
 
 message ListPeersResponse {
@@ -90,6 +92,14 @@ message BlockHasResponse {
   bool has = 1;
 }
 
+message BlockHasBatchRequest {
+  repeated string cids = 1;
+}
+
+message BlockHasBatchResponse {
+  repeated bool present = 1;
+}
+
 message BlockGetRequest {
   string cid = 1;
 }
@@ -98,6 +108,28 @@ message BlockGetResponse {
   string cid = 1;
   string codec = 2;
   bytes payload = 3;
+}
+
+// Metadata for a block whose raw bytes follow the signed response envelope on
+// the dedicated bulk stream. Large data is never nested in protobuf.
+message BlockGetStreamResponse {
+  string cid = 1;
+  uint64 size = 2;
+}
+
+message BlockGetRangeRequest {
+  string cid = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+}
+
+// Metadata for an exact [start, end) block range whose raw bytes follow the
+// signed response envelope on the dedicated bulk stream.
+message BlockGetRangeStreamResponse {
+  string cid = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  uint64 size = 4;
 }
 
 message RelayBlockGetRequest {
@@ -133,6 +165,80 @@ message BlockPutReplicaResponse {
   uint64 size = 3;
   bool already_existed = 4;
   string provider_record_json = 5;
+}
+
+// One immutable OPT-8 destination in an adaptive erasure transfer graph.
+message ErasureTransferShard {
+  uint32 index = 1;
+  string cid = 2;
+  string node_id = 3;
+  uint64 size = 4;
+}
+
+message ErasurePipelineHop {
+  uint32 index = 1;
+  string node_id = 2;
+}
+
+// The encoded (optionally compressed) stripe follows this request envelope
+// only for /erasure/store_stripe_stream. Distributed parity sends this same
+// metadata without bytes after first durably placing every systematic shard.
+message ErasureTransferRequest {
+  string logical_cid = 1;
+  uint64 placement_epoch = 2;
+  uint32 data_shards = 3;
+  uint32 parity_shards = 4;
+  uint64 encoded_size = 5;
+  uint64 shard_size = 6;
+  repeated string data_cids = 7;
+  repeated ErasurePipelineHop pipeline = 8;
+  string plan = 9;
+  uint64 logical_size = 10;
+  string encoding = 11;
+  repeated uint32 completed_indices = 12;
+  // CID of the exact raw encoded bytes following the streamed request. This
+  // lets every authenticated hop verify compressed stripes without expanding
+  // them merely to forward or place systematic shards.
+  string encoded_cid = 13;
+}
+
+message ErasureTransferResponse {
+  repeated ErasureTransferShard shards = 1;
+  string executor_node_id = 2;
+  // Physical payload bytes emitted after gateway ingress by this transfer
+  // subtree. Bytes are counted once at the sender.
+  uint64 internal_bytes = 3;
+  uint64 cross_domain_bytes = 4;
+}
+
+// Small authenticated control-plane message. Inventory records contain only
+// immutable CIDs and placement references; repair payload bytes remain on the
+// dedicated bulk plane.
+message RepairInventoryPushRequest {
+  string inventory_json = 1;
+}
+
+message RepairInventoryPushResponse {
+  bool accepted = 1;
+}
+
+message RepairExecuteRequest {
+  string task_json = 1;
+}
+
+message RepairExecuteResponse {
+  bool repaired = 1;
+  bool already_healthy = 2;
+  uint64 verified_bytes = 3;
+  repeated string source_node_ids = 4;
+}
+
+message RepairCleanupExtraRequest {
+  string exception_json = 1;
+}
+
+message RepairCleanupExtraResponse {
+  bool removed = 1;
 }
 
 message BlockProvidersRequest {

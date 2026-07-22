@@ -3,6 +3,8 @@
 [node]
 name = "node-1"
 listen_addr = "127.0.0.1:9001"
+bulk_listen_addr = "127.0.0.1:9101"
+bulk_advertise_addr = "127.0.0.1:9101"
 failure_domain = "rack-a"
 
 [node.placement_labels]
@@ -20,6 +22,16 @@ generate_if_missing = true
 
 [api]
 bind_addr = "127.0.0.1:9080"
+
+[storage.small_object_pack]
+enabled = true
+max_object_bytes = 4096
+segment_bytes = 67108864
+owners = 8
+io_uring_entries = 256
+group_commit_delay_microseconds = 200
+group_commit_max_requests = 256
+compaction_dead_percent = 50
 
 [[storage.locations]]
 path = "./dev/node1-storage"

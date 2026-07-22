@@ -566,7 +566,7 @@ fn estimate_cid_locality(
     }
     let has_local = state.block_store.has(cid).unwrap_or(false);
     match cid.codec {
-        CODEC_RAW => {
+        CODEC_RAW | CODEC_SMALL_OBJECT => {
             let size = state
                 .block_store
                 .stat(cid)
@@ -1896,7 +1896,9 @@ fn firecracker_vsock_request(
 async fn rootfs_image_bytes(state: &AppState, cid: &Cid) -> Result<Vec<u8>, ApiError> {
     match cid.codec {
         CODEC_RAW => Ok(get_block_resolved(state, cid).await?.payload),
-        CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => object_bytes(state, cid).await,
+        CODEC_SMALL_OBJECT | CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => {
+            object_bytes(state, cid).await
+        }
         _ => Err(ApiError::bad_request(
             "firecracker rootfs_cid must be raw, object, or erasure object data",
         )),
@@ -2669,7 +2671,7 @@ async fn logical_cid_size(state: &AppState, root: &Cid) -> Result<u64, ApiError>
             ));
         }
         match cid.codec {
-            CODEC_RAW => {
+            CODEC_RAW | CODEC_SMALL_OBJECT => {
                 let block = get_block_resolved(state, &cid).await?;
                 total = total
                     .checked_add(block.size)
@@ -2713,7 +2715,7 @@ async fn materialize_cid_to_path(
 ) -> Result<(), ApiError> {
     match cid.codec {
         CODEC_DIR_MANIFEST => restore_dir_manifest(state, cid, path).await,
-        CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => {
+        CODEC_SMALL_OBJECT | CODEC_OBJECT_MANIFEST | CODEC_ERASURE_MANIFEST => {
             let bytes = object_bytes(state, cid).await?;
             write_bytes(path, &bytes)
         }

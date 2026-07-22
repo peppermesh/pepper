@@ -34,6 +34,7 @@ homepage = "https://peppermesh.org"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.8"
 base64 = "0.22"
@@ -43,6 +44,8 @@ ed25519-dalek = "3.0"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
+libc = "0.2"
+io-uring = "0.7.13"
 crc32c = "0.6"
 crc32fast = "1.5"
 openraft = { version = "0.9.21", features = ["serde", "storage-v2"] }

@@ -4,16 +4,42 @@
 
 use super::*;
 use pepper_bucket::{
-    BucketLimits, BucketObjectDescriptor, encode_descriptor, get_descriptor, put_descriptor,
-    versions,
+    BucketLimits, BucketObjectDescriptor, decode_descriptor, encode_descriptor, versions,
 };
 use pepper_merkle::{MerkleLimits, ScanQuery};
 use pepper_namespace::{
-    CommandEnvelope, NamespaceCommand, NamespaceKind, NamespaceMutation, NamespaceStateMachine,
-    TransactionCommand,
+    CommandEnvelope, KeyPrecondition, NamespaceCommand, NamespaceKind, NamespaceMutation,
+    NamespaceStateMachine, TransactionCommand,
 };
 use pepper_types::CODEC_BUCKET_OBJECT;
 use serde::Deserialize;
+
+pub(super) const BUCKET_DESCRIPTOR_PLACEMENT_METADATA: &str = "placement";
+
+pub(super) fn placement_from_merkle_value(
+    value: &pepper_merkle::MerkleValue,
+) -> Result<PlacementReference, ApiError> {
+    let encoded = value
+        .metadata
+        .get(BUCKET_DESCRIPTOR_PLACEMENT_METADATA)
+        .ok_or_else(|| ApiError::bad_request("bucket descriptor placement is missing"))?;
+    let placement: PlacementReference = serde_json::from_str(encoded).map_err(ApiError::serde)?;
+    if placement.seed != value.cid || placement.validate().is_err() {
+        return Err(ApiError::bad_request(
+            "bucket descriptor placement does not match descriptor CID",
+        ));
+    }
+    Ok(placement)
+}
+
+pub(super) async fn descriptor_from_merkle_value(
+    state: &AppState,
+    value: &pepper_merkle::MerkleValue,
+) -> Result<BucketObjectDescriptor, ApiError> {
+    let placement = placement_from_merkle_value(value)?;
+    let block = get_block_at_placement(state, &value.cid, &placement).await?;
+    decode_descriptor(&block.payload, BucketLimits::default()).map_err(bucket_error)
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BucketCreateRequest {
@@ -25,6 +51,7 @@ pub(super) struct BucketPutRequest {
     pub(super) bucket: String,
     pub(super) key_hex: String,
     pub(super) content_cid: Cid,
+    pub(super) content_placement: Option<PlacementReference>,
     pub(super) logical_size: u64,
     #[serde(default = "default_content_type")]
     pub(super) content_type: String,
@@ -35,6 +62,8 @@ pub(super) struct BucketPutRequest {
     pub(super) request_id: String,
     #[serde(skip)]
     pub(super) preverified_durability: Vec<DurabilityReceipt>,
+    #[serde(skip)]
+    pub(super) partition_fence: Option<PartitionFence>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +80,14 @@ pub(super) struct BucketDeleteRequest {
     pub(super) if_generation: Option<u64>,
     pub(super) if_cid: Option<Cid>,
     pub(super) request_id: String,
+    #[serde(skip)]
+    pub(super) partition_fence: Option<PartitionFence>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PartitionFence {
+    pub(super) generation: u64,
+    pub(super) cid: Cid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,19 +138,73 @@ pub(super) async fn bucket_put(
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
+    let namespace_store = super::s3_api::direct_namespace_store(&state, &base).await;
     let current = pepper_merkle::get(
-        &state.namespace_data_store,
+        &namespace_store,
         &base.current_root_cid,
         &key,
         MerkleLimits::default(),
     )
     .await
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let previous_content_cid = match current.as_ref() {
+        Some(value) => {
+            descriptor_from_merkle_value(&state, value)
+                .await?
+                .content_cid
+        }
+        None => None,
+    };
     let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
-    let previous = current.map(|value| value.cid);
+    let previous = current.as_ref().map(|value| value.cid.clone());
+    let previous_placement = current
+        .as_ref()
+        .map(placement_from_merkle_value)
+        .transpose()?;
     let committed_at_unix_seconds = unix_seconds();
+    let content_placement = request
+        .content_placement
+        .clone()
+        .or_else(|| {
+            request
+                .preverified_durability
+                .iter()
+                .find(|receipt| receipt.cid == request.content_cid)
+                .and_then(|receipt| receipt.placement.clone())
+        })
+        .or_else(|| {
+            state.placement.current_map().map(|map| {
+                PlacementReference::replicated(
+                    map.epoch,
+                    request.content_cid.clone(),
+                    state.replication_factor as u16,
+                )
+            })
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                "authoritative placement map is not loaded",
+            )
+        })?;
+    if request
+        .preverified_durability
+        .iter()
+        .find(|receipt| receipt.cid == request.content_cid)
+        .is_some_and(|receipt| receipt.placement.as_ref() != Some(&content_placement))
+    {
+        return Err(ApiError::bad_request(
+            "content placement does not match its durability receipt",
+        ));
+    }
+    let content = PlacedCid::new(request.content_cid.clone(), content_placement)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let previous = previous
+        .zip(previous_placement)
+        .map(|(cid, placement)| PlacedCid { cid, placement });
     let descriptor = BucketObjectDescriptor::object(
-        request.content_cid.clone(),
+        content,
         request.logical_size,
         request.content_type,
         request.metadata,
@@ -126,6 +217,77 @@ pub(super) async fn bucket_put(
     let descriptor_receipt =
         put_replicated_block(&state, CODEC_BUCKET_OBJECT, descriptor_bytes).await?;
     let descriptor_cid = descriptor_receipt.cid.clone();
+    let descriptor_placement = descriptor_receipt.placement.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "bucket descriptor was stored without authoritative placement",
+        )
+    })?;
+    let mut descriptor_metadata = BTreeMap::new();
+    descriptor_metadata.insert(
+        BUCKET_DESCRIPTOR_PLACEMENT_METADATA.to_string(),
+        serde_json::to_string(&descriptor_placement).map_err(ApiError::serde)?,
+    );
+    let mut mutations = vec![NamespaceMutation::Put {
+        key_hex: request.key_hex,
+        value_cid: descriptor_cid.clone(),
+        value_kind: "bucket_object".to_string(),
+        metadata: descriptor_metadata,
+        precondition,
+    }];
+    mutations.push(repair_inventory_mutation(
+        base.current_revision.saturating_add(1),
+        PlacedCid {
+            cid: descriptor_cid.clone(),
+            placement: descriptor_placement.clone(),
+        },
+        descriptor
+            .content_cid
+            .clone()
+            .zip(descriptor.content_placement.clone())
+            .map(|(cid, placement)| PlacedCid { cid, placement }),
+        descriptor.logical_size,
+        committed_at_unix_seconds,
+    )?);
+    let mut cleanup_durability = Vec::new();
+    if let Some(pending) = small_object_pending_mutation(
+        &state,
+        &base,
+        &key,
+        descriptor
+            .content_cid
+            .as_ref()
+            .expect("object descriptors always contain a content CID"),
+        descriptor
+            .content_placement
+            .as_ref()
+            .expect("object descriptors always bind placement"),
+        descriptor.logical_size,
+    )
+    .await?
+    {
+        mutations.push(pending);
+    }
+    if let Some(previous_content_cid) = previous_content_cid
+        && descriptor.content_cid.as_ref() != Some(&previous_content_cid)
+    {
+        let (cleanup_mutations, receipts) =
+            small_object_marker_cleanup_mutations(&state, &base, &key, &previous_content_cid)
+                .await?;
+        mutations.extend(cleanup_mutations);
+        cleanup_durability.extend(receipts);
+    }
+    if let Some(fence) = request.partition_fence {
+        mutations.push(NamespaceMutation::Assert {
+            key_hex: hex::encode(S3_BUCKET_PARTITION_FENCE_KEY),
+            precondition: KeyPrecondition::Match {
+                generation: fence.generation,
+                cid: fence.cid,
+            },
+        });
+    }
+    sort_bucket_mutations(&mut mutations);
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: "bucket-http".to_string(),
@@ -135,18 +297,42 @@ pub(super) async fn bucket_put(
             transaction: TransactionCommand {
                 base_revision: base.current_revision,
                 base_root_cid: base.current_root_cid,
-                mutations: vec![NamespaceMutation::Put {
-                    key_hex: request.key_hex,
-                    value_cid: descriptor_cid.clone(),
-                    value_kind: "bucket_object".to_string(),
-                    metadata: BTreeMap::new(),
-                    precondition,
-                }],
+                mutations,
                 message: None,
             },
         },
     };
     let mut preverified_durability = request.preverified_durability;
+    preverified_durability.extend(cleanup_durability);
+    if !preverified_durability
+        .iter()
+        .any(|receipt| receipt.cid == request.content_cid)
+    {
+        let content_placement = descriptor
+            .content_placement
+            .as_ref()
+            .expect("object descriptors always bind placement");
+        let required = usize::from(content_placement.replicas);
+        if let Some(receipt) = state
+            .publication_repository
+            .durable_receipt(
+                &request.content_cid,
+                Some(content_placement),
+                required,
+                unix_seconds(),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?
+        {
+            preverified_durability.push(receipt);
+        } else {
+            preverified_durability.push(
+                AgentDurabilityBackend(state.clone())
+                    .ensure_at_placement(&request.content_cid, required, content_placement.clone())
+                    .await
+                    .map_err(publication_error)?,
+            );
+        }
+    }
     preverified_durability.push(descriptor_receipt);
     let mut response = apply_command(
         &state,
@@ -184,13 +370,7 @@ pub(super) async fn bucket_get(
         .await
         .map_err(namespace_error)?
         .ok_or_else(|| ApiError::not_found("bucket key not found"))?;
-    let descriptor = get_descriptor(
-        &state.namespace_data_store,
-        &value.cid,
-        BucketLimits::default(),
-    )
-    .await
-    .map_err(bucket_error)?;
+    let descriptor = descriptor_from_merkle_value(&state, &value).await?;
     if descriptor.tombstone {
         return Err(ApiError::not_found("bucket key is deleted"));
     }
@@ -217,26 +397,95 @@ pub(super) async fn bucket_delete(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_reserved_s3_key_hex(&request.key_hex)?;
     let namespace_id = parse_namespace(&state, &request.bucket)?;
-    let current = current_value(&state, &namespace_id, &request.key_hex).await?;
-    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
-    let previous = current.map(|value| value.cid);
     let base = namespace_manager(&state)?
         .linearizable_namespace_state(&namespace_id)
         .await
         .map_err(consensus_error)?;
+    let key =
+        hex::decode(&request.key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let current = pepper_merkle::get(
+        &super::s3_api::direct_namespace_store(&state, &base).await,
+        &base.current_root_cid,
+        &key,
+        MerkleLimits::default(),
+    )
+    .await
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let previous_content_cid = match current.as_ref() {
+        Some(value) => {
+            descriptor_from_merkle_value(&state, value)
+                .await?
+                .content_cid
+        }
+        None => None,
+    };
+    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
+    let previous = current.as_ref().map(|value| value.cid.clone());
+    let previous_placement = current
+        .as_ref()
+        .map(placement_from_merkle_value)
+        .transpose()?;
     let committed_at_unix_seconds = unix_seconds();
+    let previous = previous
+        .zip(previous_placement)
+        .map(|(cid, placement)| PlacedCid { cid, placement });
     let descriptor = BucketObjectDescriptor::tombstone(
         base.current_revision.saturating_add(1),
         committed_at_unix_seconds,
         previous,
     );
-    let descriptor_cid = put_descriptor(
-        &state.namespace_data_store,
-        &descriptor,
-        BucketLimits::default(),
-    )
-    .await
-    .map_err(bucket_error)?;
+    let descriptor_bytes =
+        encode_descriptor(&descriptor, BucketLimits::default()).map_err(bucket_error)?;
+    let descriptor_receipt =
+        put_replicated_block(&state, CODEC_BUCKET_OBJECT, descriptor_bytes).await?;
+    let descriptor_cid = descriptor_receipt.cid.clone();
+    let descriptor_placement = descriptor_receipt.placement.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            "bucket tombstone was stored without authoritative placement",
+        )
+    })?;
+    let mut descriptor_metadata = BTreeMap::new();
+    descriptor_metadata.insert(
+        BUCKET_DESCRIPTOR_PLACEMENT_METADATA.to_string(),
+        serde_json::to_string(&descriptor_placement).map_err(ApiError::serde)?,
+    );
+    let mut mutations = vec![NamespaceMutation::Put {
+        key_hex: request.key_hex,
+        value_cid: descriptor_cid.clone(),
+        value_kind: "bucket_tombstone".to_string(),
+        metadata: descriptor_metadata,
+        precondition,
+    }];
+    mutations.push(repair_inventory_mutation(
+        base.current_revision.saturating_add(1),
+        PlacedCid {
+            cid: descriptor_cid.clone(),
+            placement: descriptor_placement.clone(),
+        },
+        None,
+        0,
+        committed_at_unix_seconds,
+    )?);
+    let mut cleanup_durability = Vec::new();
+    if let Some(previous_content_cid) = previous_content_cid {
+        let (cleanup_mutations, receipts) =
+            small_object_marker_cleanup_mutations(&state, &base, &key, &previous_content_cid)
+                .await?;
+        mutations.extend(cleanup_mutations);
+        cleanup_durability.extend(receipts);
+    }
+    if let Some(fence) = request.partition_fence {
+        mutations.push(NamespaceMutation::Assert {
+            key_hex: hex::encode(S3_BUCKET_PARTITION_FENCE_KEY),
+            precondition: KeyPrecondition::Match {
+                generation: fence.generation,
+                cid: fence.cid,
+            },
+        });
+    }
+    sort_bucket_mutations(&mut mutations);
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: "bucket-http".to_string(),
@@ -246,13 +495,7 @@ pub(super) async fn bucket_delete(
             transaction: TransactionCommand {
                 base_revision: base.current_revision,
                 base_root_cid: base.current_root_cid,
-                mutations: vec![NamespaceMutation::Put {
-                    key_hex: request.key_hex,
-                    value_cid: descriptor_cid.clone(),
-                    value_kind: "bucket_object".to_string(),
-                    metadata: BTreeMap::new(),
-                    precondition,
-                }],
+                mutations,
                 message: Some("bucket tombstone".to_string()),
             },
         },
@@ -261,8 +504,11 @@ pub(super) async fn bucket_delete(
         &state,
         namespace_id,
         command,
-        Vec::new(),
-        Vec::new(),
+        vec![descriptor_cid.clone()],
+        {
+            cleanup_durability.push(descriptor_receipt);
+            cleanup_durability
+        },
         0,
         false,
     )
@@ -312,7 +558,7 @@ pub(super) async fn bucket_list(
         ));
     }
     let page = pepper_merkle::scan(
-        &state.namespace_data_store,
+        &super::s3_api::direct_namespace_store(&state, &namespace_state).await,
         &root,
         ScanQuery {
             prefix,
@@ -339,13 +585,7 @@ pub(super) async fn bucket_list(
         if entry.key.starts_with(S3_INTERNAL_KEY_PREFIX) {
             continue;
         }
-        let descriptor = get_descriptor(
-            &state.namespace_data_store,
-            &entry.value.cid,
-            BucketLimits::default(),
-        )
-        .await
-        .map_err(bucket_error)?;
+        let descriptor = descriptor_from_merkle_value(&state, &entry.value).await?;
         if request.include_tombstones || !descriptor.tombstone {
             objects.push(serde_json::json!({
                 "key_hex": hex::encode(entry.key),
@@ -399,6 +639,18 @@ fn reject_reserved_s3_key_hex(key_hex: &str) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+fn sort_bucket_mutations(mutations: &mut [NamespaceMutation]) {
+    mutations.sort_by(|left, right| bucket_mutation_key(left).cmp(bucket_mutation_key(right)));
+}
+
+fn bucket_mutation_key(mutation: &NamespaceMutation) -> &str {
+    match mutation {
+        NamespaceMutation::Assert { key_hex, .. }
+        | NamespaceMutation::Put { key_hex, .. }
+        | NamespaceMutation::Delete { key_hex, .. } => key_hex,
+    }
 }
 
 fn bucket_error(error: pepper_bucket::BucketError) -> ApiError {

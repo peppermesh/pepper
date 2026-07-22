@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 use pepper_types::{
-    CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_RAW, Cid, Codec,
-    DirManifest, ErasureManifest, ObjectManifest,
+    CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_RAW,
+    CODEC_SMALL_OBJECT, Cid, Codec, DirManifest, ErasureManifest, ObjectManifest,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -164,6 +164,9 @@ pub fn builtin_registry() -> DagCodecRegistry {
         .register(RawCodecHandler)
         .expect("unique raw codec");
     registry
+        .register(SmallObjectCodecHandler)
+        .expect("unique small-object codec");
+    registry
         .register(ObjectManifestCodecHandler)
         .expect("unique object codec");
     registry
@@ -312,6 +315,22 @@ impl DagCodecHandler for RawCodecHandler {
     }
 }
 
+pub struct SmallObjectCodecHandler;
+
+impl DagCodecHandler for SmallObjectCodecHandler {
+    fn codec(&self) -> Codec {
+        CODEC_SMALL_OBJECT
+    }
+
+    fn requires_payload(&self) -> bool {
+        false
+    }
+
+    fn links(&self, _payload: &[u8], _limits: &TraversalLimits) -> Result<Vec<Cid>, DagError> {
+        Ok(Vec::new())
+    }
+}
+
 pub struct ObjectManifestCodecHandler;
 
 impl DagCodecHandler for ObjectManifestCodecHandler {
@@ -416,11 +435,13 @@ mod tests {
                     offset: 0,
                     size: 1,
                     cid: b.clone(),
+                    placement: pepper_types::PlacementReference::replicated(1, b.clone(), 3),
                 },
                 ObjectChunk {
                     offset: 1,
                     size: 1,
                     cid: a.clone(),
+                    placement: pepper_types::PlacementReference::replicated(1, a.clone(), 3),
                 },
             ],
         );
