@@ -15,6 +15,7 @@ mod phase7;
 mod phase8;
 mod phase9;
 mod pin_gc;
+mod sqlite_suite;
 mod storage_resilience;
 
 pub use backup_suite::{BackupRestoreScenario, BackupValidationScenario};
@@ -41,6 +42,12 @@ pub use phase7::{ContinuousPartitionScenario, LinearizabilityScenario};
 pub use phase8::LearnerReplacementScenario;
 pub use phase9::{KvmFirecrackerScenario, SoakQualificationScenario, WanQualificationScenario};
 pub use pin_gc::{GarbageCollectionScenario, PinDeletionScenario, PinProtectionScenario};
+pub use sqlite_suite::{
+    SqliteBatchAtomicScenario, SqliteCompatibilityScenario, SqliteDurabilityScenario,
+    SqliteImportExportScenario, SqliteLargeTransactionScenario, SqliteLeaderFailoverScenario,
+    SqliteMinorityFencingScenario, SqliteMultiWriterScenario, SqliteReadOnlyMultiIngressScenario,
+    SqliteSoakScenario,
+};
 pub use storage_resilience::{
     CapacityScenario, CorruptionScenario, PlacementScenario, ProviderFallbackScenario,
     RepairScenario,

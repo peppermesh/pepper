@@ -24,12 +24,17 @@ use pepper_dag::BlockResolver;
 use pepper_merkle::{MerkleReadStore, MerkleWriteStore};
 use pepper_metadata::MetadataStore;
 use pepper_namespace::{
-    ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceError, NamespaceId, NamespaceMutation,
-    NamespaceState, NamespaceStateMachine, PinAction, PinIntent, load_checkpoint, write_checkpoint,
+    ApplyResult, CommandEnvelope, CommandResponse, KeyPrecondition, NamespaceCommand,
+    NamespaceError, NamespaceId, NamespaceMutation, NamespaceState, NamespaceStateMachine,
+    PinAction, PinIntent, load_checkpoint, write_checkpoint,
 };
 use pepper_network::{NetworkError, NetworkHandle, NetworkNamespaceService, proto};
 use pepper_placement::{
     ConsensusPlacementNode, select_namespace_replacement, select_namespace_replicas,
+};
+use pepper_sqlite::{
+    AcquisitionStatus, CommitAttempt, GuardedCommitRequest, WriterControlRequest,
+    WriterControlResponse, WriterCoordinator, WriterTicket,
 };
 use pepper_types::{Cid, Codec};
 use redb::{ReadableTable, TableDefinition};
@@ -54,6 +59,57 @@ const PROPOSAL_BATCH_MAX_COMMANDS: usize = 32;
 const PROPOSAL_BATCH_MAX_DELAY: Duration = Duration::from_micros(250);
 const PROPOSAL_BATCH_CHANNEL_CAPACITY: usize = 256;
 const INITIAL_MEMBERSHIP_EPOCH: u64 = 1;
+const SQLITE_HEAD_KEY: &[u8] = b"\xffsqlite/head";
+const SQLITE_WRITER_RPC_MAX_BYTES: usize = 64 * 1024;
+const SQLITE_WRITER_DEFAULT_LEASE_MILLIS: u64 = 30_000;
+const SQLITE_WRITER_DEFAULT_MAX_WAITERS: usize = 128;
+const SQLITE_WRITER_MAX_LEASE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const SQLITE_WRITER_MAX_WAIT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const SQLITE_WRITER_MAX_WAITERS: usize = 10_000;
+
+fn sqlite_consensus_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn validate_sqlite_guard_command(
+    guard: &GuardedCommitRequest,
+    command: &CommandEnvelope,
+) -> Result<(), ConsensusError> {
+    let NamespaceCommand::ApplyTransaction { transaction } = &command.command else {
+        return Err(ConsensusError::Sqlite(
+            "SQLite guard requires a namespace transaction".into(),
+        ));
+    };
+    let valid_mutation = matches!(
+        transaction.mutations.as_slice(),
+        [NamespaceMutation::Put {
+            key_hex,
+            value_cid,
+            metadata,
+            precondition: KeyPrecondition::Match { generation, cid },
+            ..
+        }] if key_hex == &hex::encode(SQLITE_HEAD_KEY)
+            && value_cid == &guard.new_snapshot_cid
+            && *generation == guard.base_generation
+            && cid == &guard.base_snapshot_cid
+            && metadata.get("leader_term") == Some(&guard.ticket.leader_term.to_string())
+    );
+    if command.request_id != guard.idempotency_key
+        || command.writer_identity != guard.ticket.holder
+        || guard.ticket.base_snapshot_cid != guard.base_snapshot_cid
+        || guard.ticket.base_generation != guard.base_generation
+        || !valid_mutation
+    {
+        return Err(ConsensusError::Sqlite(
+            "SQLite guard does not match the protected head mutation".into(),
+        ));
+    }
+    Ok(())
+}
 
 const NAMESPACE_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("namespace_groups");
 const NAMESPACE_RAFT_VOTE: TableDefinition<&str, &[u8]> =
@@ -287,6 +343,8 @@ pub enum ConsensusError {
     RecoveryConfirmationRequired,
     #[error("namespace replica placement failed: {0}")]
     Placement(String),
+    #[error("SQLite writer coordination failed: {0}")]
+    Sqlite(String),
 }
 
 #[async_trait]
@@ -2309,6 +2367,16 @@ pub struct DisasterRecoveryReport {
     pub warning: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteWriterDiagnostic {
+    pub namespace_id: String,
+    pub leader_term: u64,
+    pub head_snapshot_cid: Cid,
+    pub head_generation: u64,
+    pub active: bool,
+    pub waiters: usize,
+}
+
 pub struct NamespaceGroupManager {
     node_identity: String,
     node_id: NodeId,
@@ -2319,9 +2387,30 @@ pub struct NamespaceGroupManager {
     config: ConsensusConfig,
     groups: RwLock<HashMap<String, Arc<GroupHandle>>>,
     command_metrics: Mutex<BTreeMap<String, ConsensusCommandAccumulator>>,
+    sqlite_writers: Mutex<HashMap<String, WriterCoordinator>>,
 }
 
 impl NamespaceGroupManager {
+    pub async fn sqlite_writer_diagnostics(&self) -> Vec<SqliteWriterDiagnostic> {
+        let writers = self.sqlite_writers.lock().await;
+        let mut diagnostics = writers
+            .iter()
+            .map(|(namespace_id, coordinator)| {
+                let (head_snapshot_cid, head_generation) = coordinator.head();
+                SqliteWriterDiagnostic {
+                    namespace_id: namespace_id.clone(),
+                    leader_term: coordinator.leader_term(),
+                    head_snapshot_cid: head_snapshot_cid.clone(),
+                    head_generation,
+                    active: coordinator.active_ticket().is_some(),
+                    waiters: coordinator.waiter_count(),
+                }
+            })
+            .collect::<Vec<_>>();
+        diagnostics.sort_by(|left, right| left.namespace_id.cmp(&right.namespace_id));
+        diagnostics
+    }
+
     pub fn new(
         node_identity: String,
         metadata: Arc<MetadataStore>,
@@ -2340,6 +2429,7 @@ impl NamespaceGroupManager {
             config,
             groups: RwLock::new(HashMap::new()),
             command_metrics: Mutex::new(BTreeMap::new()),
+            sqlite_writers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2361,6 +2451,7 @@ impl NamespaceGroupManager {
             config,
             groups: RwLock::new(HashMap::new()),
             command_metrics: Mutex::new(BTreeMap::new()),
+            sqlite_writers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3288,15 +3379,468 @@ impl NamespaceGroupManager {
         None
     }
 
+    async fn local_sqlite_head(&self, group: &GroupHandle) -> Result<(Cid, u64), ConsensusError> {
+        let state = self
+            .linearizable_local_namespace_state(group)
+            .await
+            .ok_or_else(|| ConsensusError::Raft("local namespace leader is unavailable".into()))?;
+        let value = pepper_merkle::get(
+            &group.state_machine.data_store,
+            &state.current_root_cid,
+            SQLITE_HEAD_KEY,
+            pepper_merkle::MerkleLimits::default(),
+        )
+        .await
+        .map_err(|error| ConsensusError::Sqlite(error.to_string()))?
+        .ok_or_else(|| ConsensusError::Sqlite("namespace has no SQLite head".into()))?;
+        if value.cid.codec != pepper_types::CODEC_SQLITE_SNAPSHOT {
+            return Err(ConsensusError::Sqlite(
+                "namespace SQLite head has an unexpected codec".into(),
+            ));
+        }
+        Ok((value.cid, value.generation))
+    }
+
+    async fn replicated_sqlite_commit_status(
+        &self,
+        group: &GroupHandle,
+        idempotency_key: &str,
+    ) -> Result<Option<pepper_sqlite::CommitRecord>, ConsensusError> {
+        let state = self
+            .linearizable_local_namespace_state(group)
+            .await
+            .ok_or_else(|| ConsensusError::Raft("local namespace leader is unavailable".into()))?;
+        let Some(CommandResponse::Commit(response)) = state.idempotent_response(idempotency_key)
+        else {
+            return Ok(None);
+        };
+        let revision = response.namespace_revision;
+        let root = if revision == state.current_revision {
+            state.current_root_cid.clone()
+        } else {
+            state
+                .history
+                .get(&revision)
+                .map(|record| record.root_cid.clone())
+                .ok_or_else(|| {
+                    ConsensusError::Sqlite("committed SQLite revision is no longer retained".into())
+                })?
+        };
+        let current = pepper_merkle::get(
+            &group.state_machine.data_store,
+            &root,
+            SQLITE_HEAD_KEY,
+            pepper_merkle::MerkleLimits::default(),
+        )
+        .await
+        .map_err(|error| ConsensusError::Sqlite(error.to_string()))?
+        .ok_or_else(|| ConsensusError::Sqlite("committed SQLite head is missing".into()))?;
+        let base_root = revision
+            .checked_sub(1)
+            .and_then(|revision| state.history.get(&revision))
+            .map(|record| record.root_cid.clone())
+            .ok_or_else(|| {
+                ConsensusError::Sqlite(
+                    "committed SQLite base revision is no longer retained".into(),
+                )
+            })?;
+        let base = pepper_merkle::get(
+            &group.state_machine.data_store,
+            &base_root,
+            SQLITE_HEAD_KEY,
+            pepper_merkle::MerkleLimits::default(),
+        )
+        .await
+        .map_err(|error| ConsensusError::Sqlite(error.to_string()))?
+        .ok_or_else(|| ConsensusError::Sqlite("committed SQLite base head is missing".into()))?;
+        let leader_term = current
+            .metadata
+            .get("leader_term")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Ok(Some(pepper_sqlite::CommitRecord {
+            idempotency_key: idempotency_key.to_string(),
+            base_snapshot_cid: base.cid,
+            base_generation: base.generation,
+            snapshot_cid: current.cid,
+            generation: current.generation,
+            leader_term,
+        }))
+    }
+
+    fn sqlite_holder(authenticated_node: &str, session_id: &str) -> Result<String, ConsensusError> {
+        if authenticated_node.is_empty()
+            || session_id.is_empty()
+            || authenticated_node.len() > 512
+            || session_id.len() > 512
+        {
+            return Err(ConsensusError::Sqlite(
+                "invalid SQLite writer identity".into(),
+            ));
+        }
+        Ok(format!(
+            "{}:{authenticated_node}:{session_id}",
+            authenticated_node.len()
+        ))
+    }
+
+    fn validate_sqlite_ticket_owner(
+        authenticated_node: &str,
+        ticket: &WriterTicket,
+    ) -> Result<(), ConsensusError> {
+        let prefix = format!("{}:{authenticated_node}:", authenticated_node.len());
+        if !ticket.holder.starts_with(&prefix) {
+            return Err(ConsensusError::Sqlite(
+                "SQLite writer ticket belongs to another ingress".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn local_sqlite_writer(
+        &self,
+        group: &GroupHandle,
+        authenticated_node: &str,
+        leader_term: u64,
+        request: WriterControlRequest,
+    ) -> Result<WriterControlResponse, ConsensusError> {
+        let metrics = group.raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(self.node_id) || metrics.current_term != leader_term {
+            return Err(ConsensusError::Raft("stale namespace leader hint".into()));
+        }
+        if let WriterControlRequest::CommitStatus { idempotency_key } = &request {
+            if idempotency_key.is_empty() || idempotency_key.len() > 512 {
+                return Err(ConsensusError::Sqlite(
+                    "invalid SQLite commit idempotency key".into(),
+                ));
+            }
+            return Ok(WriterControlResponse::Commit {
+                record: self
+                    .replicated_sqlite_commit_status(group, idempotency_key)
+                    .await?,
+            });
+        }
+        let (head_cid, head_generation) = self.local_sqlite_head(group).await?;
+        let now_millis = sqlite_consensus_now_millis();
+        let (lease_millis, max_waiters) = match &request {
+            WriterControlRequest::Acquire {
+                wait_timeout_millis,
+                lease_millis,
+                max_waiters,
+                ..
+            } => {
+                if *lease_millis == 0
+                    || *lease_millis > SQLITE_WRITER_MAX_LEASE_MILLIS
+                    || *wait_timeout_millis > SQLITE_WRITER_MAX_WAIT_MILLIS
+                    || *max_waiters == 0
+                    || *max_waiters > SQLITE_WRITER_MAX_WAITERS
+                {
+                    return Err(ConsensusError::Sqlite(
+                        "SQLite writer limits are out of bounds".into(),
+                    ));
+                }
+                (*lease_millis, *max_waiters)
+            }
+            _ => (
+                SQLITE_WRITER_DEFAULT_LEASE_MILLIS,
+                SQLITE_WRITER_DEFAULT_MAX_WAITERS,
+            ),
+        };
+        let database = group.namespace_id.to_string();
+        let mut writers = self.sqlite_writers.lock().await;
+        let replace = writers.get(&database).is_none_or(|coordinator| {
+            coordinator.leader_term() != leader_term
+                || coordinator.head() != (&head_cid, head_generation)
+        });
+        if replace {
+            writers.insert(
+                database.clone(),
+                WriterCoordinator::new(
+                    database.clone(),
+                    head_cid,
+                    head_generation,
+                    leader_term,
+                    lease_millis,
+                    max_waiters,
+                )
+                .map_err(|error| ConsensusError::Sqlite(error.to_string()))?,
+            );
+        }
+        let coordinator = writers
+            .get_mut(&database)
+            .expect("SQLite coordinator was initialized");
+        match request {
+            WriterControlRequest::Acquire {
+                acquisition_id,
+                session_id,
+                base_snapshot_cid,
+                base_generation,
+                wait_timeout_millis,
+                ..
+            } => {
+                let holder = Self::sqlite_holder(authenticated_node, &session_id)?;
+                let scoped_acquisition = Self::sqlite_holder(authenticated_node, &acquisition_id)?;
+                let status = coordinator
+                    .acquire(
+                        scoped_acquisition,
+                        holder,
+                        base_snapshot_cid,
+                        base_generation,
+                        now_millis,
+                        wait_timeout_millis,
+                    )
+                    .map_err(|error| ConsensusError::Sqlite(error.to_string()))?;
+                Ok(WriterControlResponse::Acquisition { status })
+            }
+            WriterControlRequest::Renew { ticket, .. } => {
+                Self::validate_sqlite_ticket_owner(authenticated_node, &ticket)?;
+                let ticket = coordinator
+                    .renew(&ticket, now_millis)
+                    .map_err(|error| ConsensusError::Sqlite(error.to_string()))?;
+                Ok(WriterControlResponse::Renewed { ticket })
+            }
+            WriterControlRequest::Release { ticket, .. } => {
+                Self::validate_sqlite_ticket_owner(authenticated_node, &ticket)?;
+                coordinator
+                    .release(&ticket, now_millis)
+                    .map_err(|error| ConsensusError::Sqlite(error.to_string()))?;
+                Ok(WriterControlResponse::Released)
+            }
+            WriterControlRequest::Status { acquisition_id, .. } => {
+                let scoped_acquisition = Self::sqlite_holder(authenticated_node, &acquisition_id)?;
+                coordinator.advance(now_millis);
+                let status = coordinator
+                    .acquisition_status(&scoped_acquisition)
+                    .cloned()
+                    .unwrap_or(AcquisitionStatus::Fenced);
+                Ok(WriterControlResponse::Acquisition { status })
+            }
+            WriterControlRequest::CommitStatus { .. } => unreachable!("handled before locking"),
+        }
+    }
+
+    pub async fn routed_sqlite_writer(
+        &self,
+        namespace_id: &NamespaceId,
+        request: WriterControlRequest,
+    ) -> Result<WriterControlResponse, ConsensusError> {
+        if let Ok(group) = self.group(namespace_id).await {
+            let metrics = group.raft.metrics().borrow().clone();
+            if metrics.current_leader == Some(self.node_id) {
+                return self
+                    .local_sqlite_writer(&group, &self.node_identity, metrics.current_term, request)
+                    .await;
+            }
+        }
+        let network = self.network.as_ref().ok_or_else(|| {
+            ConsensusError::Raft("networked namespace routing is disabled".to_string())
+        })?;
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| ConsensusError::Serde(error.to_string()))?;
+        if request_json.len() > SQLITE_WRITER_RPC_MAX_BYTES {
+            return Err(ConsensusError::Sqlite(
+                "SQLite writer request exceeds limit".into(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(group) = self.group(namespace_id).await {
+                let metrics = group.raft.metrics().borrow().clone();
+                if metrics.current_leader == Some(self.node_id) {
+                    return self
+                        .local_sqlite_writer(
+                            &group,
+                            &self.node_identity,
+                            metrics.current_term,
+                            request.clone(),
+                        )
+                        .await;
+                }
+            }
+            let peers = network.peers().await;
+            let mut discoveries = tokio::task::JoinSet::new();
+            for peer in &peers {
+                for address in &peer.addresses {
+                    let Ok(address) = address.parse::<SocketAddr>() else {
+                        continue;
+                    };
+                    let network = network.clone();
+                    let namespace = namespace_id.to_string();
+                    discoveries.spawn(async move {
+                        tokio::time::timeout(
+                            Duration::from_secs(1),
+                            network.namespace_discover(address, namespace),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    });
+                }
+            }
+            let mut candidates = self
+                .discovery_records(&namespace_id.to_string())
+                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+            while let Some(result) = discoveries.join_next().await {
+                if let Ok(Some(records)) = result {
+                    for record in records {
+                        let _ = self.persist_discovery_record(record.clone());
+                        candidates.push(record);
+                    }
+                }
+            }
+            candidates.sort_by(|left, right| {
+                right
+                    .membership_epoch
+                    .cmp(&left.membership_epoch)
+                    .then_with(|| right.leader_term.cmp(&left.leader_term))
+            });
+            candidates.dedup_by(|left, right| {
+                left.membership_epoch == right.membership_epoch
+                    && left.leader_node_id == right.leader_node_id
+            });
+            for record in candidates.into_iter().take(3) {
+                if record.leader_node_id.is_empty() || record.leader_node_id == self.node_identity {
+                    continue;
+                }
+                let Some(peer) = network.peer_address(&record.leader_node_id).await else {
+                    continue;
+                };
+                let rpc = proto::NamespaceSqliteWriterRequest {
+                    context: Some(proto::NamespaceRpcContext {
+                        namespace_id: namespace_id.to_string(),
+                        namespace_protocol_version: 1,
+                        membership_epoch: record.membership_epoch,
+                        term: record.leader_term,
+                        sender_identity: self.node_identity.clone(),
+                        request_id: String::new(),
+                    }),
+                    request_json: request_json.clone(),
+                };
+                if let Some(response) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    network.namespace_sqlite_writer(peer, rpc),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                {
+                    return serde_json::from_slice(&response.response_json)
+                        .map_err(|error| ConsensusError::Serde(error.to_string()));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline || peers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(ConsensusError::Raft(
+            "namespace leader unavailable after bounded rediscovery".into(),
+        ))
+    }
+
+    async fn local_sqlite_guarded_write(
+        &self,
+        group: &GroupHandle,
+        authenticated_node: &str,
+        leader_term: u64,
+        guard: GuardedCommitRequest,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        let metrics = group.raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(self.node_id) || metrics.current_term != leader_term {
+            return Err(ConsensusError::Raft("stale namespace leader hint".into()));
+        }
+        Self::validate_sqlite_ticket_owner(authenticated_node, &guard.ticket)?;
+        if guard.ticket.database != group.namespace_id.to_string() {
+            return Err(ConsensusError::Sqlite(
+                "SQLite writer ticket targets another database".into(),
+            ));
+        }
+        validate_sqlite_guard_command(&guard, &command)?;
+        let (head_cid, head_generation) = self.local_sqlite_head(group).await?;
+        if head_cid != guard.base_snapshot_cid || head_generation != guard.base_generation {
+            return Err(ConsensusError::Sqlite(format!(
+                "generation conflict; current generation is {head_generation}"
+            )));
+        }
+        let now_millis = sqlite_consensus_now_millis();
+        let database = group.namespace_id.to_string();
+        let mut writers = self.sqlite_writers.lock().await;
+        let coordinator = writers
+            .get(&database)
+            .ok_or_else(|| ConsensusError::Sqlite("writer ticket is fenced".into()))?;
+        if coordinator.leader_term() != leader_term
+            || coordinator.head() != (&head_cid, head_generation)
+        {
+            return Err(ConsensusError::Sqlite("writer ticket is fenced".into()));
+        }
+        // Validate and calculate the transition on a clone. The live writer
+        // state advances only after Raft has committed and applied the exact
+        // namespace mutation, while the mutex keeps renew/release serialized
+        // with this proposal.
+        let mut committed = coordinator.clone();
+        committed
+            .guarded_commit(
+                CommitAttempt {
+                    idempotency_key: guard.idempotency_key,
+                    ticket: guard.ticket,
+                    base_snapshot_cid: guard.base_snapshot_cid,
+                    base_generation: guard.base_generation,
+                    new_snapshot_cid: guard.new_snapshot_cid,
+                },
+                now_millis,
+            )
+            .map_err(|error| ConsensusError::Sqlite(error.to_string()))?;
+        let response = self
+            .batched_client_write(&group.namespace_id, command)
+            .await?;
+        if response.error.is_none() {
+            writers.insert(database, committed);
+        }
+        Ok(response)
+    }
+
+    pub async fn routed_sqlite_guarded_write(
+        &self,
+        namespace_id: &NamespaceId,
+        guard: GuardedCommitRequest,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        self.routed_write_with_guard(namespace_id, command, Some(guard))
+            .await
+    }
+
     pub async fn routed_write(
         &self,
         namespace_id: &NamespaceId,
         command: CommandEnvelope,
     ) -> Result<ConsensusResponse, ConsensusError> {
+        self.routed_write_with_guard(namespace_id, command, None)
+            .await
+    }
+
+    async fn routed_write_with_guard(
+        &self,
+        namespace_id: &NamespaceId,
+        command: CommandEnvelope,
+        guard: Option<GuardedCommitRequest>,
+    ) -> Result<ConsensusResponse, ConsensusError> {
         if let Ok(group) = self.group(namespace_id).await {
             let metrics = group.raft.metrics().borrow().clone();
             if metrics.current_leader == Some(self.node_id) {
-                return self.batched_client_write(namespace_id, command).await;
+                return match guard.clone() {
+                    Some(guard) => {
+                        self.local_sqlite_guarded_write(
+                            &group,
+                            &self.node_identity,
+                            metrics.current_term,
+                            guard,
+                            command,
+                        )
+                        .await
+                    }
+                    None => self.batched_client_write(namespace_id, command).await,
+                };
             }
         }
         let network = self.network.as_ref().ok_or_else(|| {
@@ -3304,14 +3848,33 @@ impl NamespaceGroupManager {
         })?;
         let command_json = serde_json::to_vec(&command)
             .map_err(|error| ConsensusError::Serde(error.to_string()))?;
+        let application_guard_json = guard
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| ConsensusError::Serde(error.to_string()))?
+            .unwrap_or_default();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(group) = self.group(namespace_id).await {
                 let metrics = group.raft.metrics().borrow().clone();
                 if metrics.current_leader == Some(self.node_id) {
-                    return self
-                        .batched_client_write(namespace_id, command.clone())
-                        .await;
+                    return match guard.clone() {
+                        Some(guard) => {
+                            self.local_sqlite_guarded_write(
+                                &group,
+                                &self.node_identity,
+                                metrics.current_term,
+                                guard,
+                                command.clone(),
+                            )
+                            .await
+                        }
+                        None => {
+                            self.batched_client_write(namespace_id, command.clone())
+                                .await
+                        }
+                    };
                 }
             }
             let peers = network.peers().await;
@@ -3375,6 +3938,7 @@ impl NamespaceGroupManager {
                         request_id: String::new(),
                     }),
                     command_json: command_json.clone(),
+                    application_guard_json: application_guard_json.clone(),
                 };
                 forwards.spawn(async move {
                     tokio::time::timeout(
@@ -3961,10 +4525,24 @@ impl NetworkNamespaceService for NamespaceGroupManager {
         }
         let command: CommandEnvelope =
             serde_json::from_slice(&request.command_json).map_err(namespace_network_error)?;
-        let response = self
-            .batched_client_write(&group.namespace_id, command)
+        let response = if request.application_guard_json.is_empty() {
+            self.batched_client_write(&group.namespace_id, command)
+                .await
+                .map_err(namespace_network_error)?
+        } else {
+            let guard: GuardedCommitRequest =
+                serde_json::from_slice(&request.application_guard_json)
+                    .map_err(namespace_network_error)?;
+            self.local_sqlite_guarded_write(
+                &group,
+                authenticated_node,
+                context.term,
+                guard,
+                command,
+            )
             .await
-            .map_err(namespace_network_error)?;
+            .map_err(namespace_network_error)?
+        };
         let metrics = group.raft.metrics().borrow().clone();
         let metadata = read_json_table::<GroupMetadata>(
             &self.metadata,
@@ -3986,6 +4564,33 @@ impl NetworkNamespaceService for NamespaceGroupManager {
             leader_node_id: leader_node_id.unwrap_or_default(),
             leader_term: metrics.current_term,
         })
+    }
+
+    async fn sqlite_writer(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceSqliteWriterRequest,
+    ) -> Result<proto::NamespaceSqliteWriterResponse, NetworkError> {
+        let group = self
+            .validate_rpc_context(authenticated_node, request.context.as_ref(), false)
+            .await?;
+        let context = request
+            .context
+            .as_ref()
+            .ok_or_else(|| namespace_network_error("missing SQLite writer context"))?;
+        let writer_request: WriterControlRequest =
+            serde_json::from_slice(&request.request_json).map_err(namespace_network_error)?;
+        let response = self
+            .local_sqlite_writer(&group, authenticated_node, context.term, writer_request)
+            .await
+            .map_err(namespace_network_error)?;
+        let response_json = serde_json::to_vec(&response).map_err(namespace_network_error)?;
+        if response_json.len() > SQLITE_WRITER_RPC_MAX_BYTES {
+            return Err(namespace_network_error(
+                "SQLite writer response exceeds limit",
+            ));
+        }
+        Ok(proto::NamespaceSqliteWriterResponse { response_json })
     }
 
     async fn state(

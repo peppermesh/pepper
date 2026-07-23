@@ -32,6 +32,20 @@
           "minimum_passes": 1,
           "required_files": [],
           "require_image_digest": false
+        },
+        {
+          "scenario": "SQLITE-001",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
+        },
+        {
+          "scenario": "SQLITE-003",
+          "backend": "process",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": false
         }
       ]
     },
@@ -289,6 +303,69 @@
           "minimum_passes": 1,
           "required_files": [],
           "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-002",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-003",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-004",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-005",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-006",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-007",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-008",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-009",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [],
+          "require_image_digest": true
         }
       ]
     },
@@ -329,6 +406,27 @@
           "minimum_passes": 2,
           "required_files": [],
           "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-004",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-005",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SQLITE-006",
+          "backend": "docker",
+          "minimum_passes": 2,
+          "required_files": [],
+          "require_image_digest": true
         }
       ]
     },
@@ -344,6 +442,15 @@
             "observations/resource-samples.json",
             "observations/growth-analysis.json",
             "observations/soak-report.json"
+          ],
+          "require_image_digest": true
+        },
+        {
+          "scenario": "SOAK-SQLITE-001",
+          "backend": "docker",
+          "minimum_passes": 1,
+          "required_files": [
+            "observations/sqlite-soak-report.json"
           ],
           "require_image_digest": true
         }

@@ -65,6 +65,15 @@ jobs:
           - { scenario: FAULT-001, offset: 34 }
           - { scenario: FAULT-003, offset: 35 }
           - { scenario: LIN-001, offset: 36 }
+          - { scenario: SQLITE-001, offset: 37 }
+          - { scenario: SQLITE-002, offset: 38 }
+          - { scenario: SQLITE-003, offset: 39 }
+          - { scenario: SQLITE-004, offset: 40 }
+          - { scenario: SQLITE-005, offset: 41 }
+          - { scenario: SQLITE-006, offset: 42 }
+          - { scenario: SQLITE-007, offset: 43 }
+          - { scenario: SQLITE-008, offset: 44 }
+          - { scenario: SQLITE-009, offset: 45 }
     env:
       TOKIO_WORKER_THREADS: "2"
     steps:

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-sqlite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pepper-dag = { path = "../../pepper-dag" }
+pepper-sqlite = { path = ".." }
+
+[[bin]]
+name = "sqlite_decoders"
+path = "fuzz_targets/sqlite_decoders.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the cargo-fuzz harness out of the repository workspace.
+[workspace]

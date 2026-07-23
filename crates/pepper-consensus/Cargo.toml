@@ -23,6 +23,7 @@ pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
 pepper-namespace = { version = "0.3.0", path = "../pepper-namespace" }
 pepper-network = { version = "0.3.0", path = "../pepper-network" }
 pepper-placement = { version = "0.3.0", path = "../pepper-placement" }
+pepper-sqlite = { version = "0.3.0", path = "../pepper-sqlite" }
 pepper-storage = { version = "0.3.0", path = "../pepper-storage" }
 pepper-types = { version = "0.3.0", path = "../pepper-types" }
 redb = { workspace = true }

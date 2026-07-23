@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-sqlite-benchmark"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Filesystem versus Pepper VFS SQLite benchmark"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+pepper-sqlite-vfs = { version = "0.3.0", path = "../../crates/pepper-sqlite-vfs" }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3.23"
+tokio = { workspace = true }

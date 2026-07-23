@@ -42,18 +42,22 @@ pepper-namespace = { version = "0.3.0", path = "../pepper-namespace" }
 pepper-network = { version = "0.3.0", path = "../pepper-network" }
 pepper-placement = { version = "0.3.0", path = "../pepper-placement" }
 pepper-publication = { version = "0.3.0", path = "../pepper-publication" }
+pepper-sqlite = { version = "0.3.0", path = "../pepper-sqlite" }
 pepper-storage = { version = "0.3.0", path = "../pepper-storage" }
 pepper-types = { version = "0.3.0", path = "../pepper-types" }
 quick-xml = { workspace = true }
 redb = { workspace = true }
 reed-solomon-erasure = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+tempfile = "3.23"
 tikv-jemallocator = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -61,5 +65,5 @@ zstd = { workspace = true }
 zstd-safe = { workspace = true }
 
 [dev-dependencies]
+pepper-sqlite-vfs = { version = "0.3.0", path = "../pepper-sqlite-vfs" }
 reqwest = { workspace = true }
-tempfile = "3.23"

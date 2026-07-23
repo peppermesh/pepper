@@ -8,6 +8,7 @@ use super::*;
 
 pub(super) fn router(state: AppState) -> Router {
     let s3_enabled = state.s3.is_some();
+    let sqlite_enabled = state.sqlite_enabled;
     let mut router = Router::new()
         .route("/v1/node/status", get(node_status))
         .route("/v1/node/peers", get(node_peers))
@@ -131,6 +132,11 @@ pub(super) fn router(state: AppState) -> Router {
             get(diagnostics::namespace_replica_diagnostic),
         )
         .route("/v1/admin/erasure", get(admin_erasure))
+        .route("/v1/admin/sqlite", get(admin_sqlite_status))
+        .route("/v1/admin/sqlite/sessions", get(admin_sqlite_sessions))
+        .route("/v1/admin/sqlite/locks", get(admin_sqlite_locks))
+        .route("/v1/admin/sqlite/staging", get(admin_sqlite_staging))
+        .route("/v1/admin/sqlite/repair", post(admin_sqlite_repair))
         .route("/v1/admin/dag/{cid}", get(admin_dag_inspect))
         .route("/v1/admin/corruption-scan", post(admin_corruption_scan))
         .route("/v1/admin/quarantine/purge", post(admin_quarantine_purge))
@@ -141,6 +147,73 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics));
+    if sqlite_enabled {
+        router = router
+            .route("/v1/sqlite/databases", post(sqlite_create))
+            .route("/v1/sqlite/databases/{database}", get(sqlite_info))
+            .route("/v1/sqlite/databases/{database}/check", get(sqlite_check))
+            .route(
+                "/v1/sqlite/databases/{database}/import",
+                post(sqlite_import),
+            )
+            .route("/v1/sqlite/databases/{database}/export", get(sqlite_export))
+            .route(
+                "/v1/sqlite/databases/{database}/sessions",
+                post(sqlite_session_create),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/writer/acquire",
+                post(sqlite_writer_acquire),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/writer/renew",
+                post(sqlite_writer_renew),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/writer/release",
+                post(sqlite_writer_release),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/transactions",
+                post(sqlite_incremental_commit).layer(DefaultBodyLimit::disable()),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/commits/{request_id}",
+                get(sqlite_commit_status),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/compact",
+                post(sqlite_compact),
+            )
+            .route(
+                "/v1/sqlite/databases/{database}/rollback",
+                post(sqlite_rollback),
+            )
+            .route(
+                "/v1/sqlite/sessions/{session_id}/pages",
+                get(sqlite_session_pages),
+            )
+            .route(
+                "/v1/sqlite/sessions/{session_id}",
+                axum::routing::delete(sqlite_session_close),
+            )
+            .route(
+                "/v1/sqlite/experimental/databases",
+                post(sqlite_whole_file_create),
+            )
+            .route(
+                "/v1/sqlite/experimental/databases/{database}",
+                get(sqlite_whole_file_info),
+            )
+            .route(
+                "/v1/sqlite/experimental/databases/{database}/file",
+                get(sqlite_whole_file_export).put(sqlite_whole_file_commit),
+            )
+            .route(
+                "/v1/sqlite/experimental/databases/{database}/commits/{request_id}",
+                get(sqlite_whole_file_commit_status),
+            );
+    }
     if s3_enabled {
         router = router
             .route("/", any(s3_dispatch))

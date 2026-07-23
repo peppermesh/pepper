@@ -518,13 +518,11 @@ impl NetworkNamespaceAliasService for AgentNamespaceAliasService {
         _authenticated_node: &str,
         alias: String,
     ) -> Result<Option<String>, NetworkError> {
-        if alias != S3_BUCKET_CATALOG_ALIAS {
-            return Ok(None);
+        match namespace_alias(&self.state, &alias) {
+            Ok(namespace) => Ok(Some(namespace.to_string())),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(NetworkError::BlockService(error.message)),
         }
-        local_s3_bucket_catalog_namespace(&self.state)
-            .await
-            .map(|namespace| namespace.map(|namespace| namespace.to_string()))
-            .map_err(|error| NetworkError::BlockService(error.message))
     }
 
     async fn list(&self, _authenticated_node: &str) -> Result<Vec<(String, String)>, NetworkError> {

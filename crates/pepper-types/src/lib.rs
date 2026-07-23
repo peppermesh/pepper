@@ -31,6 +31,12 @@ pub const CODEC_SMALL_OBJECT: Codec = Codec(0x0f);
 /// links the EC extent and indexes its bounded record set so compaction can
 /// enumerate dirty extents instead of scanning every object in a bucket.
 pub const CODEC_SMALL_OBJECT_EXTENT_INDEX: Codec = Codec(0x10);
+/// Immutable SQLite database configuration descriptor.
+pub const CODEC_SQLITE_DATABASE: Codec = Codec(0x11);
+/// Immutable logical SQLite database snapshot descriptor.
+pub const CODEC_SQLITE_SNAPSHOT: Codec = Codec(0x12);
+/// Fixed-depth radix page-table internal or leaf node.
+pub const CODEC_SQLITE_PAGE_TABLE: Codec = Codec(0x13);
 
 /// Stable machine-readable error categories shared by HTTP, CLI, and future
 /// namespace services. New variants may be added; existing serialized names

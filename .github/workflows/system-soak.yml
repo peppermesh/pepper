@@ -30,8 +30,13 @@ concurrency:
 
 jobs:
   soak:
+    name: soak ${{ matrix.scenario }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [SOAK-001, SOAK-SQLITE-001]
     env:
       DURATION_SECONDS: ${{ inputs.duration_seconds || '18000' }}
     steps:
@@ -60,7 +65,7 @@ jobs:
       - name: Run hosted soak and growth analysis
         run: >-
           cargo run --manifest-path system-tests/Cargo.toml --locked --
-          run --scenario SOAK-001 --seed "${{ steps.preflight.outputs.seed }}"
+          run --scenario "${{ matrix.scenario }}" --seed "${{ steps.preflight.outputs.seed }}"
           --backend docker --image "pepper-system-test:${GITHUB_SHA}"
           --duration-seconds "$DURATION_SECONDS"
           --expected-kernel "${{ steps.preflight.outputs.kernel }}"
@@ -80,7 +85,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: soak-${{ github.sha }}-${{ steps.preflight.outputs.seed }}
+          name: soak-${{ matrix.scenario }}-${{ github.sha }}-${{ steps.preflight.outputs.seed }}
           path: system-tests/artifacts/
           if-no-files-found: error
           retention-days: 60

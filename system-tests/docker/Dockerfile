@@ -4,11 +4,9 @@
 FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS builder
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --locked --release -p pepper-agent -p pepper-cli \
+RUN cargo build --locked --release -p pepper-agent -p pepper-cli -p pepper-sqlite-vfs \
     && mkdir -p /out \
-    && cp /src/target/release/pepper-agent /src/target/release/pepper /out/
+    && cp /src/target/release/pepper-agent /src/target/release/pepper /src/target/release/pepper-sqlite /out/
 
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 ARG SOURCE_COMMIT=unknown
@@ -25,6 +23,7 @@ RUN apt-get update \
     && chown -R pepper:pepper /control /var/lib/pepper
 COPY --from=builder /out/pepper-agent /usr/local/bin/pepper-agent
 COPY --from=builder /out/pepper /usr/local/bin/pepper
+COPY --from=builder /out/pepper-sqlite /usr/local/bin/pepper-sqlite
 COPY dev/s3-contract/node-entrypoint.sh /usr/local/bin/s3-contract-node
 RUN chmod 755 /usr/local/bin/s3-contract-node
 ENTRYPOINT ["/usr/bin/tini", "--"]

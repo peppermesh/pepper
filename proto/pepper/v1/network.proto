@@ -389,12 +389,25 @@ message NamespaceRaftResponse {
 message NamespaceForwardRequest {
   NamespaceRpcContext context = 1;
   bytes command_json = 2;
+  // Non-empty only for an application-specific leader-side guard. Older
+  // peers are excluded by the network protocol version before they can drop
+  // this field and accidentally turn a guarded write into an ordinary write.
+  bytes application_guard_json = 3;
 }
 
 message NamespaceForwardResponse {
   bytes response_json = 1;
   string leader_node_id = 2;
   uint64 leader_term = 3;
+}
+
+message NamespaceSqliteWriterRequest {
+  NamespaceRpcContext context = 1;
+  bytes request_json = 2;
+}
+
+message NamespaceSqliteWriterResponse {
+  bytes response_json = 1;
 }
 
 enum NamespaceStateProjection {

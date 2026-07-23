@@ -18,6 +18,17 @@ pub(super) static FIRECRACKER_JAILER_SETUP_FAILURES: AtomicU64 = AtomicU64::new(
 pub(super) static FIRECRACKER_OUTPUT_EXTRACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(super) static FIRECRACKER_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
 pub(super) static FIRECRACKER_HEARTBEAT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_COMMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_READS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_PACK_WRITES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_PACK_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_EC_PAGE_PACK_WRITES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_PAGE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SQLITE_COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_OBJECT_WRITES: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_OBJECT_READS: AtomicU64 = AtomicU64::new(0);
 pub(super) static ERASURE_SHARD_REPAIRS: AtomicU64 = AtomicU64::new(0);
@@ -873,6 +884,78 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
             publication.active_read_leases,
             publication.pending_pin_intents,
             publication.durability_receipts,
+        ));
+    }
+    if state.sqlite_enabled {
+        let open_sessions = state
+            .sqlite_sessions
+            .lock()
+            .map_or(0, |sessions| sessions.len());
+        let writer_diagnostics = match &state.namespace_groups {
+            Some(manager) => manager.sqlite_writer_diagnostics().await,
+            None => Vec::new(),
+        };
+        let writer_waiters = writer_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.waiters)
+            .sum::<usize>();
+        let active_writers = writer_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.active)
+            .count();
+        body.push_str(&format!(
+            "# HELP pepper_sqlite_enabled Whether the Pepper SQLite application is enabled.\n\
+             # TYPE pepper_sqlite_enabled gauge\n\
+             pepper_sqlite_enabled 1\n\
+             # HELP pepper_sqlite_ready Whether the local SQLite socket/session runtime is ready.\n\
+             # TYPE pepper_sqlite_ready gauge\n\
+             pepper_sqlite_ready {}\n\
+             # TYPE pepper_sqlite_open_sessions gauge\n\
+             pepper_sqlite_open_sessions {}\n\
+             # TYPE pepper_sqlite_active_writers gauge\n\
+             pepper_sqlite_active_writers {}\n\
+             # TYPE pepper_sqlite_writer_waiters gauge\n\
+             pepper_sqlite_writer_waiters {}\n\
+             # TYPE pepper_sqlite_commits_total counter\n\
+             pepper_sqlite_commits_total {}\n\
+             # TYPE pepper_sqlite_commit_failures_total counter\n\
+             pepper_sqlite_commit_failures_total {}\n\
+             # TYPE pepper_sqlite_page_reads_total counter\n\
+             pepper_sqlite_page_reads_total {}\n\
+             # TYPE pepper_sqlite_page_read_bytes_total counter\n\
+             pepper_sqlite_page_read_bytes_total {}\n\
+             # TYPE pepper_sqlite_page_pack_writes_total counter\n\
+             pepper_sqlite_page_pack_writes_total {}\n\
+             # TYPE pepper_sqlite_page_pack_write_bytes_total counter\n\
+             pepper_sqlite_page_pack_write_bytes_total {}\n\
+             # TYPE pepper_sqlite_ec_page_pack_writes_total counter\n\
+             pepper_sqlite_ec_page_pack_writes_total {}\n\
+             # TYPE pepper_sqlite_page_cache_hits_total counter\n\
+             pepper_sqlite_page_cache_hits_total {}\n\
+             # TYPE pepper_sqlite_page_cache_misses_total counter\n\
+             pepper_sqlite_page_cache_misses_total {}\n\
+             # TYPE pepper_sqlite_compactions_total counter\n\
+             pepper_sqlite_compactions_total {}\n\
+             # TYPE pepper_sqlite_compaction_failures_total counter\n\
+             pepper_sqlite_compaction_failures_total {}\n\
+             # TYPE pepper_sqlite_page_cache_bytes gauge\n\
+             pepper_sqlite_page_cache_bytes {}\n",
+            u8::from(state.sqlite_ready.load(Ordering::Relaxed)),
+            open_sessions,
+            active_writers,
+            writer_waiters,
+            SQLITE_COMMITS.load(Ordering::Relaxed),
+            SQLITE_COMMIT_FAILURES.load(Ordering::Relaxed),
+            SQLITE_PAGE_READS.load(Ordering::Relaxed),
+            SQLITE_PAGE_READ_BYTES.load(Ordering::Relaxed),
+            SQLITE_PAGE_PACK_WRITES.load(Ordering::Relaxed),
+            SQLITE_PAGE_PACK_WRITE_BYTES.load(Ordering::Relaxed),
+            SQLITE_EC_PAGE_PACK_WRITES.load(Ordering::Relaxed),
+            SQLITE_PAGE_CACHE_HITS.load(Ordering::Relaxed),
+            SQLITE_PAGE_CACHE_MISSES.load(Ordering::Relaxed),
+            SQLITE_COMPACTIONS.load(Ordering::Relaxed),
+            SQLITE_COMPACTION_FAILURES.load(Ordering::Relaxed),
+            state.sqlite_pack_cache.current_bytes(),
         ));
     }
     let transport = state.network.transport_metrics();

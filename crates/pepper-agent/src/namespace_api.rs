@@ -161,7 +161,7 @@ pub(super) struct RecoverRequest {
     confirmation: String,
 }
 
-fn request_id() -> String {
+pub(super) fn request_id() -> String {
     format!(
         "api-{}",
         std::time::SystemTime::now()
@@ -192,6 +192,24 @@ pub(super) fn namespace_manager(state: &AppState) -> Result<Arc<NamespaceGroupMa
             "namespace service is disabled",
         )
     })
+}
+
+async fn generic_mutation_base(
+    state: &AppState,
+    id: &NamespaceId,
+) -> Result<NamespaceState, ApiError> {
+    let current = namespace_manager(state)?
+        .linearizable_namespace_state(id)
+        .await
+        .map_err(consensus_error)?;
+    if current.descriptor.kind == NamespaceKind::Sqlite {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "SQLite namespaces may only be mutated through the SQLite API",
+        ));
+    }
+    Ok(current)
 }
 
 pub(super) fn parse_namespace(state: &AppState, value: &str) -> Result<NamespaceId, ApiError> {
@@ -655,7 +673,7 @@ pub(super) async fn namespace_diff(
     })))
 }
 
-fn publication_coordinator(
+pub(super) fn publication_coordinator(
     state: &AppState,
 ) -> Result<PublicationCoordinator<AgentDurabilityBackend, AgentProtectionBackend>, ApiError> {
     PublicationCoordinator::new(
@@ -708,6 +726,37 @@ pub(super) async fn apply_command_with_metadata_only(
     command: CommandEnvelope,
     publication: CommandPublicationInputs,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    apply_command_internal(state, namespace_id, command, publication, None).await
+}
+
+pub(super) async fn apply_command_guarded(
+    state: &AppState,
+    namespace_id: NamespaceId,
+    command: CommandEnvelope,
+    publication: CommandPublicationInputs,
+    guard: pepper_publication::PublicationGuard,
+    proposer: Arc<dyn pepper_publication::GuardedNamespaceProposer>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    apply_command_internal(
+        state,
+        namespace_id,
+        command,
+        publication,
+        Some((guard, proposer)),
+    )
+    .await
+}
+
+async fn apply_command_internal(
+    state: &AppState,
+    namespace_id: NamespaceId,
+    command: CommandEnvelope,
+    publication: CommandPublicationInputs,
+    guarded: Option<(
+        pepper_publication::PublicationGuard,
+        Arc<dyn pepper_publication::GuardedNamespaceProposer>,
+    )>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let current = namespace_manager(state)?
         .linearizable_namespace_state(&namespace_id)
         .await
@@ -737,23 +786,29 @@ pub(super) async fn apply_command_with_metadata_only(
             "durability_receipts": []
         })));
     }
-    let coordinator = publication_coordinator(state)?;
+    let mut coordinator = publication_coordinator(state)?;
+    if let Some((_, proposer)) = &guarded {
+        coordinator = coordinator.with_proposer(proposer.clone());
+    }
     let started = std::time::Instant::now();
-    let published = coordinator
-        .publish(
-            PublicationRequest {
-                namespace_id: namespace_id.clone(),
-                command,
-                uploaded_roots: publication.uploaded_roots,
-                preverified_durability: publication.preverified_durability,
-                metadata_only_cids: publication.metadata_only_cids,
-                staged_bytes: publication.staged_bytes,
-                staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
-                retain_uploaded_on_conflict: publication.retain_uploaded_on_conflict,
-            },
-            unix_seconds(),
-        )
-        .await;
+    let request = PublicationRequest {
+        namespace_id: namespace_id.clone(),
+        command,
+        uploaded_roots: publication.uploaded_roots,
+        preverified_durability: publication.preverified_durability,
+        metadata_only_cids: publication.metadata_only_cids,
+        staged_bytes: publication.staged_bytes,
+        staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
+        retain_uploaded_on_conflict: publication.retain_uploaded_on_conflict,
+    };
+    let published = match guarded {
+        Some((guard, _)) => {
+            coordinator
+                .publish_guarded(request, guard, unix_seconds())
+                .await
+        }
+        None => coordinator.publish(request, unix_seconds()).await,
+    };
     NAMESPACE_COMMIT_LATENCY_MICROS.fetch_add(
         started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
@@ -805,16 +860,13 @@ pub(super) async fn kv_put(
     Json(request): Json<KvMutationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = parse_namespace(&state, &request.namespace)?;
+    let base = generic_mutation_base(&state, &id).await?;
     let value_cid = request
         .value_cid
         .clone()
         .ok_or_else(|| ApiError::bad_request("value_cid is required"))?;
     let current = current_value(&state, &id, &request.key_hex).await?;
     let precondition = precondition(current, request.if_generation, request.if_cid)?;
-    let base = namespace_manager(&state)?
-        .linearizable_namespace_state(&id)
-        .await
-        .map_err(consensus_error)?;
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: request.writer_identity,
@@ -852,12 +904,9 @@ pub(super) async fn kv_delete(
     Json(request): Json<KvMutationRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = parse_namespace(&state, &request.namespace)?;
+    let base = generic_mutation_base(&state, &id).await?;
     let current = current_value(&state, &id, &request.key_hex).await?;
     let precondition = precondition(current, request.if_generation, request.if_cid)?;
-    let base = namespace_manager(&state)?
-        .linearizable_namespace_state(&id)
-        .await
-        .map_err(consensus_error)?;
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: request.writer_identity,
@@ -886,6 +935,7 @@ pub(super) async fn kv_transaction(
         return Err(ApiError::bad_request("transaction file version must be 1"));
     }
     let id = parse_namespace(&state, &request.namespace)?;
+    generic_mutation_base(&state, &id).await?;
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: request.writer_identity,
@@ -1182,6 +1232,7 @@ pub(super) async fn namespace_rollback(
     Json(request): Json<RollbackRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = parse_namespace(&state, &namespace)?;
+    generic_mutation_base(&state, &id).await?;
     apply_command(
         &state,
         id,
