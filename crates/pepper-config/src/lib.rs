@@ -62,6 +62,8 @@ pub struct PepperConfig {
     #[serde(default)]
     pub s3: S3Config,
     #[serde(default)]
+    pub sqlite: SqliteConfig,
+    #[serde(default)]
     pub fast_path: FastPathConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -333,6 +335,35 @@ pub struct NamespaceConfig {
     pub staging_ttl_seconds: u64,
     #[serde(default = "default_namespace_read_lease_ttl_seconds")]
     pub read_lease_ttl_seconds: u64,
+}
+
+/// Pepper-backed SQLite is disabled by default. These limits bound local
+/// sessions and transaction staging before any durable publication begins.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqliteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sqlite_max_open_sessions")]
+    pub max_open_sessions: usize,
+    #[serde(default = "default_sqlite_max_sessions_per_database")]
+    pub max_sessions_per_database: usize,
+    #[serde(default = "default_sqlite_max_writer_waiters_per_database")]
+    pub max_writer_waiters_per_database: usize,
+    #[serde(default = "default_sqlite_max_transaction_seconds")]
+    pub max_transaction_seconds: u64,
+    #[serde(default = "default_sqlite_max_staged_bytes_per_transaction")]
+    pub max_staged_bytes_per_transaction: u64,
+    #[serde(default = "default_sqlite_max_dirty_pages_per_transaction")]
+    pub max_dirty_pages_per_transaction: u32,
+    #[serde(default = "default_sqlite_page_size")]
+    pub default_page_size: u32,
+    #[serde(default = "default_sqlite_page_pack_target_bytes")]
+    pub page_pack_target_bytes: u32,
+    #[serde(default = "default_sqlite_page_cache_bytes")]
+    pub page_cache_bytes: u64,
+    /// Local VFS protocol socket. Defaults to `<data.path>/sqlite.sock`.
+    pub socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -626,6 +657,24 @@ impl Default for NamespaceConfig {
     }
 }
 
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_open_sessions: default_sqlite_max_open_sessions(),
+            max_sessions_per_database: default_sqlite_max_sessions_per_database(),
+            max_writer_waiters_per_database: default_sqlite_max_writer_waiters_per_database(),
+            max_transaction_seconds: default_sqlite_max_transaction_seconds(),
+            max_staged_bytes_per_transaction: default_sqlite_max_staged_bytes_per_transaction(),
+            max_dirty_pages_per_transaction: default_sqlite_max_dirty_pages_per_transaction(),
+            default_page_size: default_sqlite_page_size(),
+            page_pack_target_bytes: default_sqlite_page_pack_target_bytes(),
+            page_cache_bytes: default_sqlite_page_cache_bytes(),
+            socket_path: None,
+        }
+    }
+}
+
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
@@ -725,6 +774,42 @@ fn default_bulk_bandwidth_burst_bytes() -> u64 {
 
 fn default_api_bind_addr() -> String {
     "127.0.0.1:9080".to_string()
+}
+
+fn default_sqlite_max_open_sessions() -> usize {
+    1024
+}
+
+fn default_sqlite_max_sessions_per_database() -> usize {
+    256
+}
+
+fn default_sqlite_max_writer_waiters_per_database() -> usize {
+    128
+}
+
+fn default_sqlite_max_transaction_seconds() -> u64 {
+    300
+}
+
+fn default_sqlite_max_staged_bytes_per_transaction() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_sqlite_max_dirty_pages_per_transaction() -> u32 {
+    262_144
+}
+
+fn default_sqlite_page_size() -> u32 {
+    4096
+}
+
+fn default_sqlite_page_pack_target_bytes() -> u32 {
+    4 * 1024 * 1024
+}
+
+fn default_sqlite_page_cache_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn default_s3_region() -> String {
@@ -1284,6 +1369,40 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
             ));
         }
     }
+    let sqlite = &config.sqlite;
+    if sqlite.enabled && (!config.namespace.enabled || !config.namespace.consensus_enabled) {
+        return Err(ConfigError::Invalid(
+            "sqlite.enabled requires namespace.enabled and namespace.consensus_enabled".to_string(),
+        ));
+    }
+    if sqlite.max_open_sessions == 0
+        || sqlite.max_sessions_per_database == 0
+        || sqlite.max_sessions_per_database > sqlite.max_open_sessions
+        || sqlite.max_writer_waiters_per_database == 0
+        || sqlite.max_transaction_seconds == 0
+        || sqlite.max_transaction_seconds > config.namespace.staging_ttl_seconds
+        || sqlite.max_staged_bytes_per_transaction == 0
+        || sqlite.max_staged_bytes_per_transaction > config.namespace.max_staging_bytes
+        || sqlite.max_dirty_pages_per_transaction == 0
+        || sqlite.default_page_size < 512
+        || sqlite.default_page_size > 65_536
+        || !sqlite.default_page_size.is_power_of_two()
+        || sqlite.page_pack_target_bytes < sqlite.default_page_size
+        || sqlite.page_pack_target_bytes > 4 * 1024 * 1024
+        || sqlite.page_cache_bytes < u64::from(sqlite.default_page_size)
+    {
+        return Err(ConfigError::Invalid(
+            "sqlite limits are inconsistent or outside supported ranges".to_string(),
+        ));
+    }
+    let maximum_dirty_bytes = u64::from(sqlite.max_dirty_pages_per_transaction)
+        .checked_mul(u64::from(sqlite.default_page_size))
+        .ok_or_else(|| ConfigError::Invalid("sqlite dirty-page limit overflows".to_string()))?;
+    if maximum_dirty_bytes > sqlite.max_staged_bytes_per_transaction {
+        return Err(ConfigError::Invalid(
+            "sqlite.max_dirty_pages_per_transaction exceeds max_staged_bytes_per_transaction at the default page size".to_string(),
+        ));
+    }
     if config.fast_path.enabled {
         if config.fast_path.control_cores == 0 {
             return Err(ConfigError::Invalid(
@@ -1677,6 +1796,9 @@ mod tests {
         assert_eq!(cfg.replication.default_factor, 3);
         assert!(!cfg.namespace.enabled);
         assert!(!cfg.s3.enabled);
+        assert!(!cfg.sqlite.enabled);
+        assert_eq!(cfg.sqlite.default_page_size, 4096);
+        assert_eq!(cfg.sqlite.page_pack_target_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.s3.region, "us-east-1");
         assert!(cfg.fast_path.enabled);
         assert_eq!(cfg.fast_path.control_cores, 2);
@@ -1843,6 +1965,44 @@ mod tests {
         assert!(cfg.namespace.consensus_enabled);
         assert_eq!(cfg.namespace.max_namespace_groups, 128);
         assert!(cfg.summary(Path::new("pepper.toml")).namespace_enabled);
+    }
+
+    #[test]
+    fn sqlite_feature_gate_and_limits_are_explicitly_configurable() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [namespace]
+            enabled = true
+            consensus_enabled = true
+            [sqlite]
+            enabled = true
+            max_open_sessions = 32
+            max_sessions_per_database = 8
+            max_writer_waiters_per_database = 4
+            max_transaction_seconds = 60
+            max_staged_bytes_per_transaction = 67108864
+            max_dirty_pages_per_transaction = 16384
+            default_page_size = 4096
+            page_pack_target_bytes = 4194304
+            page_cache_bytes = 134217728
+            [[storage.locations]]
+            path = "/tmp/pepper-config-sqlite-test"
+            max_capacity_bytes = 1073741824
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.sqlite.enabled);
+
+        let mut missing_consensus = cfg.clone();
+        missing_consensus.namespace.consensus_enabled = false;
+        assert!(validate(&missing_consensus).is_err());
+
+        let mut impossible_dirty_limit = cfg;
+        impossible_dirty_limit
+            .sqlite
+            .max_dirty_pages_per_transaction = 16385;
+        assert!(validate(&impossible_dirty_limit).is_err());
     }
 
     #[test]

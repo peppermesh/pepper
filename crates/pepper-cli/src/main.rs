@@ -56,7 +56,74 @@ enum Command {
     Kv(KvCommand),
     Bucket(BucketCommand),
     Fs(FsCommand),
+    Sqlite(SqliteCommand),
     Admin(AdminCommand),
+}
+
+#[derive(Debug, Parser)]
+struct SqliteCommand {
+    #[command(subcommand)]
+    command: SqliteSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SqliteSubcommand {
+    Create {
+        database: String,
+        #[arg(long)]
+        page_size: Option<u32>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Info {
+        database: String,
+    },
+    Import {
+        database: String,
+        path: PathBuf,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Export {
+        database: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, conflicts_with_all = ["snapshot", "root_cid", "checkpoint_cid", "named_snapshot"])]
+        revision: Option<u64>,
+        #[arg(long, conflicts_with_all = ["snapshot", "revision", "checkpoint_cid", "named_snapshot"])]
+        root_cid: Option<String>,
+        #[arg(long, conflicts_with_all = ["snapshot", "revision", "root_cid", "named_snapshot"])]
+        checkpoint_cid: Option<String>,
+        #[arg(long, conflicts_with_all = ["snapshot", "revision", "root_cid", "checkpoint_cid"])]
+        named_snapshot: Option<String>,
+    },
+    History {
+        database: String,
+    },
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotSubcommand,
+    },
+    Rollback {
+        database: String,
+        revision: u64,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Check {
+        database: String,
+    },
+    Compact {
+        database: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    CommitStatus {
+        database: String,
+        commit_id: String,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -408,6 +475,19 @@ enum AdminSubcommand {
         #[command(subcommand)]
         command: AdminNamespaceSubcommand,
     },
+    Sqlite {
+        #[command(subcommand)]
+        command: AdminSqliteSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminSqliteSubcommand {
+    Status,
+    Sessions,
+    Locks,
+    Staging,
+    Repair,
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,6 +662,7 @@ async fn run() -> Result<()> {
         Command::Kv(kv) => kv_command(&args.api, args.json, kv.command).await,
         Command::Bucket(bucket) => bucket_command(&args.api, args.json, bucket.command).await,
         Command::Fs(fs) => fs_command(&args.api, args.json, fs.command).await,
+        Command::Sqlite(sqlite) => sqlite_command(&args.api, args.json, sqlite.command).await,
         Command::Admin(admin) => match admin.command {
             AdminSubcommand::Gc { dry_run } => admin_gc(&args.api, args.json, dry_run).await,
             AdminSubcommand::Repair => {
@@ -601,6 +682,27 @@ async fn run() -> Result<()> {
             }
             AdminSubcommand::Namespace { command } => {
                 admin_namespace_command(&args.api, args.json, command).await
+            }
+            AdminSubcommand::Sqlite { command } => {
+                let (method, path): (reqwest::Method, &[&str]) = match command {
+                    AdminSqliteSubcommand::Status => {
+                        (reqwest::Method::GET, &["v1", "admin", "sqlite"])
+                    }
+                    AdminSqliteSubcommand::Sessions => {
+                        (reqwest::Method::GET, &["v1", "admin", "sqlite", "sessions"])
+                    }
+                    AdminSqliteSubcommand::Locks => {
+                        (reqwest::Method::GET, &["v1", "admin", "sqlite", "locks"])
+                    }
+                    AdminSqliteSubcommand::Staging => {
+                        (reqwest::Method::GET, &["v1", "admin", "sqlite", "staging"])
+                    }
+                    AdminSqliteSubcommand::Repair => {
+                        (reqwest::Method::POST, &["v1", "admin", "sqlite", "repair"])
+                    }
+                };
+                let value = send_json(&args.api, method, path, None).await?;
+                print_namespace_json(&value, args.json)
             }
             AdminSubcommand::QuarantinePurge => {
                 admin_json_post(
@@ -698,6 +800,256 @@ async fn namespace_command(api: &str, json: bool, command: NamespaceSubcommand) 
         },
     };
     print_namespace_json(&value, json)
+}
+
+async fn sqlite_command(api: &str, json: bool, command: SqliteSubcommand) -> Result<()> {
+    let value = match command {
+        SqliteSubcommand::Create {
+            database,
+            page_size,
+            request_id: id,
+        } => {
+            send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "sqlite", "databases"],
+                Some(serde_json::json!({
+                    "database": database,
+                    "page_size": page_size,
+                    "request_id": id.unwrap_or_else(request_id)
+                })),
+            )
+            .await?
+        }
+        SqliteSubcommand::Info { database } => {
+            send_json(
+                api,
+                reqwest::Method::GET,
+                &["v1", "sqlite", "databases", &database],
+                None,
+            )
+            .await?
+        }
+        SqliteSubcommand::Import {
+            database,
+            path,
+            request_id: id,
+        } => {
+            let info = send_json(
+                api,
+                reqwest::Method::GET,
+                &["v1", "sqlite", "databases", &database],
+                None,
+            )
+            .await?;
+            let file = tokio::fs::File::open(&path)
+                .await
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            let length = file
+                .metadata()
+                .await
+                .with_context(|| format!("failed to stat {}", path.display()))?
+                .len();
+            let mut url = resource_url(api, &["v1", "sqlite", "databases", &database, "import"])?;
+            url.query_pairs_mut()
+                .append_pair("request_id", &id.unwrap_or_else(request_id))
+                .append_pair(
+                    "base_revision",
+                    &info["namespace_revision"]
+                        .as_u64()
+                        .context("missing namespace revision")?
+                        .to_string(),
+                )
+                .append_pair(
+                    "base_generation",
+                    &info["head_generation"]
+                        .as_u64()
+                        .context("missing head generation")?
+                        .to_string(),
+                )
+                .append_pair(
+                    "base_snapshot",
+                    info["snapshot_cid"]
+                        .as_str()
+                        .context("missing snapshot CID")?,
+                );
+            let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+            let response = http_client()?
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/vnd.sqlite3")
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(body)
+                .send()
+                .await?;
+            decode_json_response(response).await?
+        }
+        SqliteSubcommand::Export {
+            database,
+            output,
+            snapshot,
+            revision,
+            root_cid,
+            checkpoint_cid,
+            named_snapshot,
+        } => {
+            let mut url = resource_url(api, &["v1", "sqlite", "databases", &database, "export"])?;
+            if let Some(snapshot) = snapshot {
+                url.query_pairs_mut().append_pair("snapshot", &snapshot);
+            }
+            if let Some(revision) = revision {
+                url.query_pairs_mut()
+                    .append_pair("revision", &revision.to_string());
+            }
+            if let Some(root) = root_cid {
+                url.query_pairs_mut().append_pair("root_cid", &root);
+            }
+            if let Some(checkpoint) = checkpoint_cid {
+                url.query_pairs_mut()
+                    .append_pair("checkpoint_cid", &checkpoint);
+            }
+            if let Some(name) = named_snapshot {
+                url.query_pairs_mut().append_pair("named_snapshot", &name);
+            }
+            download_to_file(url, &output).await?;
+            serde_json::json!({"database":database,"output":output,"status":"exported"})
+        }
+        SqliteSubcommand::History { database } => {
+            let info = sqlite_info_for_namespace(api, &database).await?;
+            send_json(
+                api,
+                reqwest::Method::GET,
+                &["v1", "namespaces", &info, "history"],
+                None,
+            )
+            .await?
+        }
+        SqliteSubcommand::Snapshot { command } => match command {
+            SnapshotSubcommand::List {
+                namespace: database,
+            } => {
+                let namespace = sqlite_info_for_namespace(api, &database).await?;
+                send_json(
+                    api,
+                    reqwest::Method::GET,
+                    &["v1", "namespaces", &namespace, "snapshots"],
+                    None,
+                )
+                .await?
+            }
+            SnapshotSubcommand::Create {
+                namespace: database,
+                name,
+                revision,
+                request_id: id,
+            } => {
+                let namespace = sqlite_info_for_namespace(api, &database).await?;
+                send_json(
+                    api,
+                    reqwest::Method::POST,
+                    &["v1", "namespaces", &namespace, "snapshots"],
+                    Some(serde_json::json!({"action":"create","name":name,"revision":revision,"request_id":id.unwrap_or_else(request_id)})),
+                )
+                .await?
+            }
+            SnapshotSubcommand::Delete {
+                namespace: database,
+                name,
+                request_id: id,
+            } => {
+                let namespace = sqlite_info_for_namespace(api, &database).await?;
+                send_json(
+                    api,
+                    reqwest::Method::POST,
+                    &["v1", "namespaces", &namespace, "snapshots"],
+                    Some(serde_json::json!({"action":"delete","name":name,"request_id":id.unwrap_or_else(request_id)})),
+                )
+                .await?
+            }
+        },
+        SqliteSubcommand::Rollback {
+            database,
+            revision,
+            request_id: id,
+        } => send_json(
+            api,
+            reqwest::Method::POST,
+            &["v1", "sqlite", "databases", &database, "rollback"],
+            Some(
+                serde_json::json!({"revision":revision,"request_id":id.unwrap_or_else(request_id)}),
+            ),
+        )
+        .await?,
+        SqliteSubcommand::Check { database } => {
+            send_json(
+                api,
+                reqwest::Method::GET,
+                &["v1", "sqlite", "databases", &database, "check"],
+                None,
+            )
+            .await?
+        }
+        SqliteSubcommand::Compact {
+            database,
+            request_id: id,
+        } => {
+            send_json(
+                api,
+                reqwest::Method::POST,
+                &["v1", "sqlite", "databases", &database, "compact"],
+                Some(serde_json::json!({"request_id":id.unwrap_or_else(request_id)})),
+            )
+            .await?
+        }
+        SqliteSubcommand::CommitStatus {
+            database,
+            commit_id,
+        } => {
+            send_json(
+                api,
+                reqwest::Method::GET,
+                &[
+                    "v1",
+                    "sqlite",
+                    "databases",
+                    &database,
+                    "commits",
+                    &commit_id,
+                ],
+                None,
+            )
+            .await?
+        }
+    };
+    print_namespace_json(&value, json)
+}
+
+async fn sqlite_info_for_namespace(api: &str, database: &str) -> Result<String> {
+    let info = send_json(
+        api,
+        reqwest::Method::GET,
+        &["v1", "sqlite", "databases", database],
+        None,
+    )
+    .await?;
+    info["namespace_id"]
+        .as_str()
+        .map(str::to_string)
+        .context("SQLite info response is missing namespace_id")
+}
+
+async fn decode_json_response(response: reqwest::Response) -> Result<serde_json::Value> {
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        if let Ok(error) = serde_json::from_slice::<pepper_types::ErrorResponse>(&bytes) {
+            anyhow::bail!("{:?}: {}", error.code, error.error);
+        }
+        anyhow::bail!(
+            "agent returned HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    serde_json::from_slice(&bytes).context("failed to decode agent JSON response")
 }
 
 fn mutation_body(
@@ -1863,4 +2215,56 @@ fn block_url(api: &str, cid: &str) -> Result<reqwest::Url> {
         .map_err(|_| anyhow::anyhow!("agent API URL cannot be a base for path segments"))?
         .extend(["v1", "blocks", cid]);
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_export_accepts_each_historical_selector() {
+        for selector in [
+            vec!["--snapshot", "cid://snapshot"],
+            vec!["--revision", "7"],
+            vec!["--root-cid", "cid://root"],
+            vec!["--checkpoint-cid", "cid://checkpoint"],
+            vec!["--named-snapshot", "release"],
+        ] {
+            let mut arguments = vec!["pepper", "sqlite", "export", "db", "--output", "db.sqlite"];
+            arguments.extend(selector);
+            assert!(Args::try_parse_from(arguments).is_ok());
+        }
+    }
+
+    #[test]
+    fn sqlite_export_rejects_ambiguous_historical_selectors() {
+        assert!(
+            Args::try_parse_from([
+                "pepper",
+                "sqlite",
+                "export",
+                "db",
+                "--output",
+                "db.sqlite",
+                "--revision",
+                "7",
+                "--named-snapshot",
+                "release",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sqlite_rollback_requires_database_and_revision() {
+        assert!(Args::try_parse_from(["pepper", "sqlite", "rollback", "db", "7"]).is_ok());
+        assert!(Args::try_parse_from(["pepper", "sqlite", "rollback", "db"]).is_err());
+    }
+
+    #[test]
+    fn sqlite_admin_surface_includes_staging_and_repair() {
+        for command in ["status", "sessions", "locks", "staging", "repair"] {
+            assert!(Args::try_parse_from(["pepper", "admin", "sqlite", command]).is_ok());
+        }
+    }
 }

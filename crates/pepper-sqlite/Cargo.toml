@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-sqlite"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+
+[dependencies]
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+pepper-dag = { path = "../pepper-dag", version = "0.3.0" }
+pepper-merkle = { path = "../pepper-merkle", version = "0.3.0" }
+pepper-types = { path = "../pepper-types", version = "0.3.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+tempfile = "3.23"

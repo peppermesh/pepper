@@ -591,6 +591,48 @@ pub struct PublicationCoordinator<D, P> {
     protection: Arc<P>,
     limits: PublicationLimits,
     fault_injector: Arc<dyn PublicationFaultInjector>,
+    proposer: Arc<dyn GuardedNamespaceProposer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationGuard {
+    None,
+    Application { kind: String, payload: Vec<u8> },
+}
+
+#[async_trait]
+pub trait GuardedNamespaceProposer: Send + Sync {
+    async fn propose(
+        &self,
+        namespace: &NamespaceId,
+        guard: &PublicationGuard,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, PublicationError>;
+}
+
+struct RoutedNamespaceProposer {
+    manager: Arc<NamespaceGroupManager>,
+}
+
+#[async_trait]
+impl GuardedNamespaceProposer for RoutedNamespaceProposer {
+    async fn propose(
+        &self,
+        namespace: &NamespaceId,
+        guard: &PublicationGuard,
+        command: CommandEnvelope,
+    ) -> Result<ConsensusResponse, PublicationError> {
+        if !matches!(guard, PublicationGuard::None) {
+            return Err(PublicationError::Application {
+                code: "unsupported_publication_guard".into(),
+                message: "the default namespace proposer accepts no application guard".into(),
+            });
+        }
+        self.manager
+            .routed_write(namespace, command)
+            .await
+            .map_err(|error| PublicationError::Namespace(error.to_string()))
+    }
 }
 
 impl<D, P> PublicationCoordinator<D, P>
@@ -607,6 +649,9 @@ where
         protection: Arc<P>,
         limits: PublicationLimits,
     ) -> Result<Self, PublicationError> {
+        let proposer = Arc::new(RoutedNamespaceProposer {
+            manager: manager.clone(),
+        });
         Ok(Self {
             manager,
             data_store,
@@ -616,7 +661,13 @@ where
             protection,
             limits: limits.validate()?,
             fault_injector: Arc::new(NoFaults),
+            proposer,
         })
+    }
+
+    pub fn with_proposer(mut self, proposer: Arc<dyn GuardedNamespaceProposer>) -> Self {
+        self.proposer = proposer;
+        self
     }
 
     pub fn with_fault_injector(
@@ -662,6 +713,24 @@ where
         request: PublicationRequest,
         now: i64,
     ) -> Result<PublicationResult, PublicationError> {
+        self.publish_guarded(request, PublicationGuard::None, now)
+            .await
+    }
+
+    pub async fn publish_guarded(
+        &self,
+        request: PublicationRequest,
+        guard: PublicationGuard,
+        now: i64,
+    ) -> Result<PublicationResult, PublicationError> {
+        if let PublicationGuard::Application { kind, payload } = &guard
+            && (kind.is_empty() || kind.len() > 128 || payload.len() > 64 * 1024)
+        {
+            return Err(PublicationError::Application {
+                code: "invalid_publication_guard".into(),
+                message: "application publication guard exceeds its bounds".into(),
+            });
+        }
         let lease_id = format!("{}:{}", request.namespace_id, request.command.request_id);
         let expires = now
             .checked_add(request.staging_ttl_seconds)
@@ -709,7 +778,7 @@ where
             )
             .await?;
 
-        let result = self.publish_staged(&request, &mut lease, now).await;
+        let result = self.publish_staged(&request, &guard, &mut lease, now).await;
         if result.is_ok() {
             // Permanent distributed protection must be visible before temporary
             // staging pins are withdrawn.
@@ -736,6 +805,7 @@ where
     async fn publish_staged(
         &self,
         request: &PublicationRequest,
+        guard: &PublicationGuard,
         lease: &mut StagingLease,
         now: i64,
     ) -> Result<(ApplyResult, Vec<DurabilityReceipt>), PublicationError> {
@@ -963,10 +1033,9 @@ where
         let response = {
             let _timer =
                 PhaseTimer::start(&RAFT_PUBLICATION_OBSERVATIONS, &RAFT_PUBLICATION_MICROS);
-            self.manager
-                .routed_write(&request.namespace_id, request.command.clone())
-                .await
-                .map_err(|error| PublicationError::Namespace(error.to_string()))?
+            self.proposer
+                .propose(&request.namespace_id, guard, request.command.clone())
+                .await?
         };
         self.fault(PublicationFaultPoint::QuorumCommit)?;
         self.fault(PublicationFaultPoint::StateMachineApply)?;

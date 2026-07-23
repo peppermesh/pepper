@@ -490,6 +490,12 @@ impl ClusterBackend for ProcessBackend {
             })
         } else if program == "pepper-agent" {
             self.agent_binary.clone()
+        } else if program == "pepper-sqlite" {
+            self.agent_binary.with_file_name(if cfg!(windows) {
+                "pepper-sqlite.exe"
+            } else {
+                "pepper-sqlite"
+            })
         } else {
             PathBuf::from(program)
         };

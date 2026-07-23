@@ -61,6 +61,8 @@ pub struct ClusterSpec {
     pub replication_factor: usize,
     pub namespace_voter_count: Option<usize>,
     pub net_admin: bool,
+    #[serde(default)]
+    pub sqlite_enabled: bool,
 }
 
 impl ClusterSpec {
@@ -100,6 +102,7 @@ impl ClusterSpec {
             replication_factor,
             namespace_voter_count: (node_count >= 3).then_some(3),
             net_admin: false,
+            sqlite_enabled: false,
         }
     }
 

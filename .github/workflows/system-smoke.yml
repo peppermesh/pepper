@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [BOOT-002, BLOCK-001, NS-003, LIN-001]
+        scenario: [BOOT-002, BLOCK-001, NS-003, LIN-001, SQLITE-001, SQLITE-003]
     env:
       TOKIO_WORKER_THREADS: "2"
       SYSTEM_TEST_SEED: "20260712"

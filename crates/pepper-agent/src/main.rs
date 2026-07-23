@@ -11,6 +11,7 @@ mod http;
 mod metrics;
 mod namespace_api;
 mod network_services;
+mod object_write;
 mod objects;
 mod pins;
 mod placement;
@@ -19,6 +20,7 @@ mod reconstructed_cache;
 mod repair;
 mod s3_api;
 mod small_object_pack;
+mod sqlite_api;
 
 use api_error::ApiError;
 use bucket_api::*;
@@ -29,6 +31,7 @@ use filesystem_api::*;
 use metrics::*;
 use namespace_api::*;
 use network_services::*;
+use object_write::*;
 use objects::*;
 use pins::*;
 use placement::{PlacementRuntime, placement_map_from_candidates};
@@ -37,6 +40,7 @@ use reconstructed_cache::ReconstructedStripeCache;
 use repair::*;
 use s3_api::*;
 use small_object_pack::*;
+use sqlite_api::*;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -92,6 +96,9 @@ use pepper_placement::{
     PlacementNode, select_replicas,
 };
 use pepper_publication::{PublicationLimits, PublicationRepository};
+use pepper_sqlite::format::{
+    SqliteDatabaseCodecHandler, SqlitePageTableCodecHandler, SqliteSnapshotCodecHandler,
+};
 use pepper_storage::{BlockStore, StorageError};
 use pepper_types::{
     CODEC_BUCKET_PARTITION_BARRIER, CODEC_DIR_MANIFEST, CODEC_ERASURE_MANIFEST,
@@ -149,6 +156,7 @@ const ERASURE_COMPRESSION_PROBE_REGION_BYTES: usize = 16 * 1024;
 const ERASURE_HEDGE_MAX_ACTIVE_STRIPE_READS: u64 = 1;
 const ERASURE_STRIPE_READ_CONCURRENCY: usize = 32;
 const ERASURE_REPAIR_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
+const CONTROL_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "pepper-agent", about = "Pepper node agent")]
@@ -234,6 +242,13 @@ struct AppState {
     identity: NodeIdentity,
     api_bearer_token: Option<String>,
     s3: Option<Arc<S3RuntimeConfig>>,
+    sqlite_enabled: bool,
+    sqlite_ready: Arc<std::sync::atomic::AtomicBool>,
+    sqlite_config: Option<Arc<pepper_config::SqliteConfig>>,
+    sqlite_sessions: Arc<Mutex<HashMap<String, SqliteReadSession>>>,
+    sqlite_pack_cache: Arc<pepper_sqlite::ImmutableBlockCache>,
+    sqlite_pack_fetches: Arc<tokio::sync::Mutex<HashMap<Cid, Arc<tokio::sync::Mutex<()>>>>>,
+    sqlite_socket_path: Option<PathBuf>,
     max_block_bytes: Option<u64>,
     max_object_bytes: Option<u64>,
     small_object_max_bytes: Option<u64>,
@@ -382,6 +397,10 @@ fn control_runtime(config: &pepper_config::FastPathConfig) -> Result<tokio::runt
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(control_threads)
         .thread_name("pepper-control")
+        // Raft group initialization and the HTTP service both instantiate
+        // large async state machines on these workers. Tokio's 2 MiB default
+        // is insufficient once the SQLite consensus routes are linked in.
+        .thread_stack_size(CONTROL_THREAD_STACK_BYTES)
         .on_thread_start(move || {
             if pin_cpus && !thread_cpus.is_empty() {
                 let index = thread_index.fetch_add(1, Ordering::Relaxed) as usize;
@@ -924,6 +943,17 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     dag_registry
         .register(NamespaceCommitCodecHandler)
         .expect("namespace commit codec must be registered exactly once");
+    if loaded.config.sqlite.enabled {
+        dag_registry
+            .register(SqliteDatabaseCodecHandler)
+            .expect("SQLite database codec must be registered exactly once");
+        dag_registry
+            .register(SqliteSnapshotCodecHandler)
+            .expect("SQLite snapshot codec must be registered exactly once");
+        dag_registry
+            .register(SqlitePageTableCodecHandler)
+            .expect("SQLite page-table codec must be registered exactly once");
+    }
     let namespace_data_store =
         ConsensusDataStore::from_networked_block_store(block_store.clone(), network.clone());
     let namespace_groups =
@@ -1079,6 +1109,28 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         identity: identity.clone(),
         api_bearer_token: loaded.config.auth.api_bearer_token.clone(),
         s3,
+        sqlite_enabled: loaded.config.sqlite.enabled,
+        // The feature gate is visible before its socket/session runtime is
+        // constructed. Disabled nodes preserve baseline readiness exactly.
+        sqlite_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sqlite_config: loaded
+            .config
+            .sqlite
+            .enabled
+            .then(|| Arc::new(loaded.config.sqlite.clone())),
+        sqlite_sessions: Arc::new(Mutex::new(HashMap::new())),
+        sqlite_pack_cache: Arc::new(pepper_sqlite::ImmutableBlockCache::new(
+            loaded.config.sqlite.page_cache_bytes.min(usize::MAX as u64) as usize,
+        )),
+        sqlite_pack_fetches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sqlite_socket_path: loaded.config.sqlite.enabled.then(|| {
+            loaded
+                .config
+                .sqlite
+                .socket_path
+                .clone()
+                .unwrap_or_else(|| loaded.config.data.path.join("sqlite.sock"))
+        }),
         max_block_bytes: Some(
             loaded
                 .config
@@ -1175,6 +1227,10 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     spawn_s3_lifecycle_reconciler(state.clone());
     spawn_s3_placement_refresh_loop(state.clone());
     spawn_small_object_pack_loop(state.clone());
+    #[cfg(unix)]
+    if state.sqlite_enabled {
+        spawn_sqlite_protocol_server(state.clone()).await?;
+    }
 
     let shutdown_state = state.clone();
     let app = http::router(state);
@@ -5165,39 +5221,10 @@ async fn put_object_bytes_receipt(
     state: &AppState,
     bytes: Vec<u8>,
 ) -> Result<DurabilityReceipt, ApiError> {
-    enforce_size_limit(state.max_object_bytes, bytes.len() as u64, "object")?;
-    let mut transfers = stream::FuturesOrdered::new();
-    let mut chunks = Vec::new();
-    let mut all_chunks_durable = true;
-    let pipeline_depth = object_chunk_pipeline_depth(state.replication_factor);
-    for (index, chunk) in bytes.chunks(OBJECT_CHUNK_SIZE).enumerate() {
-        transfers.push_back(put_object_chunk(
-            state,
-            chunk.to_vec(),
-            (index * OBJECT_CHUNK_SIZE) as u64,
-        ));
-        if transfers.len() >= pipeline_depth {
-            let (chunk, receipt) = transfers
-                .next()
-                .await
-                .expect("a full object chunk pipeline has a result")?;
-            all_chunks_durable &= receipt.status == "durable";
-            chunks.push(chunk);
-        }
-    }
-    while let Some(result) = transfers.next().await {
-        let (chunk, receipt) = result?;
-        all_chunks_durable &= receipt.status == "durable";
-        chunks.push(chunk);
-    }
-    let manifest = ObjectManifest::new(bytes.len() as u64, OBJECT_CHUNK_SIZE as u64, chunks);
-    manifest.validate().map_err(ApiError::manifest)?;
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(ApiError::serde)?;
-    let mut receipt = put_replicated_block(state, CODEC_OBJECT_MANIFEST, manifest_bytes).await?;
-    if !all_chunks_durable {
-        receipt.status = "degraded".to_string();
-    }
-    Ok(receipt)
+    Ok(ObjectWriteService::new(state.clone())
+        .write_bytes(bytes, ObjectWritePolicy::Replicated)
+        .await?
+        .receipt)
 }
 
 async fn put_object_chunk(
@@ -5363,27 +5390,37 @@ async fn readyz(State(state): State<AppState>) -> Response {
     // I/O to the known leader. Readiness describes whether the group can
     // serve/reroute requests; exact apply lag remains an admin metric and a
     // benchmark health assertion.
-    let ready = statuses.iter().all(|status| {
+    let namespace_ready = statuses.iter().all(|status| {
         status.running
             && status.leader_raft_id.is_some()
             && status.voter_count == 3
             && !status.membership_joint
             && (status.role != "leader" || status.quorum_recently_acknowledged)
     });
+    let sqlite_ready = state.sqlite_ready.load(Ordering::Relaxed);
+    let ready = namespace_ready && (!state.sqlite_enabled || sqlite_ready);
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (
-        status,
-        Json(serde_json::json!({
-            "ready": ready,
-            "node_id": state.status.node_id,
-            "namespace_groups": statuses
-        })),
-    )
-        .into_response()
+    let mut report = serde_json::json!({
+        "ready": ready,
+        "node_id": state.status.node_id,
+        "namespace_groups": statuses
+    });
+    if state.sqlite_enabled {
+        report["sqlite"] = serde_json::json!({
+            "enabled": true,
+            "ready": sqlite_ready && namespace_ready,
+            "runtime_ready": sqlite_ready,
+            "write_quorum_ready": namespace_ready,
+            "read_only_degraded": sqlite_ready && !namespace_ready,
+            "access_mode": if !sqlite_ready { "unavailable" } else if namespace_ready { "read_write" } else { "read_only_degraded" },
+            "reason": if !sqlite_ready { "runtime_not_started" } else if namespace_ready { "ready" } else { "write_quorum_unavailable" }
+        });
+    }
+    (status, Json(report)).into_response()
 }
 
 async fn require_http_auth_and_rate_limit(

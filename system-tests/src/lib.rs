@@ -33,10 +33,25 @@ use scenarios::{
     NamespaceRoutingScenario, NamespaceTransactionScenario, NemesisScenario, NetworkFaultScenario,
     ObjectScenario, PinDeletionScenario, PinProtectionScenario, PlacementScenario,
     ProcessFaultScenario, ProviderFallbackScenario, RawBlockScenario, RepairScenario,
-    SoakQualificationScenario, StorageFaultScenario, ThreeNodeBootstrapScenario,
-    WanQualificationScenario,
+    SoakQualificationScenario, SqliteBatchAtomicScenario, SqliteCompatibilityScenario,
+    SqliteDurabilityScenario, SqliteImportExportScenario, SqliteLargeTransactionScenario,
+    SqliteLeaderFailoverScenario, SqliteMinorityFencingScenario, SqliteMultiWriterScenario,
+    SqliteReadOnlyMultiIngressScenario, SqliteSoakScenario, StorageFaultScenario,
+    ThreeNodeBootstrapScenario, WanQualificationScenario,
 };
 use std::sync::Arc;
+
+pub const SQLITE_SCENARIOS: &[(&str, &str)] = &[
+    ("SQLITE-001", "sqlite-import-export-format"),
+    ("SQLITE-002", "sqlite-read-only-multi-ingress"),
+    ("SQLITE-003", "sqlite-batch-atomic-commit"),
+    ("SQLITE-004", "sqlite-multi-peer-writer-serialization"),
+    ("SQLITE-005", "sqlite-leader-failover-ambiguity"),
+    ("SQLITE-006", "sqlite-minority-partition-fencing"),
+    ("SQLITE-007", "sqlite-durability-gc-repair"),
+    ("SQLITE-008", "sqlite-large-transaction-compaction"),
+    ("SQLITE-009", "sqlite-vfs-compatibility"),
+];
 
 /// Stable scenario registry used by the CLI and CI filters.
 pub fn scenario_names() -> &'static [(&'static str, &'static str)] {
@@ -84,6 +99,16 @@ pub fn scenario_names() -> &'static [(&'static str, &'static str)] {
         ("SOAK-001", "fixed-kernel-growth-soak"),
         ("WAN-001", "tailscale-direct-wan"),
         ("KVM-001", "firecracker-rootfs-cancel"),
+        ("SQLITE-001", "sqlite-import-export-format"),
+        ("SQLITE-002", "sqlite-read-only-multi-ingress"),
+        ("SQLITE-003", "sqlite-batch-atomic-commit"),
+        ("SQLITE-004", "sqlite-multi-peer-writer-serialization"),
+        ("SQLITE-005", "sqlite-leader-failover-ambiguity"),
+        ("SQLITE-006", "sqlite-minority-partition-fencing"),
+        ("SQLITE-007", "sqlite-durability-gc-repair"),
+        ("SQLITE-008", "sqlite-large-transaction-compaction"),
+        ("SQLITE-009", "sqlite-vfs-compatibility"),
+        ("SOAK-SQLITE-001", "sqlite-bounded-soak"),
     ]
 }
 
@@ -138,6 +163,53 @@ pub fn scenario_by_name(name: &str) -> Result<Arc<dyn Scenario>> {
         "SOAK-001" | "fixed-kernel-growth-soak" => Ok(Arc::new(SoakQualificationScenario)),
         "WAN-001" | "tailscale-direct-wan" => Ok(Arc::new(WanQualificationScenario)),
         "KVM-001" | "firecracker-rootfs-cancel" => Ok(Arc::new(KvmFirecrackerScenario)),
+        "SQLITE-001" | "sqlite-import-export-format" => Ok(Arc::new(SqliteImportExportScenario)),
+        "SQLITE-002" | "sqlite-read-only-multi-ingress" => {
+            Ok(Arc::new(SqliteReadOnlyMultiIngressScenario))
+        }
+        "SQLITE-003" | "sqlite-batch-atomic-commit" => Ok(Arc::new(SqliteBatchAtomicScenario)),
+        "SQLITE-004" | "sqlite-multi-peer-writer-serialization" => {
+            Ok(Arc::new(SqliteMultiWriterScenario))
+        }
+        "SQLITE-005" | "sqlite-leader-failover-ambiguity" => {
+            Ok(Arc::new(SqliteLeaderFailoverScenario))
+        }
+        "SQLITE-006" | "sqlite-minority-partition-fencing" => {
+            Ok(Arc::new(SqliteMinorityFencingScenario))
+        }
+        "SQLITE-007" | "sqlite-durability-gc-repair" => Ok(Arc::new(SqliteDurabilityScenario)),
+        "SQLITE-008" | "sqlite-large-transaction-compaction" => {
+            Ok(Arc::new(SqliteLargeTransactionScenario))
+        }
+        "SQLITE-009" | "sqlite-vfs-compatibility" => Ok(Arc::new(SqliteCompatibilityScenario)),
+        "SOAK-SQLITE-001" | "sqlite-bounded-soak" => Ok(Arc::new(SqliteSoakScenario)),
         _ => bail!("unknown scenario {name:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn sqlite_scenario_range_is_executable_and_disjoint() {
+        assert_eq!(SQLITE_SCENARIOS.len(), 9);
+        for (index, (id, name)) in SQLITE_SCENARIOS.iter().enumerate() {
+            assert_eq!(*id, format!("SQLITE-{:03}", index + 1));
+            assert!(name.starts_with("sqlite-"));
+            assert!(scenario_by_name(id).is_ok());
+            assert!(scenario_by_name(name).is_ok());
+        }
+        let active = scenario_names()
+            .iter()
+            .flat_map(|(id, name)| [*id, *name])
+            .collect::<HashSet<_>>();
+        assert!(
+            SQLITE_SCENARIOS
+                .iter()
+                .flat_map(|(id, name)| [*id, *name])
+                .all(|value| active.contains(value))
+        );
     }
 }

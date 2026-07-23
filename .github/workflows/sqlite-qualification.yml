@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: sqlite-qualification
+
+on:
+  pull_request:
+    paths:
+      - "crates/pepper-sqlite/**"
+      - "crates/pepper-sqlite-vfs/**"
+      - "crates/pepper-agent/src/sqlite_api.rs"
+      - ".github/workflows/sqlite-qualification.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz immutable formats, URI, and local frames
+        env:
+          # Some distro llvm-symbolizer builds can block libFuzzer's progress;
+          # crash addresses remain available in the uploaded job log.
+          ASAN_OPTIONS: symbolize=0
+        run: >-
+          cargo +nightly fuzz run
+          --fuzz-dir crates/pepper-sqlite/fuzz sqlite_decoders
+          -- -max_total_time=120
+
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Exercise SQLite and its C VFS under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: >-
+          cargo +nightly test -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p pepper-sqlite -p pepper-sqlite-vfs

@@ -18,9 +18,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Semaphore;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -303,7 +304,7 @@ async fn s3_multipart_upload_http_contract() -> TestResult<()> {
         wait_health(port).await?;
     }
     for port in [api, api2, api3] {
-        wait_for_peer_count(port, 2).await?;
+        wait_for_connected_peer_count(port, 2).await?;
     }
     let client = reqwest::Client::builder()
         // Completion verifies the composed object's full DAG and may cross several
@@ -505,7 +506,7 @@ async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()
     let _node3 = spawn_agent(agent, &config3)?;
     for api in [api1, api2, api3] {
         wait_health(api).await?;
-        wait_for_peer_count(api, 2).await?;
+        wait_for_connected_peer_count(api, 2).await?;
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -654,12 +655,17 @@ async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()
     }
     let initial_term = stable_namespace_term(&client, api1, "load-test").await?;
     let ports = [api1, api2, api3];
+    // Preserve the full load while avoiding a 96-request thundering herd that
+    // can starve three agents' Raft runtimes on two-core CI workers.
+    let request_slots = Arc::new(Semaphore::new(8));
     let mut writes = tokio::task::JoinSet::new();
     for index in 0..32usize {
         let client = client.clone();
         let api = ports[index % ports.len()];
         let body = vec![index as u8; 4 * 1024];
+        let request_slots = Arc::clone(&request_slots);
         writes.spawn(async move {
+            let _permit = request_slots.acquire_owned().await?;
             signed_s3_success_with_retry(
                 &client,
                 api,
@@ -675,7 +681,9 @@ async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()
     for request in 0..64usize {
         let client = client.clone();
         let api = ports[request % ports.len()];
+        let request_slots = Arc::clone(&request_slots);
         reads.spawn(async move {
+            let _permit = request_slots.acquire_owned().await?;
             let response = signed_s3_success_with_retry(
                 &client,
                 api,
@@ -821,7 +829,9 @@ async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()
     for index in 0..16usize {
         let client = client.clone();
         let api = ports[index % ports.len()];
+        let request_slots = Arc::clone(&request_slots);
         reconfiguration_writes.spawn(async move {
+            let _permit = request_slots.acquire_owned().await?;
             signed_s3_success_with_retry(
                 &client,
                 api,
@@ -944,7 +954,7 @@ async fn s3_catalog_survives_gateway_loss_and_concurrent_load() -> TestResult<()
     node2.kill_and_wait();
     let _restarted_node2 = spawn_agent(agent, &config2)?;
     wait_health(api2).await?;
-    wait_for_peer_count(api2, 2).await?;
+    wait_for_connected_peer_count(api2, 2).await?;
     let after_restart = signed_s3_success_with_retry(
         &client,
         api2,
@@ -1265,7 +1275,7 @@ async fn s3_adaptive_erasure_transfer_plans_preserve_canonical_layout() -> TestR
             .filter(|(peer_index, _)| *peer_index != index)
             .map(|(_, address)| address.clone())
             .collect::<Vec<_>>();
-        configs.push(write_s3_erasure_config_with_strategy(
+        configs.push(write_s3_erasure_config_with_options(
             temp.path(),
             &node_name,
             &format!("rack-{}", index + 1),
@@ -1276,6 +1286,7 @@ async fn s3_adaptive_erasure_transfer_plans_preserve_canonical_layout() -> TestR
                 .get(index)
                 .copied()
                 .or((index == 4).then_some("distributed-parity")),
+            1,
         )?);
         node_names.push(node_name);
     }
@@ -1296,7 +1307,7 @@ async fn s3_adaptive_erasure_transfer_plans_preserve_canonical_layout() -> TestR
         wait_health(*api).await?;
     }
     for api in &api_ports[..4] {
-        wait_for_peer_count(*api, 8).await?;
+        wait_for_connected_peer_count(*api, 8).await?;
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
@@ -1537,7 +1548,7 @@ async fn s3_adaptive_erasure_transfer_plans_preserve_canonical_layout() -> TestR
         &logs[failed_target_index],
     )?;
     wait_health(api_ports[failed_target_index]).await?;
-    wait_for_peer_count(api_ports[failure_gateway_index], 8).await?;
+    wait_for_connected_peer_count(api_ports[failure_gateway_index], 8).await?;
     signed_s3_success_with_retry(
         &client,
         api_ports[failure_gateway_index],
@@ -1635,7 +1646,7 @@ async fn s3_placement_owned_repair_fails_over_migrates_and_collects_extras() -> 
     for api in &api_ports {
         wait_health(*api).await?;
     }
-    wait_for_peer_count(api_ports[0], 3).await?;
+    wait_for_connected_peer_count(api_ports[0], 3).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()?;
@@ -2036,6 +2047,12 @@ async fn s3_placement_owned_repair_fails_over_migrates_and_collects_extras() -> 
 
 async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> TestResult<()> {
     let temp = tempfile::tempdir()?;
+    // The streaming contract exercises 6+3 data placement and reconstruction,
+    // not metadata partition scaling. The packing contract needs multiple
+    // partitions to exercise split-local repacking, while the catalog contract
+    // owns the heavier 16-partition scaling coverage.
+    let bucket_partitions = if exercise_small_object_pack { 4 } else { 1 };
+    let packed_partition_hash_end = 65_536 / u64::from(bucket_partitions);
     let p2p_ports = (0..9)
         .map(|_| free_port())
         .collect::<TestResult<Vec<_>>>()?;
@@ -2056,13 +2073,14 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
             .filter(|(peer_index, _)| *peer_index != index)
             .map(|(_, address)| address.clone())
             .collect::<Vec<_>>();
-        configs.push(write_s3_erasure_config(
+        configs.push(write_s3_erasure_config_with_partitions(
             temp.path(),
             &name,
             &format!("rack-{}", index + 1),
             p2p_ports[index],
             api_ports[index],
             &bootstrap,
+            bucket_partitions,
         )?);
         node_names.push(name);
     }
@@ -2089,21 +2107,27 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     for api in &api_ports {
         wait_health(*api).await?;
     }
-    wait_for_peer_count(api_ports[0], 8).await?;
+    for api in &api_ports {
+        wait_for_connected_peer_count(*api, 8).await?;
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()?;
     let provider_discovery_before =
         prometheus_rpc_requests(&client, &api_ports, "/block/providers").await?;
-    signed_s3_success_with_retry(
+    if let Err(error) = signed_s3_success_with_retry(
         &client,
         api_ports[0],
         Method::PUT,
         "/ec-streaming",
         Vec::new(),
     )
-    .await?;
+    .await
+    {
+        dump_s3_cluster_diagnostics(&client, &api_ports, &logs).await;
+        return Err(error);
+    }
     if exercise_small_object_pack {
         let small_sizes = [
             4 * 1024,
@@ -2120,7 +2144,7 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
         while small_objects.len() < small_sizes.len() {
             let key = format!("packed-{candidate:08}.bin");
             let digest = Cid::new(pepper_types::CODEC_RAW, key.as_bytes()).digest;
-            if u16::from_be_bytes([digest[0], digest[1]]) < 4096 {
+            if u64::from(u16::from_be_bytes([digest[0], digest[1]])) < packed_partition_hash_end {
                 let size = small_sizes[small_objects.len()];
                 let payload = match small_objects.len() {
                     6 => deterministic_compressible(size, candidate + 11, 10),
@@ -2188,7 +2212,7 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
             &[("PEPPER_TEST_DISABLE_SMALL_PACK_BACKGROUND", "1")],
         )?;
         wait_health(api_ports[0]).await?;
-        wait_for_peer_count(api_ports[1], 8).await?;
+        wait_for_connected_peer_count(api_ports[1], 8).await?;
         let packed_response = client
             .post(format!(
                 "http://127.0.0.1:{}/v1/admin/s3/buckets/ec-streaming/pack",
@@ -2299,7 +2323,8 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
             if let Some(partition) = partitions["partitions"].as_array().and_then(|partitions| {
                 partitions.iter().find(|partition| {
                     partition["partition"]["hash_start"].as_u64() == Some(0)
-                        && partition["partition"]["hash_end"].as_u64() == Some(4096)
+                        && partition["partition"]["hash_end"].as_u64()
+                            == Some(packed_partition_hash_end)
                         && partition["locally_hosted"].as_bool() == Some(true)
                 })
             }) {
@@ -2703,10 +2728,7 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     let put = match put {
         Ok(response) => response,
         Err(error) => {
-            for log in &logs {
-                eprintln!("===== {} =====", log.display());
-                eprintln!("{}", fs::read_to_string(log).unwrap_or_default());
-            }
+            dump_s3_cluster_diagnostics(&client, &api_ports, &logs).await;
             return Err(error);
         }
     };
@@ -2860,33 +2882,14 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     let full_response = match full_response {
         Ok(response) => response,
         Err(error) => {
-            for log in &logs {
-                let relevant = fs::read_to_string(log)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| {
-                        let lowercase = line.to_ascii_lowercase();
-                        lowercase.contains("erasure")
-                            || lowercase.contains("error")
-                            || lowercase.contains("warn")
-                            || lowercase.contains("panic")
-                    })
-                    .rev()
-                    .take(200)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                eprintln!("===== {} =====\n{relevant}", log.display());
-            }
+            dump_s3_cluster_diagnostics(&client, &api_ports, &logs).await;
             return Err(error);
         }
     };
     let full = match full_response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
-            for log in &logs {
-                eprintln!("===== {} =====", log.display());
-                eprintln!("{}", fs::read_to_string(log).unwrap_or_default());
-            }
+            dump_s3_cluster_diagnostics(&client, &api_ports, &logs).await;
             return Err(error.into());
         }
     };
@@ -2895,7 +2898,7 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     let range_start = 8 * 1024 * 1024usize;
     let range_end = 16 * 1024 * 1024usize - 1;
     let range_header = format!("bytes={range_start}-{range_end}");
-    let range_response = signed_s3_request_with_headers(
+    let range_response = signed_s3_success_with_headers_and_retry(
         &client,
         api_ports[2],
         Method::GET,
@@ -2907,27 +2910,11 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     let range_response = match range_response {
         Ok(response) => response,
         Err(error) => {
-            for log in &logs {
-                let relevant = fs::read_to_string(log)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|line| {
-                        let lowercase = line.to_ascii_lowercase();
-                        lowercase.contains("erasure")
-                            || lowercase.contains("error")
-                            || lowercase.contains("warn")
-                            || lowercase.contains("panic")
-                    })
-                    .rev()
-                    .take(200)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                eprintln!("===== {} =====\n{relevant}", log.display());
-            }
+            dump_s3_cluster_diagnostics(&client, &api_ports, &logs).await;
             return Err(error);
         }
     };
-    let range = s3_success(range_response).await?.bytes().await?;
+    let range = range_response.bytes().await?;
     assert_eq!(&range[..], &payload[range_start..=range_end]);
 
     let provider_discovery_after =
@@ -3486,6 +3473,605 @@ async fn transactional_namespace_http_contract() -> TestResult<()> {
         .await?;
     assert_eq!(tree_diff["changes"][0]["path"], "README");
     Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_whole_file_multi_ingress_exactly_one_writer_commits() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_config(temp.path(), "sqlite1", p2p1, api1, &[])?;
+    let config2 = write_config(
+        temp.path(),
+        "sqlite2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_config(
+        temp.path(),
+        "sqlite3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    for config in [&config1, &config2, &config3] {
+        let contents = fs::read_to_string(config)?;
+        fs::write(
+            config,
+            format!(
+                "{}\n[sqlite]\nenabled = true\n",
+                contents
+                    .replace("default_factor = 2", "default_factor = 3")
+                    .replace(
+                        "consensus_enabled = true",
+                        "consensus_enabled = true\nheartbeat_interval_ms = 250\nelection_timeout_min_ms = 1500\nelection_timeout_max_ms = 3000",
+                    )
+            ),
+        )?;
+    }
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let _one = spawn_agent(agent, &config1)?;
+    let _two = spawn_agent(agent, &config2)?;
+    let _three = spawn_agent(agent, &config3)?;
+    for port in [api1, api2, api3] {
+        wait_health(port).await?;
+    }
+    wait_for_peer_count(api1, 2).await?;
+    wait_for_peer_count(api2, 2).await?;
+    wait_for_peer_count(api3, 2).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let create = client
+        .post(format!(
+            "http://127.0.0.1:{api1}/v1/sqlite/experimental/databases"
+        ))
+        .json(&serde_json::json!({
+            "database":"shared-db",
+            "request_id":"sqlite-create",
+            "page_size":4096
+        }))
+        .send()
+        .await?;
+    if !create.status().is_success() {
+        return Err(format!(
+            "SQLite create failed: {} {}",
+            create.status(),
+            create.text().await?
+        )
+        .into());
+    }
+    assert_eq!(
+        create
+            .headers()
+            .get("x-pepper-experimental")
+            .and_then(|value| value.to_str().ok()),
+        Some("whole-file-v1")
+    );
+    let created: serde_json::Value = create.json().await?;
+    let namespace = created["namespace_id"]
+        .as_str()
+        .ok_or("missing SQLite namespace ID")?
+        .to_string();
+    let initial_head = created["head_cid"]
+        .as_str()
+        .ok_or("missing SQLite initial head")?
+        .to_string();
+    wait_for_namespace_quorum(&[api1, api2, api3], &namespace).await?;
+    let encoded_namespace = encode_path_segment(&namespace);
+
+    let initial_file = client
+        .get(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/experimental/databases/{encoded_namespace}/file"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert!(initial_file.is_empty());
+    let candidate_a = sqlite_candidate(temp.path(), "candidate-a.db", &initial_file, "writer-a")?;
+    let candidate_b = sqlite_candidate(temp.path(), "candidate-b.db", &initial_file, "writer-b")?;
+    let commit_url_a = format!(
+        "http://127.0.0.1:{api2}/v1/sqlite/experimental/databases/{encoded_namespace}/file"
+    );
+    let commit_url_b = format!(
+        "http://127.0.0.1:{api3}/v1/sqlite/experimental/databases/{encoded_namespace}/file"
+    );
+    let request_a = client
+        .put(commit_url_a)
+        .query(&[
+            ("request_id", "sqlite-writer-a"),
+            ("base_revision", "1"),
+            ("base_generation", "1"),
+            ("base_cid", initial_head.as_str()),
+        ])
+        .body(candidate_a.clone())
+        .send();
+    let request_b = client
+        .put(commit_url_b)
+        .query(&[
+            ("request_id", "sqlite-writer-b"),
+            ("base_revision", "1"),
+            ("base_generation", "1"),
+            ("base_cid", initial_head.as_str()),
+        ])
+        .body(candidate_b.clone())
+        .send();
+    let (response_a, response_b) = tokio::join!(request_a, request_b);
+    let response_a = response_a?;
+    let response_b = response_b?;
+    let a_won = response_a.status().is_success();
+    let b_won = response_b.status().is_success();
+    assert_ne!(a_won, b_won, "exactly one stale-base candidate must commit");
+    let loser = if a_won { &response_b } else { &response_a };
+    assert_eq!(loser.status(), StatusCode::CONFLICT);
+    let (winner_id, winner_bytes) = if a_won {
+        ("sqlite-writer-a", candidate_a)
+    } else {
+        ("sqlite-writer-b", candidate_b)
+    };
+
+    let status: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{api1}/v1/sqlite/experimental/databases/{encoded_namespace}/commits/{winner_id}"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(status["request_id"], winner_id);
+
+    let exported = client
+        .get(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/experimental/databases/{encoded_namespace}/file"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(exported.as_ref(), winner_bytes.as_slice());
+    let exported_path = temp.path().join("exported.db");
+    fs::write(&exported_path, &exported)?;
+    let connection = rusqlite::Connection::open_with_flags(
+        exported_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
+    let value: String = connection.query_row("SELECT value FROM records", [], |row| row.get(0))?;
+    assert_eq!(value, if a_won { "writer-a" } else { "writer-b" });
+
+    // Exercise the production page-DAG path through three distinct ingress
+    // peers. The imported ordinary file must export byte-identically and each
+    // peer's immutable read session must return the same verified page.
+    let create = client
+        .post(format!("http://127.0.0.1:{api1}/v1/sqlite/databases"))
+        .json(&serde_json::json!({
+            "database":"paged-db",
+            "request_id":"paged-create",
+            "page_size":4096
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let paged: serde_json::Value = create.json().await?;
+    let paged_namespace = paged["namespace_id"].as_str().unwrap();
+    let initial_snapshot = paged["snapshot_cid"].as_str().unwrap();
+    wait_for_namespace_quorum(&[api1, api2, api3], paged_namespace).await?;
+    let encoded_paged = encode_path_segment(paged_namespace);
+    let imported: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/import"
+        ))
+        .query(&[
+            ("request_id", "paged-import"),
+            ("base_revision", "1"),
+            ("base_generation", "1"),
+            ("base_snapshot", initial_snapshot),
+        ])
+        .body(winner_bytes.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let imported_snapshot = imported["snapshot_cid"].as_str().unwrap();
+    let exported = client
+        .get(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/databases/{encoded_paged}/export"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(exported.as_ref(), winner_bytes.as_slice());
+
+    let mut first_pages: Option<Vec<u8>> = None;
+    for port in [api2, api3] {
+        let session: serde_json::Value = client
+            .post(format!(
+                "http://127.0.0.1:{port}/v1/sqlite/databases/{encoded_paged}/sessions"
+            ))
+            .json(&serde_json::json!({"snapshot": imported_snapshot}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let session_id = session["session_id"].as_str().unwrap();
+        let page = client
+            .get(format!(
+                "http://127.0.0.1:{port}/v1/sqlite/sessions/{session_id}/pages"
+            ))
+            .query(&[("pages", "1")])
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        assert_eq!(page.len(), 4096);
+        if let Some(first) = &first_pages {
+            assert_eq!(page.as_ref(), first.as_slice());
+        } else {
+            first_pages = Some(page.to_vec());
+        }
+        client
+            .delete(format!(
+                "http://127.0.0.1:{port}/v1/sqlite/sessions/{session_id}"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let historical: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/sessions"
+        ))
+        .json(&serde_json::json!({"snapshot": imported_snapshot}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let historical_id = historical["session_id"].as_str().unwrap();
+    let historical_page = client
+        .get(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/sessions/{historical_id}/pages"
+        ))
+        .query(&[("pages", "1")])
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let incremental_bytes =
+        sqlite_update_candidate(temp.path(), "incremental.db", &winner_bytes, "incremental")?;
+    let dirty = incremental_bytes
+        .chunks_exact(4096)
+        .zip(winner_bytes.chunks_exact(4096))
+        .enumerate()
+        .filter(|(_, (next, base))| next != base)
+        .map(|(index, (next, _))| (index as u32 + 1, next))
+        .collect::<Vec<_>>();
+    assert!(!dirty.is_empty());
+
+    // Writer ownership is leader-scoped, not ingress-local: acquisitions sent
+    // through two different peers contend for the same ticket.
+    let probe_a: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/writer/acquire"
+        ))
+        .json(&serde_json::json!({
+            "session_id":"probe-a",
+            "acquisition_id":"probe-a",
+            "base_snapshot":imported_snapshot,
+            "base_generation":2,
+            "wait_timeout_millis":0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probe_a["status"], "granted");
+    let probe_b: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/databases/{encoded_paged}/writer/acquire"
+        ))
+        .json(&serde_json::json!({
+            "session_id":"probe-b",
+            "acquisition_id":"probe-b",
+            "base_snapshot":imported_snapshot,
+            "base_generation":2,
+            "wait_timeout_millis":0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probe_b["status"], "busy");
+    client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/writer/release"
+        ))
+        .json(&serde_json::json!({"ticket": probe_a["ticket"].clone()}))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let acquired: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/writer/acquire"
+        ))
+        .json(&serde_json::json!({
+            "session_id":"incremental-client",
+            "acquisition_id":"incremental-acquire",
+            "base_snapshot":imported_snapshot,
+            "base_generation":2,
+            "wait_timeout_millis":0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(acquired["status"], "granted");
+    let ticket = &acquired["ticket"];
+    let pages = dirty
+        .iter()
+        .map(|(number, _)| number.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let payload = dirty
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect::<Vec<_>>();
+    let commit = client
+        .post(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/{encoded_paged}/transactions"
+        ))
+        .query(&[
+            ("request_id", "incremental-commit".to_string()),
+            ("base_revision", "2".to_string()),
+            ("base_generation", "2".to_string()),
+            ("base_snapshot", imported_snapshot.to_string()),
+            ("new_logical_size", incremental_bytes.len().to_string()),
+            ("pages", pages),
+            (
+                "ticket_id",
+                ticket["ticket_id"].as_str().unwrap().to_string(),
+            ),
+            (
+                "acquisition_id",
+                ticket["acquisition_id"].as_str().unwrap().to_string(),
+            ),
+            ("holder", ticket["holder"].as_str().unwrap().to_string()),
+            ("leader_term", ticket["leader_term"].to_string()),
+            ("lease_epoch", ticket["lease_epoch"].to_string()),
+            ("expires_at_millis", ticket["expires_at_millis"].to_string()),
+        ])
+        .body(payload)
+        .send()
+        .await?;
+    if !commit.status().is_success() {
+        return Err(format!(
+            "incremental commit failed: {} {}",
+            commit.status(),
+            commit.text().await?
+        )
+        .into());
+    }
+    let committed: serde_json::Value = commit.json().await?;
+    assert_eq!(committed["commit"]["generation"], 3);
+    let recovered: serde_json::Value = client
+        .get(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/databases/{encoded_paged}/commits/incremental-commit"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        recovered["snapshot_cid"],
+        committed["commit"]["snapshot_cid"]
+    );
+    assert_eq!(recovered["generation"], 3);
+    let latest = client
+        .get(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/databases/{encoded_paged}/export"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(latest.as_ref(), incremental_bytes.as_slice());
+    let stable_historical_page = client
+        .get(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/sessions/{historical_id}/pages"
+        ))
+        .query(&[("pages", "1")])
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(stable_historical_page, historical_page);
+    client
+        .delete(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/sessions/{historical_id}"
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let socket = temp.path().join("sqlite1/data/sqlite.sock");
+    let backend = std::sync::Arc::new(pepper_sqlite_vfs::UnixSocketBackend::new(
+        socket,
+        Duration::from_secs(30),
+    ));
+    pepper_sqlite_vfs::register_pepper_vfs(backend)?;
+    {
+        let connection = rusqlite::Connection::open_with_flags(
+            "file:pepper%3Apaged-db?mode=rw&vfs=pepper&busy_timeout_ms=10000",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|error| {
+            format!(
+                "VFS open failed: {error}; {}",
+                pepper_sqlite_vfs::last_pepper_vfs_error()
+            )
+        })?;
+        let value: String = connection
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .map_err(|error| {
+                format!(
+                    "VFS read failed: {error}; {}",
+                    pepper_sqlite_vfs::last_pepper_vfs_error()
+                )
+            })?;
+        assert_eq!(value, "incremental");
+        connection
+            .execute("UPDATE records SET value='vfs'", [])
+            .map_err(|error| {
+                format!(
+                    "VFS write failed: {error}; {}",
+                    pepper_sqlite_vfs::last_pepper_vfs_error()
+                )
+            })?;
+        let value: String = connection
+            .query_row("SELECT value FROM records", [], |row| row.get(0))
+            .map_err(|error| {
+                format!(
+                    "VFS reread failed: {error}; {}",
+                    pepper_sqlite_vfs::last_pepper_vfs_error()
+                )
+            })?;
+        assert_eq!(value, "vfs");
+    }
+    pepper_sqlite_vfs::unregister_pepper_vfs()?;
+    let vfs_export = client
+        .get(format!(
+            "http://127.0.0.1:{api1}/v1/sqlite/databases/{encoded_paged}/export"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let vfs_path = temp.path().join("vfs-export.db");
+    fs::write(&vfs_path, &vfs_export)?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &vfs_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
+    let value: String = connection.query_row("SELECT value FROM records", [], |row| row.get(0))?;
+    assert_eq!(value, "vfs");
+
+    // Explicit EC page packs use the ordinary manifest/shard data plane while
+    // SQLite control blocks and the namespace head remain replicated.
+    let ec_created: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{api2}/v1/sqlite/databases"))
+        .json(&serde_json::json!({
+            "database":"ec-db",
+            "request_id":"ec-create",
+            "page_size":4096,
+            "storage_policy":{
+                "kind":"erasure",
+                "data_shards":2,
+                "parity_shards":1,
+                "shard_copies":1
+            }
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ec_namespace = ec_created["namespace_id"].as_str().unwrap();
+    let ec_base = ec_created["snapshot_cid"].as_str().unwrap();
+    wait_for_namespace_quorum(&[api1, api2, api3], ec_namespace).await?;
+    let ec_encoded = encode_path_segment(ec_namespace);
+    let ec_import = client
+        .post(format!(
+            "http://127.0.0.1:{api3}/v1/sqlite/databases/{ec_encoded}/import"
+        ))
+        .query(&[
+            ("request_id", "ec-import"),
+            ("base_revision", "1"),
+            ("base_generation", "1"),
+            ("base_snapshot", ec_base),
+        ])
+        .body(vfs_export.clone())
+        .send()
+        .await?;
+    if !ec_import.status().is_success() {
+        return Err(format!(
+            "EC SQLite import failed: {} {}",
+            ec_import.status(),
+            ec_import.text().await?
+        )
+        .into());
+    }
+    let ec_export = client
+        .get(format!(
+            "http://127.0.0.1:{api1}/v1/sqlite/databases/{ec_encoded}/export"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    assert_eq!(ec_export, vfs_export);
+    Ok(())
+}
+
+fn sqlite_candidate(root: &Path, name: &str, base: &[u8], value: &str) -> TestResult<Vec<u8>> {
+    let path = root.join(name);
+    fs::write(&path, base)?;
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA page_size=4096; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;\
+             CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        )?;
+        connection.execute("INSERT INTO records(value) VALUES (?1)", [value])?;
+    }
+    Ok(fs::read(path)?)
+}
+
+fn sqlite_update_candidate(
+    root: &Path,
+    name: &str,
+    base: &[u8],
+    value: &str,
+) -> TestResult<Vec<u8>> {
+    let path = root.join(name);
+    fs::write(&path, base)?;
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute("UPDATE records SET value=?1", [value])?;
+    }
+    Ok(fs::read(path)?)
 }
 
 #[tokio::test]
@@ -4254,6 +4840,28 @@ async fn signed_s3_success_with_retry(
         .await
 }
 
+async fn signed_s3_success_with_headers_and_retry(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> TestResult<reqwest::Response> {
+    s3_success(
+        signed_s3_response_with_headers_and_retry(
+            client,
+            api_port,
+            method,
+            path_and_query,
+            body,
+            extra_headers,
+        )
+        .await?,
+    )
+    .await
+}
+
 async fn signed_s3_bytes_with_retry(
     client: &reqwest::Client,
     api_port: u16,
@@ -4293,37 +4901,97 @@ async fn signed_s3_response_with_retry(
     path_and_query: &str,
     body: Vec<u8>,
 ) -> TestResult<reqwest::Response> {
+    signed_s3_response_with_headers_and_retry(client, api_port, method, path_and_query, body, &[])
+        .await
+}
+
+async fn signed_s3_response_with_headers_and_retry(
+    client: &reqwest::Client,
+    api_port: u16,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> TestResult<reqwest::Response> {
+    const RETRY_DEADLINE: Duration = Duration::from_secs(180);
     let mut last_error = String::new();
-    for _ in 0..240 {
-        let response = match signed_s3_request(
+    let started = std::time::Instant::now();
+    while started.elapsed() < RETRY_DEADLINE {
+        let response = match signed_s3_request_with_headers(
             client,
             api_port,
             method.clone(),
             path_and_query,
             body.clone(),
+            extra_headers,
         )
         .await
         {
-            Ok(response) => response,
+            Ok(response) => Some(response),
             Err(error) => {
                 last_error = format!("transport error: {error}");
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
+                None
             }
         };
-        if response.status() != StatusCode::SERVICE_UNAVAILABLE
-            && response.status() != StatusCode::CONFLICT
-        {
-            return Ok(response);
+        if let Some(response) = response {
+            if !matches!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::CONFLICT
+                    | StatusCode::TOO_MANY_REQUESTS
+            ) {
+                return Ok(response);
+            }
+            let status = response.status();
+            last_error = format!("{status}: {}", response.text().await?);
         }
-        let status = response.status();
-        last_error = format!("{status}: {}", response.text().await?);
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let remaining = RETRY_DEADLINE.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
     }
     Err(format!(
         "S3 request {method} {path_and_query} did not succeed before the retry deadline: {last_error}"
     )
     .into())
+}
+
+async fn dump_s3_cluster_diagnostics(
+    client: &reqwest::Client,
+    api_ports: &[u16],
+    logs: &[PathBuf],
+) {
+    let readiness = join_all(api_ports.iter().map(|api| {
+        client
+            .get(format!("http://127.0.0.1:{api}/readyz"))
+            .timeout(Duration::from_secs(2))
+            .send()
+    }))
+    .await;
+    for (api, response) in api_ports.iter().zip(readiness) {
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                eprintln!("===== readyz {api}: {status} =====\n{body}");
+            }
+            Err(error) => eprintln!("===== readyz {api} failed =====\n{error}"),
+        }
+    }
+    for log in logs {
+        let contents = fs::read_to_string(log).unwrap_or_default();
+        let tail = contents
+            .lines()
+            .rev()
+            .take(250)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("===== {} (last 250 lines) =====\n{tail}", log.display());
+    }
 }
 
 fn xml_value(xml: &str, element: &str) -> TestResult<String> {
@@ -4360,6 +5028,17 @@ fn write_s3_config(
     api_port: u16,
     bootstrap: &[String],
 ) -> TestResult<PathBuf> {
+    write_s3_config_with_partitions(root, name, p2p_port, api_port, bootstrap, 16)
+}
+
+fn write_s3_config_with_partitions(
+    root: &Path,
+    name: &str,
+    p2p_port: u16,
+    api_port: u16,
+    bootstrap: &[String],
+    bucket_partitions: u16,
+) -> TestResult<PathBuf> {
     let config = write_config_with_options(TestConfigOptions {
         root,
         name,
@@ -4389,22 +5068,23 @@ fn write_s3_config(
         "repair_interval_seconds = 3600",
     );
     contents.push_str(&format!(
-        "\n[storage.small_object_pack]\nenabled = true\nmax_object_bytes = 1048576\nsegment_bytes = 4194304\nowners = 1\nio_uring_entries = 32\nrequire_io_uring = false\ngroup_commit_delay_microseconds = 200\ngroup_commit_max_requests = 64\ncompaction_dead_percent = 50\n\n[s3]\nenabled = true\nregion = \"us-east-1\"\naccess_key_id = \"pepper-test\"\nsecret_access_key_path = \"{}\"\n\n[fast_path]\nworkers = 2\ncontrol_cores = 2\npin_cpus = false\n",
+        "\n[storage.small_object_pack]\nenabled = true\nmax_object_bytes = 1048576\nsegment_bytes = 4194304\nowners = 1\nio_uring_entries = 32\nrequire_io_uring = false\ngroup_commit_delay_microseconds = 200\ngroup_commit_max_requests = 64\ncompaction_dead_percent = 50\n\n[s3]\nenabled = true\nregion = \"us-east-1\"\naccess_key_id = \"pepper-test\"\nsecret_access_key_path = \"{}\"\nbucket_partitions = {bucket_partitions}\n\n[fast_path]\nworkers = 2\ncontrol_cores = 2\npin_cpus = false\n",
         secret_path.display()
     ));
     fs::write(&config, contents)?;
     Ok(config)
 }
 
-fn write_s3_erasure_config(
+fn write_s3_erasure_config_with_partitions(
     root: &Path,
     name: &str,
     failure_domain: &str,
     p2p_port: u16,
     api_port: u16,
     bootstrap: &[String],
+    bucket_partitions: u16,
 ) -> TestResult<PathBuf> {
-    write_s3_erasure_config_with_strategy(
+    write_s3_erasure_config_with_options(
         root,
         name,
         failure_domain,
@@ -4412,10 +5092,12 @@ fn write_s3_erasure_config(
         api_port,
         bootstrap,
         None,
+        bucket_partitions,
     )
 }
 
-fn write_s3_erasure_config_with_strategy(
+#[allow(clippy::too_many_arguments)]
+fn write_s3_erasure_config_with_options(
     root: &Path,
     name: &str,
     failure_domain: &str,
@@ -4423,8 +5105,16 @@ fn write_s3_erasure_config_with_strategy(
     api_port: u16,
     bootstrap: &[String],
     strategy: Option<&str>,
+    bucket_partitions: u16,
 ) -> TestResult<PathBuf> {
-    let config = write_s3_config(root, name, p2p_port, api_port, bootstrap)?;
+    let config = write_s3_config_with_partitions(
+        root,
+        name,
+        p2p_port,
+        api_port,
+        bootstrap,
+        bucket_partitions,
+    )?;
     let mut contents = fs::read_to_string(&config)?;
     contents = contents.replace(
         &format!("listen_addr = \"127.0.0.1:{p2p_port}\""),

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[env]
+# SQLite only enters its documented batch-atomic pager path when this
+# compile-time option is enabled. `libsqlite3-sys` accepts additional bundled
+# amalgamation definitions through this variable.
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_BATCH_ATOMIC_WRITE"

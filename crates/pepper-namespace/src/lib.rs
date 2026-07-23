@@ -50,6 +50,7 @@ pub enum NamespaceKind {
     Kv,
     Bucket,
     Filesystem,
+    Sqlite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -585,6 +586,14 @@ impl NamespaceState {
             return Err(NamespaceError::IdempotencyConflict);
         }
         Ok(Some(record.response.clone()))
+    }
+
+    /// Read-only status lookup for a request whose original envelope may no
+    /// longer be available after a client loses the commit response.
+    pub fn idempotent_response(&self, request_id: &str) -> Option<&CommandResponse> {
+        self.idempotency
+            .get(request_id)
+            .map(|record| &record.response)
     }
 }
 

@@ -37,6 +37,12 @@ jobs:
           - { scenario: NEMESIS-001, slot: 1, offset: 103 }
           - { scenario: RAFT-002, slot: 1, offset: 104 }
           - { scenario: RAFT-004, slot: 1, offset: 105 }
+          - { scenario: SQLITE-004, slot: 0, offset: 6 }
+          - { scenario: SQLITE-005, slot: 0, offset: 7 }
+          - { scenario: SQLITE-006, slot: 0, offset: 8 }
+          - { scenario: SQLITE-004, slot: 1, offset: 106 }
+          - { scenario: SQLITE-005, slot: 1, offset: 107 }
+          - { scenario: SQLITE-006, slot: 1, offset: 108 }
     env:
       TOKIO_WORKER_THREADS: "2"
     steps:

@@ -37,7 +37,7 @@ pub mod proto {
 
 pub type ErasureChunkReceiver = mpsc::Receiver<Vec<u8>>;
 
-const PROTOCOL_VERSION: u32 = 13;
+const PROTOCOL_VERSION: u32 = 14;
 const MAX_FRAME_BYTES: usize = 68 * 1024 * 1024;
 pub const MAX_BLOCK_HAS_BATCH_CIDS: usize = 512;
 const ERASURE_STREAM_CHUNK_BYTES: usize = 256 * 1024;
@@ -578,6 +578,11 @@ pub trait NetworkNamespaceService: Send + Sync + 'static {
         authenticated_node: &str,
         request: proto::NamespaceForwardRequest,
     ) -> Result<proto::NamespaceForwardResponse, NetworkError>;
+    async fn sqlite_writer(
+        &self,
+        authenticated_node: &str,
+        request: proto::NamespaceSqliteWriterRequest,
+    ) -> Result<proto::NamespaceSqliteWriterResponse, NetworkError>;
     async fn state(
         &self,
         authenticated_node: &str,
@@ -2406,6 +2411,21 @@ impl NetworkHandle {
             .await
     }
 
+    pub async fn namespace_sqlite_writer(
+        &self,
+        peer: SocketAddr,
+        mut request: proto::NamespaceSqliteWriterRequest,
+    ) -> Result<proto::NamespaceSqliteWriterResponse, NetworkError> {
+        let request_id = next_request_id();
+        request
+            .context
+            .as_mut()
+            .ok_or_else(|| NetworkError::BlockService("missing namespace context".to_string()))?
+            .request_id = request_id.clone();
+        self.rpc_identified(peer, "/namespace/sqlite-writer", request, request_id)
+            .await
+    }
+
     pub async fn namespace_state(
         &self,
         peer: SocketAddr,
@@ -3613,7 +3633,9 @@ impl NetworkHandle {
                 let namespace_request =
                     proto::NamespaceForwardRequest::decode(request.payload.as_slice())?;
                 validate_namespace_context(request, namespace_request.context.as_ref())?;
-                if namespace_request.command_json.len() > 1024 * 1024 {
+                if namespace_request.command_json.len() > 1024 * 1024
+                    || namespace_request.application_guard_json.len() > 64 * 1024
+                {
                     return Err(NetworkError::BlockService(
                         "namespace forwarded command exceeds limit".to_string(),
                     ));
@@ -3622,6 +3644,28 @@ impl NetworkHandle {
                     NetworkError::BlockService("namespace service is disabled".to_string())
                 })?;
                 let response = service.forward(&request.node_id, namespace_request).await?;
+                encode_payload(response)
+            }
+            "/namespace/sqlite-writer" => {
+                let namespace_request =
+                    proto::NamespaceSqliteWriterRequest::decode(request.payload.as_slice())?;
+                validate_namespace_context(request, namespace_request.context.as_ref())?;
+                if namespace_request.request_json.len() > 64 * 1024 {
+                    return Err(NetworkError::BlockService(
+                        "SQLite writer request exceeds limit".to_string(),
+                    ));
+                }
+                let service = self.namespace_service.read().await.clone().ok_or_else(|| {
+                    NetworkError::BlockService("namespace service is disabled".to_string())
+                })?;
+                let response = service
+                    .sqlite_writer(&request.node_id, namespace_request)
+                    .await?;
+                if response.response_json.len() > 64 * 1024 {
+                    return Err(NetworkError::BlockService(
+                        "SQLite writer response exceeds limit".to_string(),
+                    ));
+                }
                 encode_payload(response)
             }
             "/namespace/state" => {

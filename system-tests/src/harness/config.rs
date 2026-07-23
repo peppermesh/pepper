@@ -92,6 +92,9 @@ election_timeout_max_ms = 3000
 default_factor = {replication}
 repair_interval_seconds = {repair_interval}
 
+[sqlite]
+enabled = {sqlite_enabled}
+
 [compute]
 enabled = {compute}
 runtime = "firecracker"
@@ -119,6 +122,7 @@ format = "json"
         consensus = node.consensus_enabled,
         replication = cluster.replication_factor,
         repair_interval = node.storage.repair_interval_seconds,
+        sqlite_enabled = cluster.sqlite_enabled,
         compute = node.compute_enabled,
         compute_path = runtime.data_path.join("compute").display(),
     ))
@@ -179,6 +183,10 @@ election_timeout_max_ms = 3000
 default_factor = {replication}
 repair_interval_seconds = {repair_interval}
 
+[sqlite]
+enabled = {sqlite_enabled}
+socket_path = "/var/lib/pepper/metadata/sqlite.sock"
+
 [compute]
 enabled = {compute}
 runtime = "firecracker"
@@ -204,6 +212,7 @@ format = "json"
         consensus = node.consensus_enabled,
         replication = cluster.replication_factor,
         repair_interval = node.storage.repair_interval_seconds,
+        sqlite_enabled = cluster.sqlite_enabled,
         compute = node.compute_enabled,
     ))
 }

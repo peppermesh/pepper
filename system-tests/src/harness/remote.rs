@@ -143,6 +143,9 @@ impl RemoteBackend {
                 .map(|v| v as usize)
                 .or(Some(3)),
             net_admin: false,
+            sqlite_enabled: topology["policies"]["sqlite_enabled"]
+                .as_bool()
+                .unwrap_or(false),
         };
         spec.validate()?;
         topology["profile"] = format!("wan-{}", mode.as_str()).into();
