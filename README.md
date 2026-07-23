@@ -42,6 +42,30 @@ printf 'hello pepper\n' > /tmp/input.txt
 
 `dev/node1.toml` is for local development only. See [`dev/node2.toml`](dev/node2.toml) for a second node.
 
+### Single-node demo
+
+For tests and demonstrations, [`dev/demo.toml`](dev/demo.toml) lets enabled
+quorum-backed services run with one local Raft voter and one stored copy:
+
+```sh
+printf '%s\n' 'replace-with-a-local-demo-secret' > ./dev/s3.secret
+chmod 600 ./dev/s3.secret
+./target/release/pepper-agent init --config ./dev/demo.toml
+./target/release/pepper-agent --config ./dev/demo.toml
+```
+
+The setting is:
+
+```toml
+[demo]
+single_node = true
+```
+
+This mode forces the effective block replication factor to one. It has no
+failover or replicated durability: losing the process, node, or storage can
+make namespace metadata and object data unavailable or permanently lost. Use
+a dedicated data directory and never enable it for a production deployment.
+
 ## Objects and directories
 
 ```sh

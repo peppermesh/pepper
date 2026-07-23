@@ -197,6 +197,7 @@ struct AppState {
     publication_repository: PublicationRepository,
     _publication_limits: PublicationLimits,
     namespace_log_bytes: u64,
+    namespace_voter_count: usize,
     replication_factor: usize,
     placement: Arc<PlacementRuntime>,
     fast_path: Option<Arc<FastPathRuntime>>,
@@ -725,6 +726,11 @@ fn init_node(loaded: LoadedConfig) -> Result<()> {
 }
 
 async fn run_agent(loaded: LoadedConfig) -> Result<()> {
+    if loaded.config.demo.single_node {
+        warn!(
+            "single-node demo mode is enabled; namespace metadata and stored data have no replicated durability"
+        );
+    }
     let identity_lock = acquire_identity_lock(&loaded)?;
     loaded
         .config
@@ -965,6 +971,7 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
                     network.clone(),
                     namespace_data_store.clone(),
                     ConsensusConfig {
+                        voter_count: loaded.config.namespace_voter_count(),
                         heartbeat_interval_ms: loaded.config.namespace.heartbeat_interval_ms,
                         election_timeout_min_ms: loaded.config.namespace.election_timeout_min_ms,
                         election_timeout_max_ms: loaded.config.namespace.election_timeout_max_ms,
@@ -1015,7 +1022,8 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         publication_repository,
         _publication_limits: publication_limits,
         namespace_log_bytes: loaded.config.namespace.max_consensus_log_bytes,
-        replication_factor: loaded.config.replication.default_factor as usize,
+        namespace_voter_count: loaded.config.namespace_voter_count(),
+        replication_factor: loaded.config.effective_replication_factor() as usize,
         placement,
         fast_path,
         local_block_writer,
@@ -5393,9 +5401,11 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let namespace_ready = statuses.iter().all(|status| {
         status.running
             && status.leader_raft_id.is_some()
-            && status.voter_count == 3
+            && status.voter_count == state.namespace_voter_count
             && !status.membership_joint
-            && (status.role != "leader" || status.quorum_recently_acknowledged)
+            && (status.role != "leader"
+                || state.namespace_voter_count == 1
+                || status.quorum_recently_acknowledged)
     });
     let sqlite_ready = state.sqlite_ready.load(Ordering::Relaxed);
     let ready = namespace_ready && (!state.sqlite_enabled || sqlite_ready);

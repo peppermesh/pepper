@@ -416,7 +416,7 @@ pub struct ConsensusPlacementNode {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConsensusPlacementError {
-    #[error("exactly three capable namespace replicas are unavailable")]
+    #[error("the required number of capable namespace replicas is unavailable")]
     InsufficientCapableNodes,
     #[error("three distinct failure domains are unavailable")]
     InsufficientFailureDomains,
@@ -427,6 +427,20 @@ pub fn select_namespace_replicas(
     nodes: &[ConsensusPlacementNode],
     required_log_bytes: u64,
 ) -> Result<[ConsensusPlacementNode; 3], ConsensusPlacementError> {
+    select_namespace_replicas_with_count(namespace_id, nodes, required_log_bytes, 3)?
+        .try_into()
+        .map_err(|_| ConsensusPlacementError::InsufficientCapableNodes)
+}
+
+pub fn select_namespace_replicas_with_count(
+    namespace_id: &Cid,
+    nodes: &[ConsensusPlacementNode],
+    required_log_bytes: u64,
+    replica_count: usize,
+) -> Result<Vec<ConsensusPlacementNode>, ConsensusPlacementError> {
+    if !matches!(replica_count, 1 | 3) {
+        return Err(ConsensusPlacementError::InsufficientCapableNodes);
+    }
     let mut candidates = nodes
         .iter()
         .filter(|node| {
@@ -444,7 +458,7 @@ pub fn select_namespace_replicas(
             .cmp(left_score)
             .then_with(|| left_node.node_id.cmp(&right_node.node_id))
     });
-    if candidates.len() < 3 {
+    if candidates.len() < replica_count {
         return Err(ConsensusPlacementError::InsufficientCapableNodes);
     }
     let mut domains = BTreeSet::new();
@@ -457,11 +471,11 @@ pub fn select_namespace_replicas(
         if domains.insert(domain) {
             selected.push(node.clone());
         }
-        if selected.len() == 3 {
+        if selected.len() == replica_count {
             break;
         }
     }
-    if selected.len() < 3 {
+    if selected.len() < replica_count {
         for (_, node) in candidates {
             if !selected
                 .iter()
@@ -469,14 +483,12 @@ pub fn select_namespace_replicas(
             {
                 selected.push(node);
             }
-            if selected.len() == 3 {
+            if selected.len() == replica_count {
                 break;
             }
         }
     }
-    selected
-        .try_into()
-        .map_err(|_| ConsensusPlacementError::InsufficientCapableNodes)
+    Ok(selected)
 }
 
 pub fn select_namespace_replacement(
@@ -813,6 +825,12 @@ mod tests {
             .collect::<Vec<_>>();
         let selected = select_namespace_replicas(&namespace, &nodes, 512).unwrap();
         assert_eq!(selected.len(), 3);
+        assert_eq!(
+            select_namespace_replicas_with_count(&namespace, &nodes, 512, 1)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(selected.iter().all(|node| node.node_id != "node-3"));
         assert!(selected.iter().all(|node| node.node_id != "node-4"));
         let replacement = select_namespace_replacement(

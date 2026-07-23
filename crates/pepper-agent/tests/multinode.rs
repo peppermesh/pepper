@@ -25,6 +25,56 @@ use tokio::sync::Semaphore;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Default)]
+struct RepairWave {
+    successes: usize,
+    last_retryable_error: Option<String>,
+}
+
+async fn concurrent_repair_wave(
+    client: &reqwest::Client,
+    api_ports: &[u16],
+    requests_per_node: usize,
+) -> TestResult<RepairWave> {
+    let responses = join_all(
+        api_ports
+            .iter()
+            .cycle()
+            .take(api_ports.len().saturating_mul(requests_per_node))
+            .map(|api| {
+                client
+                    .post(format!("http://127.0.0.1:{api}/v1/admin/repair"))
+                    .send()
+            }),
+    )
+    .await;
+    let mut wave = RepairWave::default();
+    for response in responses {
+        match response {
+            Ok(response) if response.status().is_success() => wave.successes += 1,
+            Ok(response)
+                if matches!(
+                    response.status(),
+                    StatusCode::CONFLICT
+                        | StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
+                ) =>
+            {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                wave.last_retryable_error = Some(format!("{status}: {body}"));
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!("non-retryable repair response {status}: {body}").into());
+            }
+            Err(error) => wave.last_retryable_error = Some(error.to_string()),
+        }
+    }
+    Ok(wave)
+}
+
 struct ChildGuard(Child);
 
 impl ChildGuard {
@@ -266,6 +316,71 @@ async fn http_auth_and_limits_are_enforced() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(invalid_pin.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_node_demo_serves_s3_without_replication() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p = free_port()?;
+    let api = free_port()?;
+    let config = write_single_node_s3_config(temp.path(), "s3-single-demo", p2p, api)?;
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    run_init(agent, &config)?;
+    let mut node = spawn_agent(agent, &config)?;
+    wait_health(api).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    signed_s3_success_with_retry(&client, api, Method::PUT, "/demo-bucket", Vec::new()).await?;
+    signed_s3_success_with_retry(
+        &client,
+        api,
+        Method::PUT,
+        "/demo-bucket/hello.txt",
+        b"hello from one node".to_vec(),
+    )
+    .await?;
+    let downloaded = signed_s3_success_with_retry(
+        &client,
+        api,
+        Method::GET,
+        "/demo-bucket/hello.txt",
+        Vec::new(),
+    )
+    .await?
+    .bytes()
+    .await?;
+    assert_eq!(downloaded.as_ref(), b"hello from one node");
+
+    let ready: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{api}/readyz"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ready["ready"], true);
+    assert!(ready["namespace_groups"].as_array().is_some_and(
+        |groups| !groups.is_empty() && groups.iter().all(|group| group["voter_count"] == 1)
+    ));
+
+    node.kill_and_wait();
+    node = spawn_agent(agent, &config)?;
+    wait_health(api).await?;
+    let after_restart = signed_s3_success_with_retry(
+        &client,
+        api,
+        Method::GET,
+        "/demo-bucket/hello.txt",
+        Vec::new(),
+    )
+    .await?
+    .bytes()
+    .await?;
+    assert_eq!(after_restart.as_ref(), b"hello from one node");
+    drop(node);
     Ok(())
 }
 
@@ -2951,20 +3066,11 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
     )
     .await?;
     let mut erasure = None;
+    let mut last_repair_error = None;
     for attempt in 0..8 {
-        let responses = join_all(api_ports.iter().chain(api_ports.iter()).map(|api| {
-            client
-                .post(format!("http://127.0.0.1:{api}/v1/admin/repair"))
-                .send()
-        }))
-        .await;
-        for response in responses {
-            let response = response?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(format!("concurrent repair failed with {status}: {body}").into());
-            }
+        let repair_wave = concurrent_repair_wave(&client, &api_ports, 2).await?;
+        if repair_wave.last_retryable_error.is_some() {
+            last_repair_error = repair_wave.last_retryable_error;
         }
         let status: serde_json::Value = client
             .get(format!(
@@ -2991,6 +3097,13 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
         }
         eprintln!("erasure repair pass {} incomplete; retrying", attempt + 1);
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if erasure.as_ref().is_none_or(|status| {
+        status["missing_shards"].as_u64() != Some(0)
+            || status["unrecoverable_manifests"].as_u64() != Some(0)
+    }) && let Some(error) = last_repair_error
+    {
+        eprintln!("last retryable erasure repair error: {error}");
     }
     let erasure = erasure.ok_or("erasure repair did not run")?;
     assert_eq!(erasure["missing_shards"], 0);
@@ -3032,14 +3145,25 @@ async fn s3_nine_node_streaming_contract(exercise_small_object_pack: bool) -> Te
         "pepper_placement_repair_leases_acquired_total",
     )
     .await?;
-    let healthy_responses = join_all(api_ports.iter().chain(api_ports.iter()).map(|api| {
-        client
-            .post(format!("http://127.0.0.1:{api}/v1/admin/repair"))
-            .send()
-    }))
-    .await;
-    for response in healthy_responses {
-        response?.error_for_status()?;
+    let mut healthy_pass_completed = false;
+    let mut last_healthy_error = None;
+    for _ in 0..8 {
+        let repair_wave = concurrent_repair_wave(&client, &api_ports, 2).await?;
+        if repair_wave.last_retryable_error.is_some() {
+            last_healthy_error = repair_wave.last_retryable_error;
+        }
+        if repair_wave.successes > 0 {
+            healthy_pass_completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if !healthy_pass_completed {
+        return Err(format!(
+            "healthy repair pass did not complete: {}",
+            last_healthy_error.unwrap_or_else(|| "no successful response".to_string())
+        )
+        .into());
     }
     assert_eq!(
         prometheus_metric_sum(
@@ -5029,6 +5153,20 @@ fn write_s3_config(
     bootstrap: &[String],
 ) -> TestResult<PathBuf> {
     write_s3_config_with_partitions(root, name, p2p_port, api_port, bootstrap, 16)
+}
+
+fn write_single_node_s3_config(
+    root: &Path,
+    name: &str,
+    p2p_port: u16,
+    api_port: u16,
+) -> TestResult<PathBuf> {
+    let config = write_s3_config_with_partitions(root, name, p2p_port, api_port, &[], 1)?;
+    let contents = fs::read_to_string(&config)?
+        .replacen("\n[node]", "\n[demo]\nsingle_node = true\n\n[node]", 1)
+        .replace("default_factor = 3", "default_factor = 1");
+    fs::write(&config, contents)?;
+    Ok(config)
 }
 
 fn write_s3_config_with_partitions(

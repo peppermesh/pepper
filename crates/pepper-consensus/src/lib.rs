@@ -30,7 +30,7 @@ use pepper_namespace::{
 };
 use pepper_network::{NetworkError, NetworkHandle, NetworkNamespaceService, proto};
 use pepper_placement::{
-    ConsensusPlacementNode, select_namespace_replacement, select_namespace_replicas,
+    ConsensusPlacementNode, select_namespace_replacement, select_namespace_replicas_with_count,
 };
 use pepper_sqlite::{
     AcquisitionStatus, CommitAttempt, GuardedCommitRequest, WriterControlRequest,
@@ -685,6 +685,9 @@ pub struct GroupMetadata {
 
 #[derive(Debug, Clone)]
 pub struct ConsensusConfig {
+    /// One is reserved for explicitly unsafe demo deployments; production
+    /// namespace groups use three voters.
+    pub voter_count: usize,
     pub max_namespace_groups: usize,
     pub max_consensus_log_bytes: u64,
     pub max_namespace_write_rate: u64,
@@ -701,6 +704,7 @@ pub struct ConsensusConfig {
 impl Default for ConsensusConfig {
     fn default() -> Self {
         Self {
+            voter_count: 3,
             max_namespace_groups: 128,
             max_consensus_log_bytes: 256 * 1024 * 1024,
             max_namespace_write_rate: 1_000,
@@ -718,7 +722,8 @@ impl Default for ConsensusConfig {
 
 impl ConsensusConfig {
     pub fn validate(&self) -> Result<(), ConsensusError> {
-        if self.max_namespace_groups == 0
+        if !matches!(self.voter_count, 1 | 3)
+            || self.max_namespace_groups == 0
             || self.max_consensus_log_bytes == 0
             || self.max_namespace_write_rate == 0
             || self.max_command_bytes == 0
@@ -1666,13 +1671,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         }
         let pointer: SnapshotPointer =
             serde_json::from_slice(snapshot.get_ref()).map_err(read_snapshot_error)?;
-        // Steady-state namespace membership has three voters. During a joint
-        // consensus transition the authoritative source set is the union of
-        // the old and new three-voter configurations, so a snapshot can
-        // legitimately name four through six replicas. Reject smaller or
-        // unbounded source sets, but never shut down a learner merely because
-        // its catch-up snapshot was built during replacement.
-        if !(3..=6).contains(&pointer.replica_node_ids.len())
+        // Demo namespaces have one voter. Production steady-state namespace
+        // membership has three voters; joint consensus can name four through
+        // six sources while a production replica is replaced.
+        if !matches!(pointer.replica_node_ids.len(), 1 | 3..=6)
             || pointer
                 .replica_node_ids
                 .iter()
@@ -1682,7 +1684,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         {
             return Err(read_snapshot_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "snapshot must identify three to six namespace replicas",
+                "snapshot must identify one demo replica or three to six production replicas",
             )));
         }
         self.data_store
@@ -2473,6 +2475,12 @@ impl NamespaceGroupManager {
         data_store: ConsensusDataStore,
     ) -> Result<Arc<GroupHandle>, ConsensusError> {
         let group = state.namespace_id.to_string();
+        if usize::from(state.descriptor.replication_factor) != self.config.voter_count {
+            return Err(ConsensusError::InvalidConfig(format!(
+                "namespace {group} has {} voters but this node is configured for {}",
+                state.descriptor.replication_factor, self.config.voter_count
+            )));
+        }
         let previous_metadata =
             read_json_table::<GroupMetadata>(&self.metadata, NAMESPACE_GROUPS, &group)?;
         let persisted_state =
@@ -3020,12 +3028,9 @@ impl NamespaceGroupManager {
             namespace_group_count: local.namespace_group_count,
             max_consensus_log_bytes: local.max_consensus_log_bytes,
         }];
-        candidates.extend(
-            network
-                .peers()
-                .await
-                .into_iter()
-                .map(|peer| ConsensusPlacementNode {
+        if self.config.voter_count != 1 {
+            candidates.extend(network.peers().await.into_iter().map(|peer| {
+                ConsensusPlacementNode {
                     node_id: peer.node_id,
                     addresses: peer.addresses,
                     reachable: peer.connected,
@@ -3034,10 +3039,16 @@ impl NamespaceGroupManager {
                     namespace_group_capacity: peer.namespace_group_capacity,
                     namespace_group_count: peer.namespace_group_count,
                     max_consensus_log_bytes: peer.max_consensus_log_bytes,
-                }),
-        );
-        let replicas = select_namespace_replicas(placement_seed, &candidates, required_log_bytes)
-            .map_err(|error| ConsensusError::Placement(error.to_string()))?;
+                }
+            }));
+        }
+        let replicas = select_namespace_replicas_with_count(
+            placement_seed,
+            &candidates,
+            required_log_bytes,
+            self.config.voter_count,
+        )
+        .map_err(|error| ConsensusError::Placement(error.to_string()))?;
         Ok(replicas.into_iter().map(|node| node.node_id).collect())
     }
 
@@ -4662,7 +4673,7 @@ impl NetworkNamespaceService for NamespaceGroupManager {
                 "checkpoint does not belong to requested namespace",
             ));
         }
-        let hydration_replicas = if request.current_voters.len() == 3 {
+        let hydration_replicas = if matches!(request.current_voters.len(), 1 | 3) {
             request.current_voters.clone()
         } else {
             state.descriptor.initial_replica_set.clone()
@@ -5231,6 +5242,41 @@ mod tests {
             serde_json::from_value::<ConsensusCommandBatch>(encoded).unwrap(),
             payload
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_voter_demo_group_elects_and_commits() {
+        let router = InProcessRouter::default();
+        let descriptor =
+            NamespaceDescriptor::new(NamespaceKind::Kv, vec!["node-a".into()], "creator", "00", 1);
+        let node = test_node(
+            "node-a",
+            router,
+            descriptor,
+            ConsensusConfig {
+                voter_count: 1,
+                ..ConsensusConfig::default()
+            },
+        )
+        .await;
+        node.manager
+            .initialize(
+                &node.initial_state.namespace_id,
+                raft_members(&["node-a".into()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_leader(&[&node]).await, raft_node_id("node-a"));
+        node.manager
+            .client_write(
+                &node.initial_state.namespace_id,
+                put_command(&node.initial_state, "demo-write", "alpha"),
+            )
+            .await
+            .unwrap();
+        wait_for_revision(&node, 1).await;
+        let status = node.manager.operational_statuses().await;
+        assert_eq!(status[0].voter_count, 1);
     }
 
     async fn wait_for_leader(nodes: &[&TestNode]) -> NodeId {

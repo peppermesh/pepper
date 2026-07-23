@@ -314,11 +314,14 @@ pub(super) async fn bootstrap_namespace_group(
 ) -> Result<CreatedNamespace, ApiError> {
     let manager = namespace_manager(state)?;
     let replicas = descriptor.initial_replica_set.clone();
-    if replicas.len() != 3 {
+    if replicas.len() != state.namespace_voter_count {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::NamespaceUnavailable,
-            "exactly three consensus replicas are required",
+            format!(
+                "{} consensus replica(s) are required in the configured mode",
+                state.namespace_voter_count
+            ),
         ));
     }
     let created = create_namespace(
@@ -367,12 +370,13 @@ pub(super) async fn bootstrap_namespace_group(
             }
             accepted += usize::from(stored);
         }
-        if accepted < 3 {
+        if accepted < replicas.len() {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::DurabilityNotMet,
                 format!(
-                    "namespace bootstrap durability not met for {cid}: accepted {accepted} of 3"
+                    "namespace bootstrap durability not met for {cid}: accepted {accepted} of {}",
+                    replicas.len()
                 ),
             ));
         }
@@ -489,11 +493,14 @@ pub(super) async fn namespace_create(
         .select_replica_set(&seed, state.namespace_log_bytes)
         .await
         .map_err(consensus_error)?;
-    if replicas.len() != 3 {
+    if replicas.len() != state.namespace_voter_count {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::NamespaceUnavailable,
-            "exactly three consensus replicas are required",
+            format!(
+                "{} consensus replica(s) are required in the configured mode",
+                state.namespace_voter_count
+            ),
         ));
     }
     let mut descriptor = NamespaceDescriptor::new(
