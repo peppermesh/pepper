@@ -38,6 +38,8 @@ pub struct LoadedConfig {
 #[serde(deny_unknown_fields)]
 pub struct PepperConfig {
     #[serde(default)]
+    pub demo: DemoConfig,
+    #[serde(default)]
     pub node: NodeConfig,
     #[serde(default)]
     pub data: DataConfig,
@@ -69,6 +71,16 @@ pub struct PepperConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// Explicitly unsafe modes intended only for local tests and demonstrations.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemoConfig {
+    /// Run namespace consensus and replicated storage with a single local
+    /// copy. This provides no tolerance for process, node, or disk loss.
+    #[serde(default)]
+    pub single_node: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1718,6 +1730,18 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
 }
 
 impl PepperConfig {
+    pub fn namespace_voter_count(&self) -> usize {
+        if self.demo.single_node { 1 } else { 3 }
+    }
+
+    pub fn effective_replication_factor(&self) -> u16 {
+        if self.demo.single_node {
+            1
+        } else {
+            self.replication.default_factor
+        }
+    }
+
     pub fn identity_key_path(&self) -> PathBuf {
         self.identity
             .key_path
@@ -1794,6 +1818,9 @@ mod tests {
         assert_eq!(cfg.api.bind_addr, "127.0.0.1:9080");
         assert!(!cfg.api.allow_insecure_remote);
         assert_eq!(cfg.replication.default_factor, 3);
+        assert!(!cfg.demo.single_node);
+        assert_eq!(cfg.namespace_voter_count(), 3);
+        assert_eq!(cfg.effective_replication_factor(), 3);
         assert!(!cfg.namespace.enabled);
         assert!(!cfg.s3.enabled);
         assert!(!cfg.sqlite.enabled);
@@ -1808,6 +1835,38 @@ mod tests {
         assert!(!cfg.erasure.enabled);
         assert_eq!(cfg.erasure.data_shards, 6);
         assert_eq!(cfg.erasure.parity_shards, 3);
+    }
+
+    #[test]
+    fn single_node_demo_uses_one_voter_and_one_storage_copy() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [demo]
+            single_node = true
+            [namespace]
+            enabled = true
+            consensus_enabled = true
+            [replication]
+            default_factor = 3
+            [[storage.locations]]
+            path = "/tmp/pepper-config-single-node-demo"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.namespace_voter_count(), 1);
+        assert_eq!(cfg.effective_replication_factor(), 1);
+    }
+
+    #[test]
+    fn bundled_single_node_demo_config_is_valid() {
+        let cfg: PepperConfig = toml::from_str(include_str!("../../../dev/demo.toml")).unwrap();
+        validate(&cfg).unwrap();
+        assert!(cfg.demo.single_node);
+        assert!(cfg.s3.enabled);
+        assert_eq!(cfg.namespace_voter_count(), 1);
+        assert_eq!(cfg.effective_replication_factor(), 1);
     }
 
     #[test]

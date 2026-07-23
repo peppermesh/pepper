@@ -95,15 +95,18 @@ impl NamespaceDescriptor {
         created_at_unix_seconds: i64,
     ) -> Self {
         initial_replica_set.sort();
+        let replication_factor = u16::try_from(initial_replica_set.len()).unwrap_or(u16::MAX);
         Self {
             descriptor_type: DESCRIPTOR_TYPE.to_string(),
             version: FORMAT_VERSION,
             kind,
             initial_replica_set,
             consensus_protocol_version: 1,
-            replication_factor: 3,
+            replication_factor,
             placement_constraints: BTreeMap::new(),
-            durability: DurabilityPolicy { replicas: 3 },
+            durability: DurabilityPolicy {
+                replicas: replication_factor,
+            },
             retention: RetentionPolicy {
                 keep_last: 64,
                 max_age_seconds: None,
@@ -121,12 +124,13 @@ impl NamespaceDescriptor {
                 "unsupported type or version".to_string(),
             ));
         }
-        if self.initial_replica_set.len() != 3
-            || self.replication_factor != 3
+        if !matches!(self.initial_replica_set.len(), 1 | 3)
+            || usize::from(self.replication_factor) != self.initial_replica_set.len()
             || self.durability.replicas == 0
         {
             return Err(NamespaceError::InvalidDescriptor(
-                "0.2.0 namespaces require exactly three initial Raft replicas".to_string(),
+                "namespaces require either one demo voter or exactly three Raft replicas"
+                    .to_string(),
             ));
         }
         if self

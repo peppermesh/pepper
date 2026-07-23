@@ -812,9 +812,11 @@ pub(super) async fn admin_sqlite_status(State(state): State<AppState>) -> Respon
     let write_quorum_ready = namespace_statuses.iter().all(|status| {
         status.running
             && status.leader_raft_id.is_some()
-            && status.voter_count == 3
+            && status.voter_count == state.namespace_voter_count
             && !status.membership_joint
-            && (status.role != "leader" || status.quorum_recently_acknowledged)
+            && (status.role != "leader"
+                || state.namespace_voter_count == 1
+                || status.quorum_recently_acknowledged)
     });
     let runtime_ready = state
         .sqlite_ready
