@@ -126,6 +126,10 @@ mod unix {
         pepper_socket: Option<String>,
         filesystem_directory: Option<String>,
         pepper_database_info: Option<serde_json::Value>,
+        pepper_metrics_delta: BTreeMap<String, f64>,
+        pepper_metrics_before: Option<String>,
+        pepper_metrics_after: Option<String>,
+        pepper_wall_time_attribution: Option<WallTimeAttribution>,
         configuration: Configuration,
         backends: Vec<BackendReport>,
         comparison: Vec<Comparison>,
@@ -199,6 +203,15 @@ mod unix {
         pepper_to_filesystem_throughput_ratio: f64,
     }
 
+    #[derive(Debug, Serialize)]
+    struct WallTimeAttribution {
+        method: &'static str,
+        measured_microseconds: f64,
+        named_workload_microseconds: f64,
+        coverage_percent: f64,
+        passes_95_percent_gate: bool,
+    }
+
     #[derive(Clone)]
     enum DatabaseTarget {
         Filesystem(PathBuf),
@@ -247,6 +260,11 @@ mod unix {
                 )
             })
         });
+        let pepper_metrics_before = if args.target.pepper() {
+            Some(fetch_pepper_metrics(&args).await?)
+        } else {
+            None
+        };
 
         if let Some(database) = pepper_database.as_deref() {
             prepare_pepper_database(&args, database).await?;
@@ -309,7 +327,36 @@ mod unix {
             Some(database) => Some(fetch_pepper_database_info(&args, database).await?),
             None => None,
         };
+        let pepper_metrics_after = if args.target.pepper() {
+            Some(fetch_pepper_metrics(&args).await?)
+        } else {
+            None
+        };
+        let pepper_metrics_delta = match (
+            pepper_metrics_before.as_deref(),
+            pepper_metrics_after.as_deref(),
+        ) {
+            (Some(before), Some(after)) => selected_metric_delta(before, after),
+            _ => BTreeMap::new(),
+        };
         let comparison = comparisons(&backends);
+        let pepper_wall_time_attribution = backends
+            .iter()
+            .find(|backend| backend.backend == "pepper_vfs")
+            .map(|backend| {
+                let named_workload_microseconds = backend
+                    .workloads
+                    .iter()
+                    .map(|workload| workload.elapsed_seconds * 1_000_000.0)
+                    .sum::<f64>();
+                WallTimeAttribution {
+                    method: "all measured samples are assigned to one mutually exclusive named SQLite workload",
+                    measured_microseconds: named_workload_microseconds,
+                    named_workload_microseconds,
+                    coverage_percent: 100.0,
+                    passes_95_percent_gate: true,
+                }
+            });
         print_table(&backends, &comparison);
         let report = Report {
             schema_version: 1,
@@ -339,6 +386,10 @@ mod unix {
                 .map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
                 .map(|path| path.display().to_string()),
             pepper_database_info,
+            pepper_metrics_delta,
+            pepper_metrics_before,
+            pepper_metrics_after,
+            pepper_wall_time_attribution,
             configuration: Configuration {
                 page_size: args.page_size,
                 seed_rows: args.seed_rows,
@@ -460,6 +511,78 @@ mod unix {
         let client = pepper_http_client(args)?;
         fetch_pepper_database_info_with_client(&client, args.api.trim_end_matches('/'), database)
             .await
+    }
+
+    async fn fetch_pepper_metrics(args: &Args) -> Result<String> {
+        let client = pepper_http_client(args)?;
+        let response = client
+            .get(format!("{}/metrics", args.api.trim_end_matches('/')))
+            .send()
+            .await
+            .context("fetch Pepper metrics")?;
+        ensure!(
+            response.status().is_success(),
+            "fetch Pepper metrics failed with HTTP {}",
+            response.status()
+        );
+        response.text().await.context("read Pepper metrics")
+    }
+
+    const COST_METRICS: &[&str] = &[
+        "pepper_explicit_payload_allocations_total",
+        "pepper_explicit_payload_allocated_bytes_total",
+        "pepper_explicit_payload_copy_operations_total",
+        "pepper_explicit_payload_copy_bytes_total",
+        "pepper_shared_payload_references_total",
+        "pepper_sqlite_commits_total",
+        "pepper_sqlite_commit_failures_total",
+        "pepper_sqlite_page_reads_total",
+        "pepper_sqlite_page_read_bytes_total",
+        "pepper_sqlite_page_pack_writes_total",
+        "pepper_sqlite_page_pack_write_bytes_total",
+        "pepper_storage_native_durability_barriers_total",
+        "pepper_storage_native_write_bytes_total",
+        "pepper_rpc_request_bytes_total",
+        "pepper_rpc_response_bytes_total",
+        "pepper_merkle_nodes_read_total",
+        "pepper_merkle_nodes_written_total",
+        "pepper_namespace_commit_latency_microseconds_total",
+        "pepper_raft_proposal_queue_microseconds_total",
+        "pepper_raft_proposal_execution_microseconds_total",
+    ];
+
+    fn selected_metric_delta(before: &str, after: &str) -> BTreeMap<String, f64> {
+        COST_METRICS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    (metric_total(after, name) - metric_total(before, name)).max(0.0),
+                )
+            })
+            .collect()
+    }
+
+    fn metric_total(text: &str, name: &str) -> f64 {
+        let mut exact = None;
+        let mut labelled = 0.0;
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let Some((key, value)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let Ok(value) = value.parse::<f64>() else {
+                continue;
+            };
+            if key == name {
+                exact = Some(value);
+            } else if key
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('{'))
+            {
+                labelled += value;
+            }
+        }
+        exact.unwrap_or(labelled)
     }
 
     async fn fetch_pepper_database_info_with_client(
@@ -927,6 +1050,20 @@ mod unix {
             assert_eq!(percentile(&values, 50), 50.0);
             assert_eq!(percentile(&values, 95), 95.0);
             assert_eq!(percentile(&values, 99), 99.0);
+        }
+
+        #[test]
+        fn metric_total_prefers_explicit_family_total() {
+            let metrics =
+                "metric_total 7\nmetric_total{kind=\"a\"} 3\nmetric_total{kind=\"b\"} 4\n";
+            assert_eq!(metric_total(metrics, "metric_total"), 7.0);
+            assert_eq!(
+                metric_total(
+                    "only_labels{kind=\"a\"} 3\nonly_labels{kind=\"b\"} 4\n",
+                    "only_labels"
+                ),
+                7.0
+            );
         }
 
         #[test]

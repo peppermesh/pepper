@@ -1,0 +1,47 @@
+{
+  "_license": "SPDX-License-Identifier: Apache-2.0",
+  "schema_version": 1,
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "cargo_lock_sha256": "72c71d11df284800661327865c5c7d3ce3899a56a8a8fc8801bccc9774d45653",
+  "full_run_sha256": "577d3e3eac7ac0710d2ab54d3b7df4ad85c5c966fde4d7947a28ad9b1464526c",
+  "full_manifest_sha256": "93e4cc4944b36bea72dcd910957d52b660e4757fa7152b34f4f7f005d39ed023",
+  "environment": "single process, single voter, release mode, developer host",
+  "classification": "exploratory",
+  "result": "pass",
+  "cells": [
+    {
+      "groups": 100,
+      "leaders_ready": 100,
+      "startup_milliseconds": 31,
+      "readiness_milliseconds": 0,
+      "incremental_rss_kib": 8260,
+      "incremental_threads": 0,
+      "incremental_open_file_descriptors": 0,
+      "log_append_entries": 200,
+      "state_apply_entries": 200
+    },
+    {
+      "groups": 1000,
+      "leaders_ready": 1000,
+      "startup_milliseconds": 564,
+      "readiness_milliseconds": 9,
+      "incremental_rss_kib": 60732,
+      "incremental_threads": 0,
+      "incremental_open_file_descriptors": 0,
+      "log_append_entries": 2000,
+      "state_apply_entries": 2000
+    },
+    {
+      "groups": 10000,
+      "leaders_ready": 10000,
+      "startup_milliseconds": 23690,
+      "readiness_milliseconds": 123,
+      "incremental_rss_kib": 640436,
+      "incremental_threads": 0,
+      "incremental_open_file_descriptors": 0,
+      "log_append_entries": 20000,
+      "state_apply_entries": 20000
+    }
+  ]
+}

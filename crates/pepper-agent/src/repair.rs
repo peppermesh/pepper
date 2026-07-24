@@ -2498,7 +2498,7 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
         }
 
         let encoded = state.block_store.get_encoded(&stat.cid)?;
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
         let selected = select_replicas(&stat.cid, &candidates, candidates.len());
         for node in selected {
             if node.is_local || healthy_nodes.contains(&node.node_id) {
@@ -2513,7 +2513,7 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
             };
             match time::timeout(
                 Duration::from_secs(1),
-                state.network.block_put_replica_stream(
+                state.network.block_put_replica_buffer_chain(
                     address,
                     stat.codec,
                     &stat.cid,

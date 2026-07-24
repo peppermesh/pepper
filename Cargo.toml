@@ -2,24 +2,41 @@
 
 [workspace]
 members = [
+    "benchmarks/pepper-filesystem-benchmark",
+    "benchmarks/pepper-kafka-benchmark",
+    "benchmarks/pepper-kafka-operations-benchmark",
+    "benchmarks/pepper-ordered-log-benchmark",
+    "benchmarks/pepper-phase0",
     "benchmarks/pepper-s3-throughput",
     "benchmarks/pepper-sqlite-benchmark",
     "crates/pepper-agent",
     "crates/pepper-bucket",
+    "crates/pepper-buffer",
     "crates/pepper-cli",
+    "crates/pepper-commit",
     "crates/pepper-compute",
     "crates/pepper-config",
     "crates/pepper-consensus",
     "crates/pepper-crypto",
     "crates/pepper-dag",
+    "crates/pepper-dataset",
+    "crates/pepper-durability",
+    "crates/pepper-extent",
     "crates/pepper-filesystem",
     "crates/pepper-guest-agent",
+    "crates/pepper-kafka",
+    "crates/pepper-kafka-model",
+    "crates/pepper-kafka-protocol",
+    "crates/pepper-keyed-runtime",
     "crates/pepper-merkle",
     "crates/pepper-metadata",
     "crates/pepper-namespace",
     "crates/pepper-network",
+    "crates/pepper-observability",
+    "crates/pepper-ordered-log",
     "crates/pepper-placement",
     "crates/pepper-publication",
+    "crates/pepper-rsm",
     "crates/pepper-sqlite",
     "crates/pepper-sqlite-vfs",
     "crates/pepper-storage",
@@ -76,10 +93,12 @@ tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "proce
 tokio-util = { version = "0.7", features = ["io"] }
 toml = "1.1"
 tower-http = { version = "0.6", features = ["trace"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tikv-jemallocator = "0.7"
 async-trait = "0.1"
+kafka-protocol = { version = "=0.15.1", features = ["messages_enums"] }
 futures-util = "0.3"
 fs2 = "0.4"
 zstd = "0.13"

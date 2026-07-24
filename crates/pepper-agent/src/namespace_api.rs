@@ -339,7 +339,7 @@ pub(super) async fn bootstrap_namespace_group(
     ] {
         let encoded = state.block_store.get_encoded(cid)?;
         let logical_size = encoded.logical_size_bytes();
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
         let mut accepted = 0;
         for replica in &replicas {
             if replica == &state.status.node_id {
@@ -353,7 +353,7 @@ pub(super) async fn bootstrap_namespace_group(
             for _ in 0..5 {
                 if let Ok(response) = state
                     .network
-                    .block_put_replica_stream(
+                    .block_put_replica_buffer_chain(
                         address,
                         cid.codec,
                         cid,
@@ -798,6 +798,7 @@ async fn apply_command_internal(
         coordinator = coordinator.with_proposer(proposer.clone());
     }
     let started = std::time::Instant::now();
+    observe_current_stage(OperationStage::Publication);
     let request = PublicationRequest {
         namespace_id: namespace_id.clone(),
         command,
@@ -823,6 +824,9 @@ async fn apply_command_internal(
     let result = match published {
         Ok(result) => {
             NAMESPACE_COMMITS.fetch_add(1, Ordering::Relaxed);
+            observe_current_stage(OperationStage::StateApplication);
+            add_current_cost(OperationCostMetric::StateMachineOperations, 1);
+            add_current_cost(OperationCostMetric::StateMachineEntries, 1);
             result
         }
         Err(error) => {

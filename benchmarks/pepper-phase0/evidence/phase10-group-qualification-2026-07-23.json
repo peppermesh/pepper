@@ -1,0 +1,13 @@
+{
+  "schema": "pepper.phase10.group-qualification.v1",
+  "initialized_groups": 10000,
+  "idle_members": 0,
+  "encoded_bytes": 1288974,
+  "encoded_bytes_per_group": 128,
+  "scheduler_tasks": 1,
+  "file_descriptors_per_group": 0,
+  "churn_members": 1000,
+  "churn_elapsed_microseconds": 19377,
+  "unrelated_operation_microseconds": 1,
+  "all_pass": true
+}

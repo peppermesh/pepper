@@ -8,6 +8,7 @@
 //! claim that their own blocks are preverified.
 
 use crate::{SnapshotDescriptor, SqliteError, SqliteFormatLimits, format::encode_canonical};
+use pepper_dataset::{ExactBase, MutationFrontier, PreparedDatasetArtifact};
 use pepper_types::{
     CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_SMALL_OBJECT, CODEC_SQLITE_PAGE_TABLE,
     CODEC_SQLITE_SNAPSHOT, Cid, DurabilityReceipt, PlacementRole,
@@ -17,12 +18,14 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct IncrementalProofInput {
     pub protected_base_snapshot: Cid,
+    pub protected_base_generation: u64,
     pub protected_base_descriptor: SnapshotDescriptor,
     pub new_snapshot: Cid,
     pub new_snapshot_descriptor: SnapshotDescriptor,
     pub new_page_table_nodes: Vec<Cid>,
     pub new_page_pack_roots: Vec<Cid>,
     pub verified_descendants: Vec<Cid>,
+    pub changed_page_count: usize,
     pub durability_receipts: Vec<DurabilityReceipt>,
     pub builder_identity: String,
 }
@@ -76,6 +79,38 @@ impl IncrementalDurabilityProof {
             ));
         }
 
+        let root_changed = input.new_snapshot_descriptor.page_table_root_cid
+            != input.protected_base_descriptor.page_table_root_cid;
+        let artifact = PreparedDatasetArtifact {
+            exact_base: ExactBase {
+                generation: input.protected_base_generation,
+                root: input.protected_base_snapshot.clone(),
+            },
+            candidate_root: input.new_snapshot.clone(),
+            descriptor: input
+                .new_snapshot_descriptor
+                .dataset_root(input.protected_base_generation.saturating_add(1)),
+            frontier: MutationFrontier {
+                // A byte-identical rewrite (for example, SQLite compaction)
+                // advances the snapshot descriptor while retaining the
+                // content-addressed page table. Its submitted pages are not
+                // changed index keys and therefore have an empty frontier.
+                changed_keys: if root_changed {
+                    input.changed_page_count
+                } else {
+                    0
+                },
+                index_depth: 4,
+                candidate_index_root: input.new_snapshot_descriptor.page_table_root_cid.clone(),
+                new_index_nodes: input.new_page_table_nodes.clone(),
+                new_data_roots: input.new_page_pack_roots.clone(),
+                verified_descendants: input.verified_descendants.clone(),
+            },
+        };
+        artifact
+            .validate()
+            .map_err(|error| SqliteError::Invalid(error.to_string()))?;
+
         validate_cid_list(
             &input.new_page_table_nodes,
             |cid| cid.codec == CODEC_SQLITE_PAGE_TABLE,
@@ -97,8 +132,6 @@ impl IncrementalDurabilityProof {
             "verified descendants",
         )?;
 
-        let root_changed = input.new_snapshot_descriptor.page_table_root_cid
-            != input.protected_base_descriptor.page_table_root_cid;
         if root_changed
             != input
                 .new_page_table_nodes
@@ -270,12 +303,14 @@ mod tests {
         let child = Cid::new(CODEC_RAW, b"child");
         IncrementalProofInput {
             protected_base_snapshot: base,
+            protected_base_generation: 4,
             protected_base_descriptor: base_descriptor,
             new_snapshot: new_snapshot.clone(),
             new_snapshot_descriptor: new_descriptor,
             new_page_table_nodes: vec![new_root.clone()],
             new_page_pack_roots: vec![pack.clone()],
             verified_descendants: vec![child.clone()],
+            changed_page_count: 1,
             durability_receipts: vec![
                 receipt(new_snapshot),
                 receipt(new_root),
@@ -312,6 +347,36 @@ mod tests {
         let mut weak = fixture();
         weak.durability_receipts[0].replicas_accepted = 2;
         assert!(IncrementalDurabilityProof::build(weak, 3, SqliteFormatLimits::default()).is_err());
+    }
+
+    #[test]
+    fn proof_accepts_byte_identical_rewrite_with_unchanged_index() {
+        let old_root = Cid::new(CODEC_SQLITE_PAGE_TABLE, b"unchanged-root");
+        let base_descriptor = descriptor(old_root.clone(), None);
+        let base_payload = encode_canonical(&base_descriptor, 64 * 1024).unwrap();
+        let base = Cid::new(CODEC_SQLITE_SNAPSHOT, &base_payload);
+        let new_descriptor = descriptor(old_root, Some(base.clone()));
+        let new_payload = encode_canonical(&new_descriptor, 64 * 1024).unwrap();
+        let new_snapshot = Cid::new(CODEC_SQLITE_SNAPSHOT, &new_payload);
+        let proof = IncrementalDurabilityProof::build(
+            IncrementalProofInput {
+                protected_base_snapshot: base,
+                protected_base_generation: 4,
+                protected_base_descriptor: base_descriptor,
+                new_snapshot: new_snapshot.clone(),
+                new_snapshot_descriptor: new_descriptor,
+                new_page_table_nodes: Vec::new(),
+                new_page_pack_roots: Vec::new(),
+                verified_descendants: Vec::new(),
+                changed_page_count: 1,
+                durability_receipts: vec![receipt(new_snapshot)],
+                builder_identity: "node:a".into(),
+            },
+            3,
+            SqliteFormatLimits::default(),
+        )
+        .unwrap();
+        assert!(proof.new_page_table_nodes().is_empty());
     }
 
     #[test]

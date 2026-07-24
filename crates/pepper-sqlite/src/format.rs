@@ -2,6 +2,7 @@
 
 use crate::SqliteError;
 use pepper_dag::{DagCodecHandler, DagError, TraversalLimits};
+use pepper_dataset::{DatasetRoot, IndexKind};
 use pepper_types::{
     CODEC_ERASURE_MANIFEST, CODEC_OBJECT_MANIFEST, CODEC_SMALL_OBJECT, CODEC_SQLITE_DATABASE,
     CODEC_SQLITE_PAGE_TABLE, CODEC_SQLITE_SNAPSHOT, Cid, Codec,
@@ -215,6 +216,21 @@ pub struct SnapshotDescriptor {
 }
 
 impl SnapshotDescriptor {
+    pub fn dataset_root(&self, generation: u64) -> DatasetRoot {
+        DatasetRoot {
+            product: "sqlite".into(),
+            format_version: self.version,
+            generation,
+            index_kind: IndexKind::FixedFanout {
+                fanout: 256,
+                depth: 4,
+            },
+            index_root: self.page_table_root_cid.clone(),
+            previous_root: self.base_snapshot_cid.clone(),
+            logical_bytes: self.logical_size,
+        }
+    }
+
     pub fn validate(&self, limits: SqliteFormatLimits) -> Result<(), SqliteError> {
         let limits = limits.validate()?;
         if self.descriptor_type != SNAPSHOT_TYPE

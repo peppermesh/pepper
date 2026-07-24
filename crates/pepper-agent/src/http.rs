@@ -226,5 +226,180 @@ pub(super) fn router(state: AppState) -> Router {
         ))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(operation_identity))
         .with_state(state)
+}
+
+async fn operation_identity(request: Request<Body>, next: Next) -> Response {
+    let incoming = match request
+        .headers()
+        .get(pepper_observability::OPERATION_ID_HEADER)
+    {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|value| OperationId::parse(value).ok())
+        {
+            Some(id) => Some(id),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "x-pepper-operation-id must contain 32 hexadecimal characters",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let class = classify_http_workload(request.method(), request.uri().path());
+    let work_key = WorkKey::combine(&[
+        request.method().as_str().as_bytes(),
+        request.uri().path().as_bytes(),
+    ]);
+    let content_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let scope = OperationScope::begin(class, work_key, incoming);
+    let operation_id = scope.context().id;
+    let mut response = scope_operation(scope.clone(), async move {
+        observe_current_stage(OperationStage::Ingress);
+        if content_length > 0 {
+            add_current_cost(OperationCostMetric::OwnedBytes, content_length);
+        }
+        let response = next.run(request).await;
+        observe_current_stage(OperationStage::Response);
+        response
+    })
+    .await;
+    scope.finish(response.status().is_success() || response.status().is_redirection());
+    response.headers_mut().insert(
+        pepper_observability::OPERATION_ID_HEADER,
+        HeaderValue::from_str(&operation_id.to_string())
+            .expect("operation ID is always a valid HTTP header"),
+    );
+    response
+}
+
+fn classify_http_workload(method: &Method, path: &str) -> WorkloadClass {
+    if path == "/v1/fs/commit" {
+        WorkloadClass::FilesystemCommit
+    } else if path == "/v1/fs/checkout" || path == "/v1/fs/restore" {
+        WorkloadClass::FilesystemCheckout
+    } else if path.starts_with("/v1/sqlite/") && path.ends_with("/transactions") {
+        WorkloadClass::SqliteCommit
+    } else if path.starts_with("/v1/sqlite/") {
+        WorkloadClass::SqliteRead
+    } else if path.starts_with("/v1/") || path == "/healthz" || path == "/readyz" {
+        WorkloadClass::Control
+    } else if *method == Method::PUT || *method == Method::POST {
+        WorkloadClass::S3Put
+    } else if *method == Method::GET || *method == Method::HEAD {
+        WorkloadClass::S3Get
+    } else {
+        WorkloadClass::Unknown
+    }
+}
+
+#[cfg(test)]
+mod operation_identity_tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request, routing::put};
+    use pepper_observability::{CostMetric, process_metrics};
+    use tower::ServiceExt;
+
+    #[test]
+    fn workload_classification_is_closed_and_route_aware() {
+        assert_eq!(
+            classify_http_workload(&Method::POST, "/v1/fs/commit"),
+            WorkloadClass::FilesystemCommit
+        );
+        assert_eq!(
+            classify_http_workload(&Method::POST, "/v1/sqlite/databases/example/transactions"),
+            WorkloadClass::SqliteCommit
+        );
+        assert_eq!(
+            classify_http_workload(&Method::PUT, "/bucket/key"),
+            WorkloadClass::S3Put
+        );
+        assert_eq!(
+            classify_http_workload(&Method::GET, "/bucket/key"),
+            WorkloadClass::S3Get
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_generates_preserves_and_validates_operation_ids() {
+        let app = Router::new()
+            .route("/bucket/key", put(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn(operation_identity));
+
+        let operations_before = process_metrics().get(WorkloadClass::S3Put, CostMetric::Operations);
+        let generated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/bucket/key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::NO_CONTENT);
+        let generated_id = generated
+            .headers()
+            .get(pepper_observability::OPERATION_ID_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        OperationId::parse(generated_id).unwrap();
+
+        let supplied = "00112233445566778899aabbccddeeff";
+        let preserved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/bucket/key")
+                    .header(pepper_observability::OPERATION_ID_HEADER, supplied)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preserved.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preserved
+                .headers()
+                .get(pepper_observability::OPERATION_ID_HEADER)
+                .unwrap(),
+            supplied
+        );
+
+        let malformed = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/bucket/key")
+                    .header(pepper_observability::OPERATION_ID_HEADER, "not-an-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            malformed
+                .headers()
+                .get(pepper_observability::OPERATION_ID_HEADER)
+                .is_none()
+        );
+        assert!(
+            process_metrics().get(WorkloadClass::S3Put, CostMetric::Operations)
+                >= operations_before + 2
+        );
+    }
 }

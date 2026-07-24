@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "classification": "phase3-keyed-runtime-resource-governor-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "phase2_binary_sha256": "afef3503b16302c23c76f3528c4bde413a4ab1faa74732cef4e4dcd243142a34",
+  "phase3_binary_sha256": "9dfa0e4c6baf043efa6492366d0cf766c564a997bd4d3e932098e86772e28435",
+  "cargo_lock_sha256": "186e4dd0169f62780a8d59ebc8e8a5a20da67c7ee34d4007918b28f745e76005",
+  "phase3_source_diff_sha256": "3a4b73604212e2d7ea630a0af3c160781932f2f80d27cffbe47467cd5750ef6d",
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "topology": "three local Pepper peers, replication factor 3, eight owner workers per peer",
+    "source_snapshot_tree_sha256": "82525fff683d838b31cd346d04fa1d3b031ff2afe22424f1762fb634b6e6315d",
+    "comparison_method": "the qualified Phase 2 binary created one quiesced three-node source state; Phase 2 and Phase 3 ran sequentially on the same ports and host from independent byte copies"
+  },
+  "predeclared_budget": {
+    "s3_median_throughput_regression_percent": 5.0,
+    "s3_median_p99_regression_percent": 5.0,
+    "correctness_failure_tolerance": 0,
+    "control_completion_budget_milliseconds": 30,
+    "control_test_background_service_milliseconds": 100,
+    "control_test_minimum_execution_slots": 3
+  },
+  "s3": {
+    "configuration": {
+      "operation": "put",
+      "payload_bytes": 4096,
+      "concurrency": 8,
+      "duration_seconds": 60,
+      "object_count": 1024,
+      "repetitions": 5,
+      "endpoints": [
+        "http://127.0.0.1:31080",
+        "http://127.0.0.1:31081",
+        "http://127.0.0.1:31082"
+      ]
+    },
+    "phase2": {
+      "operations_per_second": [
+        29.11759469050955,
+        17.49067088630962,
+        13.705158450669806,
+        11.496880372295758,
+        10.093741089603714
+      ],
+      "p99_milliseconds": [
+        693.382,
+        1048.885,
+        1325.851,
+        1657.793,
+        1609.5
+      ],
+      "median_operations_per_second": 13.705158450669806,
+      "median_p99_milliseconds": 1325.851,
+      "successes": 4946,
+      "failures": 0
+    },
+    "phase3": {
+      "operations_per_second": [
+        28.9701822797483,
+        17.4050803175489,
+        13.466990095159803,
+        11.652403082601545,
+        10.079798255181723
+      ],
+      "p99_milliseconds": [
+        728.484,
+        1112.461,
+        1311.039,
+        1327.146,
+        1724.361
+      ],
+      "median_operations_per_second": 13.466990095159803,
+      "median_p99_milliseconds": 1311.039,
+      "successes": 4930,
+      "failures": 0
+    },
+    "throughput_regression_percent": 1.737800816877,
+    "p99_regression_percent": -1.117169274677,
+    "passes": true
+  },
+  "resource_governor": {
+    "ordinary_admission_uses_mutex": false,
+    "ordinary_admission_uses_semaphore": false,
+    "hierarchy": [
+      "key",
+      "tenant",
+      "product",
+      "operation",
+      "worker",
+      "global"
+    ],
+    "s3_key_budget_rejections": 0,
+    "s3_draining_slots_at_capture": 0,
+    "s3_queue_and_service_metrics_nonzero": true,
+    "synthetic_tests": {
+      "in_key_ordering": "pass",
+      "cross_key_concurrency": "pass",
+      "hot_key_isolation": "pass",
+      "hierarchical_budget_release": "pass",
+      "control_latency_under_background_saturation": "pass",
+      "safe_drain_and_remap": "pass"
+    },
+    "passes": true
+  },
+  "implementation_validation": [
+    {
+      "command": "cargo test -p pepper-keyed-runtime",
+      "result": "pass",
+      "tests": 5
+    },
+    {
+      "command": "cargo test -p pepper-config",
+      "result": "pass",
+      "tests": 13
+    },
+    {
+      "command": "cargo test -p pepper-agent --bin pepper-agent",
+      "result": "pass",
+      "tests": 47
+    },
+    {
+      "command": "cargo test -q --workspace",
+      "result": "pass"
+    }
+  ],
+  "raw_artifacts": {
+    "phase2": {
+      "s3-1.json": "17ace5e58206ca6ec74241f977ff621e116be74677788beebf7b4ad74e45ec40",
+      "s3-2.json": "e98673bdf1e53c738e86add1352c0acb064fdf204cb4c3bd3124aa837199b86c",
+      "s3-3.json": "7001ea4a4f9cd64d0ad61cb166172e49b77a4b8271b55713e12b53f021c6fac2",
+      "s3-4.json": "59b62e715e2eec3a3469459f8c6f97269a73529d50c026a80a6d03bc38da8892",
+      "s3-5.json": "67cf1d28294d4f9729b36449d51b51197a2a8cd17fb08754b9cb60361117246a",
+      "metrics.prom": "70a03c6f833b3022d0dccc7cb4df728d37103701c6e04f1b5c5968dbde8790e3"
+    },
+    "phase3": {
+      "s3-1.json": "a7781564361c84082d1ffef702512bc18feacf4dbb035fb1c40cd60e9014ed0e",
+      "s3-2.json": "a8fe5eb67bcd70663b1bf4c77cc004a420c0f421e6adca24d0ba6e3545c40050",
+      "s3-3.json": "e3314ed344469b86eada35fc4049d835076dead9f05d2f3e52e4b9b427661a2b",
+      "s3-4.json": "ef35a08aa4e7886fb786d627ed75be15d8eb29b2ad5229950683bf51cbfe045c",
+      "s3-5.json": "89bd4083af9f222529a65d1d530eec4a324f05ba8a6bb27db33977e1ad646240",
+      "metrics.prom": "536141f61d05372a816cd9e04a9cd08f711e28be43d975821578a5cc6553ccb4"
+    }
+  },
+  "limitations": [
+    "Hash-sharded budgets are intentionally conservative: unrelated identifiers that collide share a cap.",
+    "Callers must declare retained request bytes accurately; the runtime cannot inspect an opaque product envelope.",
+    "CPU affinity is applied by the product-owned worker thread and is never required for ordering correctness.",
+    "The S3 absolute rate declines as the catalog grows; this known pre-Phase-3 behavior is controlled by comparing medians from byte-identical initial states.",
+    "Large raw reports and Prometheus captures remain under target; their hashes, aggregates, and gate decision are tracked here."
+  ],
+  "gate": {
+    "phase3_complete": true,
+    "decision": "pass"
+  }
+}

@@ -237,10 +237,12 @@ struct ReportResults {
 
 #[derive(Debug, Serialize)]
 struct LatencyReport {
+    mean: f64,
     p50: f64,
     p95: f64,
     p99: f64,
     max: f64,
+    total: f64,
 }
 
 impl Backend {
@@ -1323,8 +1325,15 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
     }
     let elapsed = started.elapsed().as_secs_f64();
     combined.latencies_micros.sort_unstable();
+    let total_latency_micros = combined
+        .latencies_micros
+        .iter()
+        .copied()
+        .map(u128::from)
+        .sum::<u128>();
+    let total_latency_ms = total_latency_micros as f64 / 1000.0;
     let report = Report {
-        schema_version: 5,
+        schema_version: 6,
         started_at,
         config: ReportConfig {
             backend: args.backend,
@@ -1359,10 +1368,12 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
             logical_mb_per_second: combined.logical_bytes as f64 / 1_000_000.0 / elapsed,
             operations_per_second: combined.attempts as f64 / elapsed,
             latency_ms: LatencyReport {
+                mean: total_latency_ms / combined.latencies_micros.len().max(1) as f64,
                 p50: percentile(&combined.latencies_micros, 50),
                 p95: percentile(&combined.latencies_micros, 95),
                 p99: percentile(&combined.latencies_micros, 99),
                 max: combined.latencies_micros.last().copied().unwrap_or(0) as f64 / 1000.0,
+                total: total_latency_ms,
             },
             http_status_counts: combined.statuses,
             error_counts: combined.errors,

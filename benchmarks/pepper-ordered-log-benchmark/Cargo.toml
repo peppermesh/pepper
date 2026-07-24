@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-ordered-log-benchmark"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Retained Phase 7 ordered-log qualification"
+
+[dependencies]
+bytes = { workspace = true }
+pepper-buffer = { path = "../../crates/pepper-buffer", version = "0.3.0" }
+pepper-extent = { path = "../../crates/pepper-extent", version = "0.3.0" }
+pepper-ordered-log = { path = "../../crates/pepper-ordered-log", version = "0.3.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3.23"

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-extent"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Product-neutral checksummed extent and range I/O for Pepper"
+
+[dependencies]
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+hex = { workspace = true }
+pepper-buffer = { version = "0.3.0", path = "../pepper-buffer" }
+pepper-durability = { version = "0.3.0", path = "../pepper-durability" }
+pepper-observability = { version = "0.3.0", path = "../pepper-observability" }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = "3.23"

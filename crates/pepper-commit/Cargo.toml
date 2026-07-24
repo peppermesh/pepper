@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-commit"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Product-neutral prepared-artifact commit engine for Pepper"
+
+[dependencies]
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }

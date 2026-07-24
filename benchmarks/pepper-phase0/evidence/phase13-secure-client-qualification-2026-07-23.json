@@ -1,0 +1,60 @@
+{
+  "schema": "pepper.phase13.secure-client-qualification.v2",
+  "date_utc": "2026-07-23",
+  "source_base_commit": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "branch": "vinayakb/kafka",
+  "server": {
+    "binary": "target/release/pepper-kafka-smoke-server",
+    "sha256": "d9a50eb3e719a25013917d2827b849ecef6372a16ee71c087b170646eaf0ebdc",
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "command": "target/release/pepper-kafka-smoke-server DATA_DIRECTORY CA_PEM_OUTPUT",
+    "listeners": [
+      "127.0.0.1:19092",
+      "127.0.0.1:29092",
+      "127.0.0.1:39092"
+    ],
+    "transport": "TLSv1.3",
+    "sasl_mechanism": "SCRAM-SHA-256",
+    "certificate_sha256": "73adb6c342b1d7205af3ff839f22928e1ecfa1ab215043e3b93b0d61f5d95e3c"
+  },
+  "clients": [
+    {
+      "name": "Apache Java command-line clients",
+      "version": "Apache Kafka 4.3.1",
+      "container": "apache/kafka@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837",
+      "configuration_sha256": "8101db571b800da41078715281237b9ca983a359f06dc56534fdcea7ea7aefcf",
+      "flows": "TLS/SCRAM, create RF=3 topic, produce, fetch, delete",
+      "observed_output": "java-secure; Processed a total of 1 messages",
+      "result": "pass"
+    },
+    {
+      "name": "librdkafka through confluent-kafka",
+      "version": "confluent-kafka 2.11.1 / librdkafka 2.11.1",
+      "container": "python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de",
+      "script_sha256": "e2ca50d0b65f841d03eee62bfff11264778f3b111f50fb1c988bf013c76ce34e",
+      "flows": "TLS/SCRAM, create/delete, idempotent produce, commit/abort transaction, read_committed, group offset commit",
+      "observed_output": "phase13 TLS/SCRAM/idempotence/transactions/groups ok [b'idempotent', b'committed']",
+      "result": "pass"
+    },
+    {
+      "name": "franz-go",
+      "version": "v1.20.4 with kadm v1.17.2",
+      "container": "golang@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac",
+      "script_sha256": "c754c3dfc2ee90c19f7d256b56925b50c1462358c3acb603ccc2507bf28075cc",
+      "flows": "TLS/SCRAM, create/delete, idempotent produce, group fetch and offset commit",
+      "observed_output": "franz-go v1.20.4 TLS/SCRAM/group flow ok",
+      "result": "pass"
+    },
+    {
+      "name": "kafka-python-ng",
+      "version": "2.2.3",
+      "container": "python@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91",
+      "script_sha256": "c9ca91bc45670ac74d1960a1add9708b28033931f845e88f26381d08774a934c",
+      "flows": "TLS, legacy SASL token framing with SCRAM, create/delete, produce, group fetch and offset commit",
+      "observed_output": "kafka-python-ng TLS/SCRAM/group flow ok",
+      "result": "pass"
+    }
+  ],
+  "protocol_discovery": "kafka-python-ng 2.2.3 uses SaslHandshake v0 followed by legacy length-delimited SASL tokens. Pepper now advertises v0-v1, retains Kafka-framed SaslAuthenticate v0, and qualifies both paths.",
+  "all_pass": true
+}

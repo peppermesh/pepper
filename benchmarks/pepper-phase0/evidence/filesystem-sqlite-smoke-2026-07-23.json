@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "classification": "exploratory-smoke-not-qualification-evidence",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "environment": {
+    "topology": "three Pepper peers in Docker on one development host",
+    "filesystem": "xfs",
+    "storage_engine": "files",
+    "sqlite_journal_mode": "DELETE",
+    "sqlite_synchronous": "FULL"
+  },
+  "filesystem": {
+    "configuration": {
+      "files": 100,
+      "file_bytes": 4096,
+      "mutation_percent": 10,
+      "iterations": 3,
+      "upload_concurrency": 8
+    },
+    "initial_upload_operations_per_second": 1363.7942414170018,
+    "initial_commit_p50_microseconds": 610899.693,
+    "mutation_upload_p50_microseconds": 11471.767,
+    "mutation_commit_p50_microseconds": 626963.333,
+    "mutation_commit_p95_microseconds": 628267.058,
+    "checkout_resolution_p50_microseconds": 3946.055,
+    "checkout_materialization_p50_microseconds": 6733.455,
+    "end_to_end_mutation_commit_p50_microseconds": 636779.146,
+    "end_to_end_mutation_commit_p95_microseconds": 641764.227,
+    "final_revision": 4,
+    "final_file_count": 100,
+    "final_logical_bytes": 409600,
+    "verified_files": 300,
+    "verified_bytes": 1228800,
+    "ingress_cost_delta": {
+      "explicit_payload_allocations": 650,
+      "explicit_payload_allocated_bytes": 546476320,
+      "explicit_payload_copy_operations": 650,
+      "explicit_payload_copy_bytes": 1749280,
+      "shared_payload_references": 520,
+      "merkle_nodes_read": 1097,
+      "merkle_nodes_written": 1174,
+      "namespace_commit_microseconds": 2112886,
+      "rpc_request_bytes": 1550244,
+      "rpc_response_bytes": 472098
+    },
+    "artifact": {
+      "local_path": "target/phase0-filesystem-smoke-v3.json",
+      "sha256": "30d731dee77381df66aadf0bff72760927720c85208787067a87f805a76a917c"
+    }
+  },
+  "sqlite": {
+    "configuration": {
+      "seed_rows": 1000,
+      "payload_bytes": 256,
+      "point_reads": 500,
+      "scans": 1,
+      "reopen_reads": 5,
+      "batch_sizes": [
+        1,
+        10,
+        100
+      ],
+      "transactions_per_batch": 3
+    },
+    "filesystem_p50_microseconds": {
+      "point_read_connection_cache": 9.45,
+      "sequential_scan_connection_cache": 71.909,
+      "point_read_reopen": 78.93,
+      "insert_autocommit_1": 1480.364,
+      "insert_transaction_10": 1257.546,
+      "insert_transaction_100": 1369.875
+    },
+    "pepper_p50_microseconds": {
+      "point_read_connection_cache": 0.74,
+      "sequential_scan_connection_cache": 79.47,
+      "point_read_reopen": 14079.117,
+      "insert_autocommit_1": 65329.835,
+      "insert_transaction_10": 68642.301,
+      "insert_transaction_100": 71215.592
+    },
+    "pepper_p95_microseconds": {
+      "point_read_reopen": 15705.631,
+      "insert_autocommit_1": 68901.771,
+      "insert_transaction_10": 68966.231,
+      "insert_transaction_100": 71614.231
+    },
+    "final_rows": 1333,
+    "integrity_check": "ok",
+    "ingress_cost_delta": {
+      "commits": 11,
+      "commit_failures": 0,
+      "page_pack_writes": 11,
+      "page_pack_write_bytes": 573440,
+      "page_reads": 70,
+      "page_read_bytes": 286720,
+      "explicit_payload_allocations": 171,
+      "explicit_payload_allocated_bytes": 46363890,
+      "explicit_payload_copy_operations": 171,
+      "explicit_payload_copy_bytes": 799986,
+      "shared_payload_references": 160,
+      "namespace_commit_microseconds": 487380,
+      "rpc_request_bytes": 490757,
+      "rpc_response_bytes": 318546
+    },
+    "artifact": {
+      "local_path": "/home/vinayakb/pepper-phase0-platform-smoke/fs-scratch/phase0-sqlite-smoke-v3.json",
+      "sha256": "83491bf8cb3ae5d83bbcf19af599fa2402081d6a03aceab9f0f5b1bb39da4a57"
+    }
+  },
+  "findings": [
+    "The filesystem benchmark exposed and now regression-tests correct CID URL path-segment encoding.",
+    "For 130 small filesystem content writes, the current object builder requested 546476320 payload-buffer bytes while copying 1749280 bytes.",
+    "For the SQLite workload, 11 commits requested 46363890 payload-buffer bytes while copying 799986 bytes.",
+    "The approximately 4 MiB reserved buffer per small object or page-pack write is a concrete target for the shared owned-buffer and extent work."
+  ],
+  "limitations": [
+    "The worktree was dirty and the workload was intentionally smaller than qualification scale.",
+    "All peers shared one host and block device.",
+    "Metrics deltas are from the selected ingress peer; the Phase 0 platform suite separately captures all three peers.",
+    "The explicit payload counters are reviewed lower bounds rather than allocator-wide measurements."
+  ]
+}

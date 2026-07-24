@@ -1,0 +1,27 @@
+{
+  "schema": "pepper.phase13.security-soak-qualification.v1",
+  "mixed_operations": 1000000,
+  "lifecycle_events": 10000,
+  "elapsed_milliseconds": 65,
+  "tenant_isolation_victim_p99_microseconds": 0,
+  "tenant_isolation_budget_microseconds": 10000,
+  "security_before": {
+    "credentials": 1,
+    "acl_rules": 4,
+    "tracked_principals": 1,
+    "audit_events": 256,
+    "maximum_audit_events": 256
+  },
+  "security_after": {
+    "credentials": 1,
+    "acl_rules": 4,
+    "tracked_principals": 1,
+    "audit_events": 256,
+    "maximum_audit_events": 256
+  },
+  "file_descriptors_before": 10,
+  "file_descriptors_after": 10,
+  "lifecycle_entries_after_quiescence": 0,
+  "coordinator_groups_after_quiescence": 1,
+  "all_pass": true
+}

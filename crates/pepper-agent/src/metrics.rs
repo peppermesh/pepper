@@ -62,6 +62,11 @@ pub(super) static S3_BLOCK_HASH_STORAGE_PHASES: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_BLOCK_HASH_STORAGE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_REPLICA_TRANSFER_PHASES: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_REPLICA_TRANSFER_MICROS: AtomicU64 = AtomicU64::new(0);
+pub(super) static EXPLICIT_PAYLOAD_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static EXPLICIT_PAYLOAD_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static EXPLICIT_PAYLOAD_COPY_OPERATIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static EXPLICIT_PAYLOAD_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(super) static SHARED_PAYLOAD_REFERENCES: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_WRITE_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_WRITE_ADMISSION_QUEUE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(super) static S3_HTTP_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +119,23 @@ pub(super) fn observe_phase(counter: &AtomicU64, total_micros: &AtomicU64, elaps
         elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
     );
+}
+
+pub(super) fn observe_payload_allocation(bytes: usize) {
+    EXPLICIT_PAYLOAD_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    EXPLICIT_PAYLOAD_ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    add_current_cost(OperationCostMetric::OwnedBytes, bytes as u64);
+}
+
+pub(super) fn observe_payload_copy(bytes: usize) {
+    EXPLICIT_PAYLOAD_COPY_OPERATIONS.fetch_add(1, Ordering::Relaxed);
+    EXPLICIT_PAYLOAD_COPY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    add_current_cost(OperationCostMetric::CopyOperations, 1);
+    add_current_cost(OperationCostMetric::CopyBytes, bytes as u64);
+}
+
+pub(super) fn observe_shared_payload_reference() {
+    SHARED_PAYLOAD_REFERENCES.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(super) fn record_erasure_stripe_encoding(
@@ -460,6 +482,21 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          pepper_s3_put_phase_observations_total{{phase=\"durability_fsync_barrier\"}} {}\n\
          pepper_s3_put_phase_observations_total{{phase=\"merkle_update\"}} {}\n\
          pepper_s3_put_phase_observations_total{{phase=\"raft_namespace_publication\"}} {}\n\
+         # HELP pepper_explicit_payload_allocations_total Explicit full or partial payload-buffer allocations at reviewed product boundaries.\n\
+         # TYPE pepper_explicit_payload_allocations_total counter\n\
+         pepper_explicit_payload_allocations_total {}\n\
+         # HELP pepper_explicit_payload_allocated_bytes_total Capacity bytes requested by reviewed explicit payload-buffer allocations.\n\
+         # TYPE pepper_explicit_payload_allocated_bytes_total counter\n\
+         pepper_explicit_payload_allocated_bytes_total {}\n\
+         # HELP pepper_explicit_payload_copy_operations_total Reviewed explicit payload copy operations.\n\
+         # TYPE pepper_explicit_payload_copy_operations_total counter\n\
+         pepper_explicit_payload_copy_operations_total {}\n\
+         # HELP pepper_explicit_payload_copy_bytes_total Bytes passed through reviewed explicit payload copy operations.\n\
+         # TYPE pepper_explicit_payload_copy_bytes_total counter\n\
+         pepper_explicit_payload_copy_bytes_total {}\n\
+         # HELP pepper_shared_payload_references_total Reference-counted payload handles created without copying payload bytes.\n\
+         # TYPE pepper_shared_payload_references_total counter\n\
+         pepper_shared_payload_references_total {}\n\
          # HELP pepper_namespace_durability_receipt_sources_total Durability receipts by verification source.\n\
          # TYPE pepper_namespace_durability_receipt_sources_total counter\n\
          pepper_namespace_durability_receipt_sources_total{{source=\"preverified\"}} {}\n\
@@ -534,11 +571,36 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         publication_phases.durability_observations,
         publication_phases.merkle_update_observations,
         publication_phases.raft_publication_observations,
+        EXPLICIT_PAYLOAD_ALLOCATIONS.load(Ordering::Relaxed),
+        EXPLICIT_PAYLOAD_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        EXPLICIT_PAYLOAD_COPY_OPERATIONS.load(Ordering::Relaxed),
+        EXPLICIT_PAYLOAD_COPY_BYTES.load(Ordering::Relaxed),
+        SHARED_PAYLOAD_REFERENCES.load(Ordering::Relaxed),
         publication_phases.durability_preverified_receipts,
         publication_phases.durability_cached_receipts,
         publication_phases.durability_backend_receipts,
         publication_phases.durability_missing_preverified_receipts,
         publication_phases.durability_invalid_preverified_receipts,
+    ));
+    body.push_str(&format!(
+        "# HELP pepper_commit_engine_transitions_total Shared prepared-artifact commit transitions by stage.\n\
+         # TYPE pepper_commit_engine_transitions_total counter\n\
+         pepper_commit_engine_transitions_total{{stage=\"prepared\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"staged\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"durable\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"proposed\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"ambiguous\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"recovered\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"reconciled\"}} {}\n\
+         pepper_commit_engine_transitions_total{{stage=\"finalized\"}} {}\n",
+        publication_phases.commit_engine_prepared,
+        publication_phases.commit_engine_staged,
+        publication_phases.commit_engine_durable,
+        publication_phases.commit_engine_proposed,
+        publication_phases.commit_engine_ambiguous,
+        publication_phases.commit_engine_recovered,
+        publication_phases.commit_engine_reconciled,
+        publication_phases.commit_engine_finalized,
     ));
     body.push_str(&format!(
         "# HELP pepper_storage_native_writes_total Records durably appended by the native segment backend.\n\
@@ -786,6 +848,7 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
     ));
     if let Some(runtime) = &state.fast_path {
         let (dispatches, rejections, failovers, cross_core_hops) = runtime.totals();
+        let governor = runtime.governor_snapshot();
         body.push_str(&format!(
             "# HELP pepper_fast_path_enabled Whether per-core S3 execution ownership is enabled.\n\
              # TYPE pepper_fast_path_enabled gauge\n\
@@ -810,10 +873,22 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
              pepper_fast_path_owner_failovers_total {failovers}\n\
              # HELP pepper_fast_path_cross_core_hops_total Explicit request and response ownership transfers.\n\
              # TYPE pepper_fast_path_cross_core_hops_total counter\n\
-             pepper_fast_path_cross_core_hops_total {cross_core_hops}\n",
+             pepper_fast_path_cross_core_hops_total {cross_core_hops}\n\
+             # HELP pepper_keyed_runtime_key_budget_rejections_total Operations rejected by a bounded per-key budget.\n\
+             # TYPE pepper_keyed_runtime_key_budget_rejections_total counter\n\
+             pepper_keyed_runtime_key_budget_rejections_total {}\n\
+             # HELP pepper_keyed_runtime_remaps_total Safely drained key-slot ownership movements.\n\
+             # TYPE pepper_keyed_runtime_remaps_total counter\n\
+             pepper_keyed_runtime_remaps_total {}\n\
+             # HELP pepper_keyed_runtime_draining_slots Key slots currently fenced while ownership moves.\n\
+             # TYPE pepper_keyed_runtime_draining_slots gauge\n\
+             pepper_keyed_runtime_draining_slots {}\n",
             runtime.owner_count(),
             runtime.reserved_control_cores(),
             u8::from(runtime.cpu_pinning_enabled()),
+            governor.key_budget_rejections,
+            governor.remaps,
+            governor.draining_slots,
         ));
         body.push_str(
             "# TYPE pepper_fast_path_owner_healthy gauge\n\
@@ -826,7 +901,11 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
              # TYPE pepper_fast_path_owner_execution_microseconds_total counter\n\
              # TYPE pepper_fast_path_owner_response_bytes_total counter\n\
              # TYPE pepper_fast_path_owner_buffer_hits_total counter\n\
-             # TYPE pepper_fast_path_owner_buffer_misses_total counter\n",
+             # TYPE pepper_fast_path_owner_buffer_misses_total counter\n\
+             # TYPE pepper_keyed_runtime_owner_queued gauge\n\
+             # TYPE pepper_keyed_runtime_owner_active gauge\n\
+             # TYPE pepper_keyed_runtime_owner_queue_microseconds_total counter\n\
+             # TYPE pepper_keyed_runtime_owner_service_microseconds_total counter\n",
         );
         for owner in runtime.snapshots() {
             body.push_str(&format!(
@@ -840,7 +919,15 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
                  pepper_fast_path_owner_execution_microseconds_total{{owner=\"{}\"}} {}\n\
                  pepper_fast_path_owner_response_bytes_total{{owner=\"{}\"}} {}\n\
                  pepper_fast_path_owner_buffer_hits_total{{owner=\"{}\"}} {}\n\
-                 pepper_fast_path_owner_buffer_misses_total{{owner=\"{}\"}} {}\n",
+                 pepper_fast_path_owner_buffer_misses_total{{owner=\"{}\"}} {}\n\
+                 pepper_keyed_runtime_owner_queued{{owner=\"{}\",class=\"control\"}} {}\n\
+                 pepper_keyed_runtime_owner_queued{{owner=\"{}\",class=\"foreground\"}} {}\n\
+                 pepper_keyed_runtime_owner_queued{{owner=\"{}\",class=\"background\"}} {}\n\
+                 pepper_keyed_runtime_owner_active{{owner=\"{}\",class=\"control\"}} {}\n\
+                 pepper_keyed_runtime_owner_active{{owner=\"{}\",class=\"foreground\"}} {}\n\
+                 pepper_keyed_runtime_owner_active{{owner=\"{}\",class=\"background\"}} {}\n\
+                 pepper_keyed_runtime_owner_queue_microseconds_total{{owner=\"{}\"}} {}\n\
+                 pepper_keyed_runtime_owner_service_microseconds_total{{owner=\"{}\"}} {}\n",
                 owner.id,
                 u8::from(owner.healthy),
                 owner.id,
@@ -863,6 +950,22 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
                 owner.buffer_hits,
                 owner.id,
                 owner.buffer_misses,
+                owner.id,
+                owner.scheduler_queued_by_class[0],
+                owner.id,
+                owner.scheduler_queued_by_class[1],
+                owner.id,
+                owner.scheduler_queued_by_class[2],
+                owner.id,
+                owner.scheduler_active_by_class[0],
+                owner.id,
+                owner.scheduler_active_by_class[1],
+                owner.id,
+                owner.scheduler_active_by_class[2],
+                owner.id,
+                owner.scheduler_queue_micros,
+                owner.id,
+                owner.scheduler_service_micros,
             ));
         }
     } else {
@@ -1095,8 +1198,17 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
     if let Some(manager) = &state.namespace_groups {
         let statuses = manager.operational_statuses().await;
         body.push_str(&format!(
-            "# TYPE pepper_namespace_groups_hosted gauge\npepper_namespace_groups_hosted {}\n",
-            statuses.len()
+            "# TYPE pepper_namespace_groups_hosted gauge\n\
+             pepper_namespace_groups_hosted {}\n\
+             # HELP pepper_rsm_groups_hosted Product-neutral replicated state-machine groups hosted by this process.\n\
+             # TYPE pepper_rsm_groups_hosted gauge\n\
+             pepper_rsm_groups_hosted{{product=\"namespace\"}} {}\n\
+             # HELP pepper_rsm_active_batch_runners Demand-driven proposal batch runners; idle groups retain none.\n\
+             # TYPE pepper_rsm_active_batch_runners gauge\n\
+             pepper_rsm_active_batch_runners{{product=\"namespace\"}} {}\n",
+            statuses.len(),
+            statuses.len(),
+            manager.active_proposal_runners(),
         ));
         for status in statuses {
             let namespace = status.namespace_id.to_string();
@@ -1125,5 +1237,6 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
             ));
         }
     }
+    body.push_str(&pepper_observability::process_metrics().render_prometheus());
     body.into_response()
 }

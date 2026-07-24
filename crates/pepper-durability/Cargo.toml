@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-durability"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Product-neutral per-device durability and group-commit scheduler"
+
+[dependencies]
+pepper-observability = { version = "0.3.0", path = "../pepper-observability" }
+serde = { workspace = true }
+thiserror = { workspace = true }

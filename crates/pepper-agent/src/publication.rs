@@ -37,7 +37,7 @@ impl AgentDurabilityBackend {
             .or_else(|_| self.0.block_store.encode(cid.codec, &payload))
             .map_err(|error| PublicationError::Storage(error.to_string()))?;
         let encoded_size = encoded.logical_size_bytes();
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
 
         let local_node_id = self.0.status.node_id.clone();
         let local_selected = target_node_ids.contains(&local_node_id);
@@ -102,7 +102,7 @@ impl AgentDurabilityBackend {
                         let address = fast_path::peer_address(&state.network, &node_id).await?;
                         let ack = state
                             .network
-                            .block_put_replica_stream(
+                            .block_put_replica_buffer_chain(
                                 address,
                                 cid.codec,
                                 &cid,
@@ -165,7 +165,7 @@ impl AgentDurabilityBackend {
             .or_else(|_| self.0.block_store.encode(cid.codec, &payload))
             .map_err(|error| PublicationError::Storage(error.to_string()))?;
         let encoded_size = encoded.logical_size_bytes();
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
 
         let local_provider = self.0.network.local_provider_record(cid);
         self.0
@@ -242,7 +242,7 @@ impl AgentDurabilityBackend {
                                 };
                                 let Ok(ack) = state
                                     .network
-                                    .block_put_replica_stream(
+                                    .block_put_replica_buffer_chain(
                                         address,
                                         cid.codec,
                                         &cid,
@@ -313,6 +313,8 @@ impl DurabilityBackend for AgentDurabilityBackend {
         replication_factor: usize,
         placement: Option<&PlacementReference>,
     ) -> Result<DurabilityReceipt, PublicationError> {
+        observe_current_stage(OperationStage::Durability);
+        observe_current_stage(OperationStage::Replication);
         let Some(map) = self.0.placement.current_map() else {
             if self.0.s3.is_some() {
                 return Err(PublicationError::Protection(

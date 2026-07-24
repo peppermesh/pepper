@@ -11,7 +11,7 @@ use pepper_dag::{DagCodecHandler, DagError, TraversalLimits};
 use pepper_types::{CODEC_MERKLE_NODE, Cid, Codec};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
@@ -191,6 +191,14 @@ pub struct MerkleIoStats {
     pub nodes_written: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkGetResult {
+    /// Values in exactly the same order as the requested keys.
+    pub values: Vec<Option<MerkleValue>>,
+    /// Distinct immutable index nodes fetched from the backing store.
+    pub unique_nodes_read: usize,
+}
+
 /// Store decorator used by production metrics and benchmarks. Taking two
 /// snapshots around an operation exposes its immutable-node read/write cost.
 pub fn structural_sharing_ratio(total_nodes: usize, nodes_written: u64) -> f64 {
@@ -367,6 +375,66 @@ where
         cid = node.children[index].cid.clone();
         depth += 1;
     }
+}
+
+/// Resolve a bounded key set with one request-scoped immutable-node cache.
+/// Shared prefixes and duplicate keys therefore fetch each physical node at
+/// most once while results retain caller order.
+pub async fn get_many<S>(
+    store: &S,
+    root: &Cid,
+    keys: &[Vec<u8>],
+    limits: MerkleLimits,
+) -> Result<BulkGetResult, MerkleError>
+where
+    S: MerkleReadStore + ?Sized,
+{
+    let limits = limits.validate()?;
+    if keys.len() > limits.max_scan_entries {
+        return Err(MerkleError::TooManyNodes(limits.max_scan_entries));
+    }
+    for key in keys {
+        validate_key(key, &limits)?;
+    }
+    let mut cache = HashMap::<Cid, Node>::new();
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut cid = root.clone();
+        let mut offset = 0usize;
+        let mut depth = 0usize;
+        let value = loop {
+            if depth > limits.max_depth {
+                return Err(MerkleError::TooDeep(limits.max_depth));
+            }
+            if !cache.contains_key(&cid) {
+                let node = load_node(store, &cid, &limits).await?;
+                cache.insert(cid.clone(), node);
+            }
+            let node = cache.get(&cid).expect("request node cached");
+            let prefix = node.prefix()?;
+            if !key[offset..].starts_with(&prefix) {
+                break None;
+            }
+            offset += prefix.len();
+            if offset == key.len() {
+                break node.value.clone();
+            }
+            let edge = key[offset];
+            let Ok(index) = node
+                .children
+                .binary_search_by_key(&edge, |child| child.edge)
+            else {
+                break None;
+            };
+            cid = node.children[index].cid.clone();
+            depth += 1;
+        };
+        values.push(value);
+    }
+    Ok(BulkGetResult {
+        values,
+        unique_nodes_read: cache.len(),
+    })
 }
 
 pub async fn apply_batch<S>(
@@ -1072,11 +1140,16 @@ mod tests {
     struct MemoryStore {
         blocks: Mutex<BTreeMap<String, Vec<u8>>>,
         puts: Mutex<usize>,
+        gets: Mutex<usize>,
     }
 
     impl MemoryStore {
         fn put_count(&self) -> usize {
             *self.puts.lock().unwrap()
+        }
+
+        fn get_count(&self) -> usize {
+            *self.gets.lock().unwrap()
         }
 
         fn corrupt(&self, cid: &Cid, payload: Vec<u8>) {
@@ -1087,6 +1160,7 @@ mod tests {
     #[async_trait]
     impl MerkleReadStore for MemoryStore {
         async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+            *self.gets.lock().unwrap() += 1;
             self.blocks
                 .lock()
                 .unwrap()
@@ -1169,6 +1243,95 @@ mod tests {
             validate_tree(&store, &root, limits).await.unwrap().entries,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_get_deduplicates_shared_nodes_and_preserves_order() {
+        let store = MemoryStore::default();
+        let limits = MerkleLimits::default();
+        let root = build_from_sorted(
+            &store,
+            &[
+                MapEntry {
+                    key: b"alpha".to_vec(),
+                    value: value("a", 1),
+                },
+                MapEntry {
+                    key: b"alpine".to_vec(),
+                    value: value("b", 1),
+                },
+                MapEntry {
+                    key: b"beta".to_vec(),
+                    value: value("c", 1),
+                },
+            ],
+            limits,
+        )
+        .await
+        .unwrap();
+        let before = store.get_count();
+        let result = get_many(
+            &store,
+            &root,
+            &[
+                b"beta".to_vec(),
+                b"alpha".to_vec(),
+                b"missing".to_vec(),
+                b"alpha".to_vec(),
+            ],
+            limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.values,
+            vec![
+                Some(value("c", 1)),
+                Some(value("a", 1)),
+                None,
+                Some(value("a", 1)),
+            ]
+        );
+        assert_eq!(store.get_count() - before, result.unique_nodes_read);
+        assert!(result.unique_nodes_read < 4 * 3);
+    }
+
+    #[tokio::test]
+    async fn sparse_frontier_scales_with_changes_not_retained_history() {
+        let store = MemoryStore::default();
+        let limits = MerkleLimits::default();
+        let entries = (0..65_536u32)
+            .map(|index| MapEntry {
+                key: format!("key-{index:05}").into_bytes(),
+                value: value(&format!("old-{index}"), 1),
+            })
+            .collect::<Vec<_>>();
+        let root = build_from_sorted(&store, &entries, limits).await.unwrap();
+        let mut observations = BTreeMap::<usize, (Cid, usize)>::new();
+        for retained_history in [1usize, 1_000] {
+            let retained = vec![root.clone(); retained_history];
+            for changed in [1usize, 16, 256] {
+                let mutations = (0..changed)
+                    .map(|index| Mutation::Put {
+                        key: format!("key-{:05}", index * 257).into_bytes(),
+                        value: value(&format!("new-{index}"), 2),
+                    })
+                    .collect::<Vec<_>>();
+                let before = store.put_count();
+                let candidate = apply_batch(&store, &root, &mutations, limits)
+                    .await
+                    .unwrap();
+                let written = store.put_count() - before;
+                assert!(written <= 1 + changed * limits.max_depth);
+                if let Some((expected_root, expected_written)) = observations.get(&changed) {
+                    assert_eq!(&candidate, expected_root);
+                    assert_eq!(written, *expected_written);
+                } else {
+                    observations.insert(changed, (candidate, written));
+                }
+                assert_eq!(retained.len(), retained_history);
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,43 @@
+{
+  "schema": "pepper.phase11.client-qualification.v1",
+  "date_utc": "2026-07-23",
+  "base_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "working_tree_note": "Phase 11 was qualified from the implementation working tree before commit.",
+  "broker": {
+    "command": "target/release/pepper-kafka-smoke-server /tmp/pepper-phase11-final.XXXXXX",
+    "binary_sha256": "d4f9ae5b60a923ccb3a6367b9c7bdf508cd157718050528b97c566bb75575635",
+    "listeners": [
+      "127.0.0.1:19092",
+      "127.0.0.1:29092",
+      "127.0.0.1:39092"
+    ]
+  },
+  "client": {
+    "name": "librdkafka through confluent-kafka",
+    "version": "confluent-kafka 2.11.1 / librdkafka 2.11.1",
+    "container": "python:3.12-slim",
+    "container_digest": "python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de",
+    "script": "benchmarks/pepper-phase0/client-smoke/phase11_transaction_smoke.py",
+    "script_sha256": "ae52c1f83066fdc09fd1a1f142e1b109c8b9670ccb72a3b78e0d9232d0035ccb",
+    "flow": "create RF=3 topic; produce with idempotence enabled; initialize a transactional producer; commit one record; abort one record; consume with isolation.level=read_committed",
+    "observed_values": [
+      "idempotent",
+      "committed"
+    ],
+    "aborted_value_observed": false,
+    "result": "pass"
+  },
+  "correctness": {
+    "transaction_coordinator_discovery": "pass with FindCoordinator v1 key_type=1",
+    "producer_id_and_epoch": "pass",
+    "idempotent_produce": "pass",
+    "commit_transaction": "pass",
+    "abort_transaction": "pass",
+    "read_committed": "pass",
+    "tcp_transactional_offset_commit": "pass",
+    "crash_recovery": "pass",
+    "golden_and_truncation_boundaries": "pass",
+    "malformed_frames": 100000
+  },
+  "all_pass": true
+}

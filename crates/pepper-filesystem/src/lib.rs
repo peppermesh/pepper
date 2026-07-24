@@ -2,17 +2,23 @@
 
 //! Canonical immutable snapshot-filesystem descriptors and tree operations.
 
+use async_trait::async_trait;
 use pepper_dag::{DagCodecHandler, DagError, TraversalLimits};
+use pepper_dataset::{
+    BulkRead, DatasetError, DatasetRoot, ExactBase, IndexAdapter, IndexKind, IndexUpdate,
+    MutationFrontier, PreparedDatasetArtifact,
+};
 use pepper_merkle::{
-    MerkleLimits, MerkleReadStore, MerkleValue, MerkleWriteStore, Mutation, ScanQuery, apply_batch,
-    empty_root, scan,
+    MapEntry, MerkleLimits, MerkleReadStore, MerkleValue, MerkleWriteStore, Mutation, ScanQuery,
+    apply_batch, build_from_sorted, empty_root, get, get_many, scan,
 };
 use pepper_types::{CODEC_FILESYSTEM_INODE, CODEC_FILESYSTEM_ROOT, Cid, Codec};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     future::Future,
     pin::Pin,
+    sync::Mutex,
 };
 use thiserror::Error;
 
@@ -160,6 +166,20 @@ pub struct FilesystemRootDescriptor {
     pub previous_root_cid: Option<Cid>,
 }
 
+impl FilesystemRootDescriptor {
+    pub fn dataset_root(&self) -> DatasetRoot {
+        DatasetRoot {
+            product: "filesystem".into(),
+            format_version: self.version,
+            generation: self.creation_revision,
+            index_kind: IndexKind::SparseMerkle,
+            index_root: self.root_inode_cid.clone(),
+            previous_root: self.previous_root_cid.clone(),
+            logical_bytes: self.logical_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TreeInputEntry {
@@ -171,10 +191,34 @@ pub struct TreeInputEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TreeMutation {
+    Put { entry: TreeInputEntry },
+    Delete { path: String },
+}
+
+impl TreeMutation {
+    fn path(&self) -> &str {
+        match self {
+            Self::Put { entry } => &entry.path,
+            Self::Delete { path } => path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TreeEntry {
     pub path: String,
     pub inode_cid: Cid,
     pub inode: InodeDescriptor,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemBuild {
+    pub root_cid: Cid,
+    pub descriptor: FilesystemRootDescriptor,
+    /// A validated exact-base artifact for every non-initial snapshot.
+    pub prepared_artifact: Option<PreparedDatasetArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +244,137 @@ pub enum FilesystemError {
     Storage(String),
     #[error("filesystem tree exceeds configured limits")]
     Limit,
+}
+
+/// Sparse-Merkle adapter used by filesystem directories. It adds
+/// request-scoped bulk-read deduplication and reports the exact immutable
+/// write frontier without changing the canonical Merkle representation.
+pub struct FilesystemIndexAdapter<'a, S: MerkleWriteStore + ?Sized> {
+    store: &'a S,
+    limits: MerkleLimits,
+}
+
+impl<'a, S: MerkleWriteStore + ?Sized> FilesystemIndexAdapter<'a, S> {
+    pub fn new(store: &'a S, limits: MerkleLimits) -> Self {
+        Self { store, limits }
+    }
+}
+
+struct TrackingMerkleStore<'a, S: MerkleWriteStore + ?Sized> {
+    inner: &'a S,
+    writes: Mutex<Vec<Cid>>,
+}
+
+struct TrackingFilesystemStore<'a, S: MerkleWriteStore + ?Sized> {
+    inner: &'a S,
+    writes: Mutex<Vec<Cid>>,
+}
+
+#[async_trait]
+impl<S: MerkleWriteStore + ?Sized> MerkleReadStore for TrackingFilesystemStore<'_, S> {
+    async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+        self.inner.get(cid).await
+    }
+}
+
+#[async_trait]
+impl<S: MerkleWriteStore + ?Sized> MerkleWriteStore for TrackingFilesystemStore<'_, S> {
+    async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String> {
+        let cid = self.inner.put(codec, payload).await?;
+        self.writes
+            .lock()
+            .map_err(|_| "filesystem build write tracker poisoned".to_string())?
+            .push(cid.clone());
+        Ok(cid)
+    }
+}
+
+#[async_trait]
+impl<S: MerkleWriteStore + ?Sized> MerkleReadStore for TrackingMerkleStore<'_, S> {
+    async fn get(&self, cid: &Cid) -> Result<Vec<u8>, String> {
+        self.inner.get(cid).await
+    }
+}
+
+#[async_trait]
+impl<S: MerkleWriteStore + ?Sized> MerkleWriteStore for TrackingMerkleStore<'_, S> {
+    async fn put(&self, codec: Codec, payload: Vec<u8>) -> Result<Cid, String> {
+        let cid = self.inner.put(codec, payload).await?;
+        self.writes
+            .lock()
+            .map_err(|_| "filesystem index write tracker poisoned".to_string())?
+            .push(cid.clone());
+        Ok(cid)
+    }
+}
+
+#[async_trait]
+impl<S: MerkleWriteStore + ?Sized> IndexAdapter for FilesystemIndexAdapter<'_, S> {
+    type Root = Cid;
+    type Key = Vec<u8>;
+    type Value = MerkleValue;
+    type Mutation = Mutation;
+
+    fn kind(&self) -> IndexKind {
+        IndexKind::SparseMerkle
+    }
+
+    async fn get_many(
+        &self,
+        root: &Self::Root,
+        keys: &[Self::Key],
+    ) -> Result<BulkRead<Self::Value>, DatasetError> {
+        let result = get_many(self.store, root, keys, self.limits)
+            .await
+            .map_err(|error| DatasetError::Storage(error.to_string()))?;
+        Ok(BulkRead {
+            values: result.values,
+            unique_index_nodes: result.unique_nodes_read,
+        })
+    }
+
+    async fn apply(
+        &self,
+        root: &Self::Root,
+        mutations: Vec<Self::Mutation>,
+    ) -> Result<IndexUpdate<Self::Root>, DatasetError> {
+        let changed_keys = mutations.len();
+        let mut new_data_roots = mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                Mutation::Put { value, .. } => Some(value.cid.clone()),
+                Mutation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        new_data_roots.sort_by_key(ToString::to_string);
+        new_data_roots.dedup();
+        let tracking = TrackingMerkleStore {
+            inner: self.store,
+            writes: Mutex::new(Vec::new()),
+        };
+        let candidate = pepper_merkle::apply_batch(&tracking, root, &mutations, self.limits)
+            .await
+            .map_err(|error| DatasetError::Storage(error.to_string()))?;
+        let mut new_index_nodes = tracking
+            .writes
+            .into_inner()
+            .map_err(|_| DatasetError::Storage("filesystem write tracker poisoned".into()))?;
+        let mut seen = HashSet::new();
+        new_index_nodes.retain(|cid| seen.insert(cid.clone()));
+        let frontier = MutationFrontier {
+            changed_keys,
+            index_depth: self.limits.max_depth,
+            candidate_index_root: candidate.clone(),
+            new_index_nodes,
+            new_data_roots,
+            verified_descendants: Vec::new(),
+        };
+        frontier.validate()?;
+        Ok(IndexUpdate {
+            root: candidate,
+            frontier,
+        })
+    }
 }
 
 fn validate_path(path: &str, limits: FilesystemLimits) -> Result<(), FilesystemError> {
@@ -330,6 +505,115 @@ pub async fn get_root<S: MerkleReadStore + ?Sized>(
 
 pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
     store: &S,
+    entries: Vec<TreeInputEntry>,
+    creation_revision: u64,
+    previous_root_cid: Option<Cid>,
+    root_mode: u32,
+    limits: FilesystemLimits,
+) -> Result<(Cid, FilesystemRootDescriptor), FilesystemError> {
+    let build = build_tree_prepared(
+        store,
+        entries,
+        creation_revision,
+        previous_root_cid,
+        root_mode,
+        limits,
+    )
+    .await?;
+    Ok((build.root_cid, build.descriptor))
+}
+
+pub async fn build_tree_prepared<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
+    store: &S,
+    entries: Vec<TreeInputEntry>,
+    creation_revision: u64,
+    previous_root_cid: Option<Cid>,
+    root_mode: u32,
+    limits: FilesystemLimits,
+) -> Result<FilesystemBuild, FilesystemError> {
+    let protected_base = match &previous_root_cid {
+        Some(base) => {
+            let descriptor = get_root(store, base, limits).await?;
+            if creation_revision != descriptor.creation_revision.saturating_add(1) {
+                return Err(FilesystemError::Invalid(
+                    "filesystem candidate does not immediately follow its protected base".into(),
+                ));
+            }
+            Some(descriptor)
+        }
+        None => None,
+    };
+    let changed_keys = entries.len().max(1);
+    let mut verified_descendants = entries
+        .iter()
+        .filter_map(|entry| entry.content_cid.clone())
+        .collect::<Vec<_>>();
+    verified_descendants.sort_by_key(ToString::to_string);
+    verified_descendants.dedup();
+    let tracking = TrackingFilesystemStore {
+        inner: store,
+        writes: Mutex::new(Vec::new()),
+    };
+    let (root_cid, descriptor) = build_tree_inner(
+        &tracking,
+        entries,
+        creation_revision,
+        previous_root_cid.clone(),
+        root_mode,
+        limits,
+    )
+    .await?;
+    let mut writes = tracking
+        .writes
+        .into_inner()
+        .map_err(|_| FilesystemError::Storage("filesystem build tracker poisoned".into()))?;
+    let mut seen = HashSet::new();
+    writes.retain(|cid| seen.insert(cid.clone()));
+    let new_index_nodes = writes
+        .into_iter()
+        .filter(|cid| {
+            matches!(
+                cid.codec,
+                pepper_types::CODEC_MERKLE_NODE | CODEC_FILESYSTEM_INODE
+            )
+        })
+        .collect::<Vec<_>>();
+    let prepared_artifact = previous_root_cid
+        .map(|base| {
+            let artifact = PreparedDatasetArtifact {
+                exact_base: ExactBase {
+                    generation: protected_base
+                        .as_ref()
+                        .expect("base descriptor loaded")
+                        .creation_revision,
+                    root: base,
+                },
+                candidate_root: root_cid.clone(),
+                descriptor: descriptor.dataset_root(),
+                frontier: MutationFrontier {
+                    changed_keys,
+                    index_depth: limits.max_depth,
+                    candidate_index_root: descriptor.root_inode_cid.clone(),
+                    new_index_nodes,
+                    new_data_roots: Vec::new(),
+                    verified_descendants,
+                },
+            };
+            artifact
+                .validate()
+                .map_err(|error| FilesystemError::Invalid(error.to_string()))?;
+            Ok::<_, FilesystemError>(artifact)
+        })
+        .transpose()?;
+    Ok(FilesystemBuild {
+        root_cid,
+        descriptor,
+        prepared_artifact,
+    })
+}
+
+async fn build_tree_inner<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
+    store: &S,
     mut entries: Vec<TreeInputEntry>,
     creation_revision: u64,
     previous_root_cid: Option<Cid>,
@@ -356,7 +640,7 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
         .collect::<BTreeSet<_>>();
     FilesystemMetadataDescriptor { mode: root_mode }.validate()?;
     let mut directories = BTreeMap::from([(String::new(), root_mode)]);
-    let mut nodes = BTreeMap::<String, Cid>::new();
+    let mut children = BTreeMap::<String, Vec<(String, Cid)>>::new();
     let mut bytes = 0u64;
     let mut files = 0u64;
     for entry in &entries {
@@ -382,15 +666,17 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
                     return Err(FilesystemError::Limit);
                 }
                 files += 1;
-                nodes.insert(
-                    entry.path.clone(),
-                    put_inode(
-                        store,
-                        &InodeDescriptor::file(content, entry.logical_size, entry.mode),
-                        limits,
-                    )
-                    .await?,
-                );
+                let inode_cid = put_inode(
+                    store,
+                    &InodeDescriptor::file(content, entry.logical_size, entry.mode),
+                    limits,
+                )
+                .await?;
+                let (parent, name) = parent_name(&entry.path);
+                children
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push((name.to_string(), inode_cid));
             }
             InodeKind::Directory => {
                 if entry.content_cid.is_some() || entry.logical_size != 0 {
@@ -406,17 +692,16 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
     directory_paths.sort_by_key(|path| {
         std::cmp::Reverse(path.matches('/').count() + usize::from(!path.is_empty()))
     });
+    let mut root_inode_cid = None;
     for directory in directory_paths {
-        let mut mutations = Vec::new();
-        for (path, cid) in &nodes {
-            let (parent, name) = parent_name(path);
-            if parent == directory {
-                let entry = DirectoryEntryDescriptor {
-                    name: name.to_string(),
-                    inode_cid: cid.clone(),
-                };
+        let mut directory_children = children.remove(&directory).unwrap_or_default();
+        directory_children.sort_by(|left, right| left.0.cmp(&right.0));
+        let entries = directory_children
+            .into_iter()
+            .map(|(name, inode_cid)| {
+                let entry = DirectoryEntryDescriptor { name, inode_cid };
                 entry.validate(limits)?;
-                mutations.push(Mutation::Put {
+                Ok(MapEntry {
                     key: entry.name.as_bytes().to_vec(),
                     value: MerkleValue {
                         cid: entry.inode_cid,
@@ -424,13 +709,10 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
                         value_kind: "filesystem_inode".into(),
                         metadata: BTreeMap::new(),
                     },
-                });
-            }
-        }
-        let empty = empty_root(store, MerkleLimits::default())
-            .await
-            .map_err(|e| FilesystemError::Storage(e.to_string()))?;
-        let map_root = apply_batch(store, &empty, &mutations, MerkleLimits::default())
+                })
+            })
+            .collect::<Result<Vec<_>, FilesystemError>>()?;
+        let map_root = build_from_sorted(store, &entries, MerkleLimits::default())
             .await
             .map_err(|e| FilesystemError::Storage(e.to_string()))?;
         let inode_cid = put_inode(
@@ -439,12 +721,21 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
             limits,
         )
         .await?;
-        nodes.insert(directory, inode_cid);
+        if directory.is_empty() {
+            root_inode_cid = Some(inode_cid);
+        } else {
+            let (parent, name) = parent_name(&directory);
+            children
+                .entry(parent.to_string())
+                .or_default()
+                .push((name.to_string(), inode_cid));
+        }
     }
     let descriptor = FilesystemRootDescriptor {
         descriptor_type: ROOT_TYPE.into(),
         version: VERSION,
-        root_inode_cid: nodes[""].clone(),
+        root_inode_cid: root_inode_cid
+            .ok_or_else(|| FilesystemError::Invalid("filesystem root inode missing".into()))?,
         creation_revision,
         file_count: files,
         directory_count: directories.len() as u64,
@@ -453,6 +744,345 @@ pub async fn build_tree<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
     };
     let cid = put_root(store, &descriptor, limits).await?;
     Ok((cid, descriptor))
+}
+
+/// Apply a bounded changed-path set by rewriting only affected directory
+/// maps and ancestor inodes. Unrelated subtrees are never traversed.
+pub async fn apply_tree_mutations<S: MerkleReadStore + MerkleWriteStore + ?Sized>(
+    store: &S,
+    base_root_cid: Cid,
+    mutations: Vec<TreeMutation>,
+    creation_revision: u64,
+    limits: FilesystemLimits,
+) -> Result<FilesystemBuild, FilesystemError> {
+    if mutations.is_empty() || mutations.len() > limits.max_entries {
+        return Err(FilesystemError::Invalid(
+            "filesystem mutation batch must be nonempty and bounded".into(),
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for mutation in &mutations {
+        validate_path(mutation.path(), limits)?;
+        if !paths.insert(mutation.path().to_string()) {
+            return Err(FilesystemError::Invalid(
+                "filesystem mutation paths must be unique".into(),
+            ));
+        }
+    }
+    let base = get_root(store, &base_root_cid, limits).await?;
+    if creation_revision != base.creation_revision.saturating_add(1) {
+        return Err(FilesystemError::Invalid(
+            "filesystem candidate does not immediately follow its protected base".into(),
+        ));
+    }
+    let tracking = TrackingFilesystemStore {
+        inner: store,
+        writes: Mutex::new(Vec::new()),
+    };
+    let mut root_inode_cid = base.root_inode_cid.clone();
+    let mut file_count = base.file_count;
+    let mut directory_count = base.directory_count;
+    let mut logical_bytes = base.logical_bytes;
+    let mut verified_descendants = Vec::new();
+
+    for mutation in &mutations {
+        let components = mutation.path().split('/').collect::<Vec<_>>();
+        let mut directory_stack = Vec::<InodeDescriptor>::with_capacity(components.len());
+        let mut current = get_inode(&tracking, &root_inode_cid, limits).await?;
+        if current.kind != InodeKind::Directory {
+            return Err(FilesystemError::Invalid(
+                "filesystem root is not a directory".into(),
+            ));
+        }
+        directory_stack.push(current.clone());
+        for component in &components[..components.len() - 1] {
+            let directory_root = current
+                .directory_root_cid
+                .as_ref()
+                .expect("validated directory");
+            let value = get(
+                &tracking,
+                directory_root,
+                component.as_bytes(),
+                MerkleLimits::default(),
+            )
+            .await
+            .map_err(|error| FilesystemError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                FilesystemError::Invalid(format!(
+                    "missing parent directory while mutating {}",
+                    mutation.path()
+                ))
+            })?;
+            current = get_inode(&tracking, &value.cid, limits).await?;
+            if current.kind != InodeKind::Directory {
+                return Err(FilesystemError::Invalid(format!(
+                    "parent component {component:?} is not a directory"
+                )));
+            }
+            directory_stack.push(current.clone());
+        }
+
+        let target_name = components.last().expect("validated nonempty path");
+        let parent = directory_stack.last().expect("root directory exists");
+        let parent_root = parent
+            .directory_root_cid
+            .as_ref()
+            .expect("validated directory");
+        let existing = get(
+            &tracking,
+            parent_root,
+            target_name.as_bytes(),
+            MerkleLimits::default(),
+        )
+        .await
+        .map_err(|error| FilesystemError::Storage(error.to_string()))?;
+        let existing_inode = match &existing {
+            Some(value) => Some(get_inode(&tracking, &value.cid, limits).await?),
+            None => None,
+        };
+        if existing_inode
+            .as_ref()
+            .is_some_and(|inode| inode.kind == InodeKind::Directory)
+            && matches!(
+                mutation,
+                TreeMutation::Put {
+                    entry: TreeInputEntry {
+                        kind: InodeKind::RegularFile,
+                        ..
+                    }
+                }
+            )
+        {
+            let inode = existing_inode.as_ref().expect("checked directory");
+            let page = scan(
+                &tracking,
+                inode
+                    .directory_root_cid
+                    .as_ref()
+                    .expect("validated directory"),
+                ScanQuery {
+                    limit: 1,
+                    ..ScanQuery::default()
+                },
+                MerkleLimits::default(),
+            )
+            .await
+            .map_err(|error| FilesystemError::Storage(error.to_string()))?;
+            if !page.entries.is_empty() {
+                return Err(FilesystemError::Invalid(
+                    "nonempty directory replacement requires explicit child deletions".into(),
+                ));
+            }
+        }
+
+        let replacement = match mutation {
+            TreeMutation::Put { entry } => {
+                if entry.mode & !0o777 != 0 {
+                    return Err(FilesystemError::Invalid("unsupported mode bits".into()));
+                }
+                match entry.kind {
+                    InodeKind::RegularFile => {
+                        let content = entry.content_cid.clone().ok_or_else(|| {
+                            FilesystemError::Invalid("file content CID missing".into())
+                        })?;
+                        verified_descendants.push(content.clone());
+                        Some(
+                            put_inode(
+                                &tracking,
+                                &InodeDescriptor::file(content, entry.logical_size, entry.mode),
+                                limits,
+                            )
+                            .await?,
+                        )
+                    }
+                    InodeKind::Directory => {
+                        if entry.content_cid.is_some() || entry.logical_size != 0 {
+                            return Err(FilesystemError::Invalid(
+                                "directory contains file fields".into(),
+                            ));
+                        }
+                        let directory_root = match &existing_inode {
+                            Some(inode) if inode.kind == InodeKind::Directory => inode
+                                .directory_root_cid
+                                .clone()
+                                .expect("validated directory"),
+                            _ => empty_root(&tracking, MerkleLimits::default())
+                                .await
+                                .map_err(|error| FilesystemError::Storage(error.to_string()))?,
+                        };
+                        Some(
+                            put_inode(
+                                &tracking,
+                                &InodeDescriptor::directory(directory_root, entry.mode),
+                                limits,
+                            )
+                            .await?,
+                        )
+                    }
+                }
+            }
+            TreeMutation::Delete { .. } => {
+                let Some(inode) = &existing_inode else {
+                    return Err(FilesystemError::Invalid(format!(
+                        "cannot delete missing path {}",
+                        mutation.path()
+                    )));
+                };
+                if inode.kind == InodeKind::Directory {
+                    let page = scan(
+                        &tracking,
+                        inode
+                            .directory_root_cid
+                            .as_ref()
+                            .expect("validated directory"),
+                        ScanQuery {
+                            limit: 1,
+                            ..ScanQuery::default()
+                        },
+                        MerkleLimits::default(),
+                    )
+                    .await
+                    .map_err(|error| FilesystemError::Storage(error.to_string()))?;
+                    if !page.entries.is_empty() {
+                        return Err(FilesystemError::Invalid(
+                            "nonempty directory deletion requires explicit child deletions".into(),
+                        ));
+                    }
+                }
+                None
+            }
+        };
+
+        if let Some(inode) = &existing_inode {
+            match inode.kind {
+                InodeKind::RegularFile => {
+                    file_count = file_count.checked_sub(1).ok_or(FilesystemError::Limit)?;
+                    logical_bytes = logical_bytes
+                        .checked_sub(inode.logical_size)
+                        .ok_or(FilesystemError::Limit)?;
+                }
+                InodeKind::Directory => {
+                    directory_count = directory_count
+                        .checked_sub(1)
+                        .ok_or(FilesystemError::Limit)?;
+                }
+            }
+        }
+        if let TreeMutation::Put { entry } = mutation {
+            match entry.kind {
+                InodeKind::RegularFile => {
+                    file_count = file_count.checked_add(1).ok_or(FilesystemError::Limit)?;
+                    logical_bytes = logical_bytes
+                        .checked_add(entry.logical_size)
+                        .filter(|bytes| *bytes <= limits.max_total_bytes)
+                        .ok_or(FilesystemError::Limit)?;
+                }
+                InodeKind::Directory => {
+                    directory_count = directory_count
+                        .checked_add(1)
+                        .ok_or(FilesystemError::Limit)?;
+                }
+            }
+        }
+        let total_entries = file_count
+            .checked_add(directory_count.saturating_sub(1))
+            .ok_or(FilesystemError::Limit)?;
+        if total_entries > limits.max_entries as u64 {
+            return Err(FilesystemError::Limit);
+        }
+
+        let mut child = replacement;
+        for level in (0..directory_stack.len()).rev() {
+            let directory = &directory_stack[level];
+            let key = components[level].as_bytes().to_vec();
+            let index_mutation = match child {
+                Some(cid) => Mutation::Put {
+                    key,
+                    value: MerkleValue {
+                        cid,
+                        generation: 1,
+                        value_kind: "filesystem_inode".into(),
+                        metadata: BTreeMap::new(),
+                    },
+                },
+                None => Mutation::Delete { key },
+            };
+            let map_root = apply_batch(
+                &tracking,
+                directory
+                    .directory_root_cid
+                    .as_ref()
+                    .expect("validated directory"),
+                &[index_mutation],
+                MerkleLimits::default(),
+            )
+            .await
+            .map_err(|error| FilesystemError::Storage(error.to_string()))?;
+            child = Some(
+                put_inode(
+                    &tracking,
+                    &InodeDescriptor::directory(map_root, directory.mode),
+                    limits,
+                )
+                .await?,
+            );
+        }
+        root_inode_cid = child.expect("rewritten root inode");
+    }
+
+    let descriptor = FilesystemRootDescriptor {
+        descriptor_type: ROOT_TYPE.into(),
+        version: VERSION,
+        root_inode_cid,
+        creation_revision,
+        file_count,
+        directory_count,
+        logical_bytes,
+        previous_root_cid: Some(base_root_cid.clone()),
+    };
+    let root_cid = put_root(&tracking, &descriptor, limits).await?;
+    let mut writes = tracking
+        .writes
+        .into_inner()
+        .map_err(|_| FilesystemError::Storage("filesystem mutation tracker poisoned".into()))?;
+    let mut seen = HashSet::new();
+    writes.retain(|cid| seen.insert(cid.clone()));
+    let new_index_nodes = writes
+        .into_iter()
+        .filter(|cid| {
+            matches!(
+                cid.codec,
+                pepper_types::CODEC_MERKLE_NODE | CODEC_FILESYSTEM_INODE
+            )
+        })
+        .collect::<Vec<_>>();
+    verified_descendants.sort_by_key(ToString::to_string);
+    verified_descendants.dedup();
+    let artifact = PreparedDatasetArtifact {
+        exact_base: ExactBase {
+            generation: base.creation_revision,
+            root: base_root_cid,
+        },
+        candidate_root: root_cid.clone(),
+        descriptor: descriptor.dataset_root(),
+        frontier: MutationFrontier {
+            changed_keys: mutations.len(),
+            index_depth: limits.max_path_bytes.saturating_add(limits.max_depth),
+            candidate_index_root: descriptor.root_inode_cid.clone(),
+            new_index_nodes,
+            new_data_roots: Vec::new(),
+            verified_descendants,
+        },
+    };
+    artifact
+        .validate()
+        .map_err(|error| FilesystemError::Invalid(error.to_string()))?;
+    Ok(FilesystemBuild {
+        root_cid,
+        descriptor,
+        prepared_artifact: Some(artifact),
+    })
 }
 
 fn walk_inode<'a, S: MerkleReadStore + ?Sized>(
@@ -756,6 +1386,135 @@ mod tests {
             .unwrap();
         assert_eq!(changes.len(), 2);
         assert!(changes.iter().any(|change| change.path == "d31/f07"));
+    }
+
+    #[tokio::test]
+    async fn incremental_mutations_match_full_rebuild_and_touch_only_changed_paths() {
+        let store = Store::default();
+        let mut entries = vec![
+            TreeInputEntry {
+                path: "a".into(),
+                kind: InodeKind::Directory,
+                mode: 0o755,
+                logical_size: 0,
+                content_cid: None,
+            },
+            TreeInputEntry {
+                path: "a/b".into(),
+                kind: InodeKind::Directory,
+                mode: 0o700,
+                logical_size: 0,
+                content_cid: None,
+            },
+        ];
+        for index in 0..256 {
+            let payload = format!("old-{index}");
+            entries.push(TreeInputEntry {
+                path: format!("a/b/f{index:03}"),
+                kind: InodeKind::RegularFile,
+                mode: 0o644,
+                logical_size: payload.len() as u64,
+                content_cid: Some(Cid::new(CODEC_RAW, payload.as_bytes())),
+            });
+        }
+        let (base, _) = build_tree(
+            &store,
+            entries.clone(),
+            1,
+            None,
+            0o755,
+            FilesystemLimits::default(),
+        )
+        .await
+        .unwrap();
+        let replacement = b"replacement";
+        let changed = TreeInputEntry {
+            path: "a/b/f127".into(),
+            kind: InodeKind::RegularFile,
+            mode: 0o600,
+            logical_size: replacement.len() as u64,
+            content_cid: Some(Cid::new(CODEC_RAW, replacement)),
+        };
+        let incremental = apply_tree_mutations(
+            &store,
+            base.clone(),
+            vec![TreeMutation::Put {
+                entry: changed.clone(),
+            }],
+            2,
+            FilesystemLimits::default(),
+        )
+        .await
+        .unwrap();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.path == changed.path)
+            .unwrap();
+        *entry = changed;
+        let rebuilt = build_tree_prepared(
+            &store,
+            entries,
+            2,
+            Some(base),
+            0o755,
+            FilesystemLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(incremental.root_cid, rebuilt.root_cid);
+        assert_eq!(incremental.descriptor, rebuilt.descriptor);
+        let frontier = &incremental.prepared_artifact.as_ref().unwrap().frontier;
+        assert_eq!(frontier.changed_keys, 1);
+        assert!(frontier.new_index_nodes.len() <= 1 + frontier.index_depth);
+        assert_eq!(
+            flatten_tree(&store, &incremental.root_cid, FilesystemLimits::default())
+                .await
+                .unwrap()
+                .len(),
+            258
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_delete_rejects_nonempty_directory() {
+        let store = Store::default();
+        let content = Cid::new(CODEC_RAW, b"x");
+        let (base, _) = build_tree(
+            &store,
+            vec![
+                TreeInputEntry {
+                    path: "dir".into(),
+                    kind: InodeKind::Directory,
+                    mode: 0o755,
+                    logical_size: 0,
+                    content_cid: None,
+                },
+                TreeInputEntry {
+                    path: "dir/file".into(),
+                    kind: InodeKind::RegularFile,
+                    mode: 0o644,
+                    logical_size: 1,
+                    content_cid: Some(content),
+                },
+            ],
+            1,
+            None,
+            0o755,
+            FilesystemLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            apply_tree_mutations(
+                &store,
+                base,
+                vec![TreeMutation::Delete { path: "dir".into() }],
+                2,
+                FilesystemLimits::default(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

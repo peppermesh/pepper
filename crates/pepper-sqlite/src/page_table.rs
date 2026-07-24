@@ -6,9 +6,12 @@ use crate::{
         PageTableChild, PageTableNode, PageTableNodeKind, decode_canonical, encode_canonical,
     },
 };
+use async_trait::async_trait;
+use pepper_dataset::{
+    BulkRead, DatasetError, IndexAdapter, IndexKind, IndexUpdate, MutationFrontier,
+};
 use pepper_types::{CODEC_SQLITE_PAGE_TABLE, Cid};
-use std::collections::HashSet;
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageMutation {
@@ -38,6 +41,99 @@ pub struct PageTableValidation {
     pub page_count: u32,
     pub node_cids: Vec<Cid>,
     pub page_pack_roots: Vec<Cid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageTableBulkRead {
+    pub values: Vec<Option<PageReference>>,
+    pub unique_nodes_read: usize,
+}
+
+/// Dense fixed-fanout adapter over SQLite's canonical four-level radix table.
+pub struct SqliteIndexAdapter<'a, S: SqliteBlockStore + ?Sized> {
+    store: &'a S,
+    page_size: u32,
+    table: PageTable,
+}
+
+impl<'a, S: SqliteBlockStore + ?Sized> SqliteIndexAdapter<'a, S> {
+    pub fn new(store: &'a S, page_size: u32, limits: SqliteFormatLimits) -> Self {
+        Self {
+            store,
+            page_size,
+            table: PageTable { limits },
+        }
+    }
+}
+
+#[async_trait]
+impl<S: SqliteBlockStore + ?Sized> IndexAdapter for SqliteIndexAdapter<'_, S> {
+    type Root = Cid;
+    type Key = u32;
+    type Value = PageReference;
+    type Mutation = PageMutation;
+
+    fn kind(&self) -> IndexKind {
+        IndexKind::FixedFanout {
+            fanout: 256,
+            depth: 4,
+        }
+    }
+
+    async fn get_many(
+        &self,
+        root: &Self::Root,
+        keys: &[Self::Key],
+    ) -> Result<BulkRead<Self::Value>, DatasetError> {
+        let result = self
+            .table
+            .get_many_with_stats(self.store, root, keys)
+            .await
+            .map_err(|error| DatasetError::Storage(error.to_string()))?;
+        Ok(BulkRead {
+            values: result.values,
+            unique_index_nodes: result.unique_nodes_read,
+        })
+    }
+
+    async fn apply(
+        &self,
+        root: &Self::Root,
+        mutations: Vec<Self::Mutation>,
+    ) -> Result<IndexUpdate<Self::Root>, DatasetError> {
+        let changed_keys = mutations
+            .iter()
+            .map(PageMutation::page_number)
+            .collect::<HashSet<_>>()
+            .len();
+        let mut new_data_roots = mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                PageMutation::Put(page) => Some(page.pack_cid.clone()),
+                PageMutation::Delete(_) => None,
+            })
+            .collect::<Vec<_>>();
+        new_data_roots.sort_by_key(ToString::to_string);
+        new_data_roots.dedup();
+        let update = self
+            .table
+            .apply(self.store, root, self.page_size, mutations)
+            .await
+            .map_err(|error| DatasetError::Storage(error.to_string()))?;
+        let frontier = MutationFrontier {
+            changed_keys,
+            index_depth: 4,
+            candidate_index_root: update.root.clone(),
+            new_index_nodes: update.written_nodes,
+            new_data_roots,
+            verified_descendants: Vec::new(),
+        };
+        frontier.validate()?;
+        Ok(IndexUpdate {
+            root: update.root,
+            frontier,
+        })
+    }
 }
 
 /// Memory-bounded canonical builder for already sorted page references. It
@@ -129,14 +225,73 @@ impl PageTable {
         root: &Cid,
         page_numbers: &[u32],
     ) -> Result<Vec<Option<PageReference>>, SqliteError> {
+        Ok(self
+            .get_many_with_stats(store, root, page_numbers)
+            .await?
+            .values)
+    }
+
+    /// Resolve pages with a request-scoped node cache. Common radix prefixes
+    /// and duplicate page numbers fetch each immutable node only once.
+    pub async fn get_many_with_stats<S: SqliteBlockStore + ?Sized>(
+        &self,
+        store: &S,
+        root: &Cid,
+        page_numbers: &[u32],
+    ) -> Result<PageTableBulkRead, SqliteError> {
         if page_numbers.len() > 256 {
             return Err(SqliteError::Limit("page lookup batch exceeds 256".into()));
         }
-        let mut result = Vec::with_capacity(page_numbers.len());
+        let mut cache = HashMap::<Cid, PageTableNode>::new();
+        let mut values = Vec::with_capacity(page_numbers.len());
         for page_number in page_numbers {
-            result.push(self.get(store, root, *page_number).await?);
+            self.validate_page_number(*page_number)?;
+            let bytes = page_number.to_be_bytes();
+            let mut cid = root.clone();
+            let mut missing = false;
+            for level in 0..3u8 {
+                if !cache.contains_key(&cid) {
+                    let node = self.get_node(store, &cid).await?;
+                    cache.insert(cid.clone(), node);
+                }
+                let node = cache.get(&cid).expect("request node cached");
+                self.expect_node(
+                    node,
+                    PageTableNodeKind::Internal,
+                    level,
+                    &bytes[..level as usize],
+                )?;
+                let Some(child) = node
+                    .children
+                    .iter()
+                    .find(|child| child.edge == bytes[level as usize])
+                else {
+                    missing = true;
+                    break;
+                };
+                cid = child.cid.clone();
+            }
+            if missing {
+                values.push(None);
+                continue;
+            }
+            if !cache.contains_key(&cid) {
+                let node = self.get_node(store, &cid).await?;
+                cache.insert(cid.clone(), node);
+            }
+            let leaf = cache.get(&cid).expect("request leaf cached");
+            self.expect_node(leaf, PageTableNodeKind::Leaf, 3, &bytes[..3])?;
+            values.push(
+                leaf.pages
+                    .binary_search_by_key(page_number, |page| page.page_number)
+                    .ok()
+                    .map(|index| leaf.pages[index].clone()),
+            );
         }
-        Ok(result)
+        Ok(PageTableBulkRead {
+            values,
+            unique_nodes_read: cache.len(),
+        })
     }
 
     /// Traverse and validate the complete fixed-depth tree. When

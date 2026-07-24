@@ -1,0 +1,24 @@
+{
+  "schema": "pepper.phase11.transaction-qualification.v1",
+  "transaction_state": {
+    "producer_partition_entries": 100000,
+    "producer_partition_encoded_bytes": 33966698,
+    "encoded_bytes_per_producer_partition": 339,
+    "idle_transactional_ids": 10000,
+    "idle_transaction_encoded_bytes": 1899119,
+    "encoded_bytes_per_idle_transaction": 189,
+    "sequence_operations": 100000,
+    "duplicate_operations": 33333,
+    "rejected_gap_operations": 33333,
+    "rejected_fence_operations": 33334,
+    "transaction_cycles": 10000,
+    "committed_cycles": 3334,
+    "aborted_cycles": 3333,
+    "timed_out_cycles": 3333,
+    "scheduler_tasks": 1,
+    "coordinator_shards": 32,
+    "files_per_producer": 0,
+    "all_pass": true
+  },
+  "all_pass": true
+}

@@ -13,6 +13,7 @@ homepage = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 pepper-dag = { path = "../pepper-dag", version = "0.3.0" }
+pepper-dataset = { path = "../pepper-dataset", version = "0.3.0" }
 pepper-merkle = { path = "../pepper-merkle", version = "0.3.0" }
 pepper-types = { path = "../pepper-types", version = "0.3.0" }
 serde = { workspace = true }

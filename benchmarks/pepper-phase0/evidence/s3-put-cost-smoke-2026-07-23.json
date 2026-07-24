@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "classification": "exploratory-smoke-not-qualification-evidence",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "environment": {
+    "topology": "three Pepper peers in Docker on one development host",
+    "filesystem": "xfs",
+    "storage_engine": "files",
+    "duration_seconds": 15,
+    "object_bytes": 4096,
+    "concurrency": 8,
+    "routing": "leader",
+    "payload_profile": "incompressible"
+  },
+  "result": {
+    "successes": 956,
+    "failures": 0,
+    "operations_per_second": 63.19161837801205,
+    "logical_megabytes_per_second": 0.2588328688763374,
+    "latency_millis": {
+      "mean": 126.27444769874478,
+      "p50": 121.883,
+      "p95": 205.361,
+      "p99": 241.433,
+      "max": 278.668
+    }
+  },
+  "wall_time_attribution": {
+    "client_observed_microseconds": 120718372,
+    "owner_queue_microseconds": 2151822,
+    "owner_execution_microseconds": 117991628,
+    "attributed_boundary_microseconds": 120143450,
+    "coverage_percent": 99.5237493759442,
+    "passes_95_percent_gate": true,
+    "method": "sum of per-request client latency compared with mutually exclusive owner queue and owner execution boundaries"
+  },
+  "reviewed_payload_cost_lower_bound": {
+    "explicit_allocations": 4780,
+    "explicit_allocated_bytes": 13379918,
+    "explicit_copy_operations": 4780,
+    "explicit_copy_bytes": 13379918,
+    "shared_payload_references": 3824,
+    "logical_client_bytes": 3915776
+  },
+  "durability": {
+    "native_barriers": 4878,
+    "native_groups": 4830,
+    "group_requests": 4998
+  },
+  "traffic_bytes": {
+    "native_storage_writes": 14196213,
+    "peer_bulk_total": 18928284,
+    "rpc_request_total": 53020502,
+    "rpc_response_total": 20608163
+  },
+  "runner_artifact": {
+    "local_path": "target/phase0-s3-smoke-v2",
+    "cell_sha256": "dcab943505a208a5d101f3b0310ab4ca90b44537603cae5ee3f5ae56d80eeb07",
+    "manifest_sha256": "7dcd77e15ac9d1c43fc6ea8a18ca9c5101f6ae72a9a3e508eceb4b3d68f77ff7"
+  },
+  "limitations": [
+    "The source worktree was dirty.",
+    "The run was shorter than the 60-second qualification minimum.",
+    "The three peers shared one host and one underlying block device.",
+    "Reviewed allocation/copy counters are a lower bound and do not claim to observe allocator-internal, TLS, kernel, or device copies.",
+    "Boundary attribution proves end-to-end accounting coverage; nested subphase counters overlap and are not summed as exclusive wall time."
+  ]
+}

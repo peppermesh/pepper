@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "classification": "phase0-qualification-gate-evidence-not-a-release-performance-claim",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "environment": {
+    "host": "surya",
+    "operating_system": "Linux 7.0.0-27-generic",
+    "architecture": "x86_64",
+    "logical_cpus": 128,
+    "cpu": "AMD Ryzen Threadripper 7980X 64-Cores",
+    "filesystem": "xfs",
+    "storage_mount": "/home",
+    "topology": "three native Pepper peers on one qualification host",
+    "pepper_replication_factor": 3,
+    "pepper_logging_filter": "warn",
+    "kafka_nodes": 3,
+    "kafka_replication_factor": 3,
+    "kafka_minimum_in_sync_replicas": 2,
+    "kafka_unclean_leader_election": false
+  },
+  "platform_suite": {
+    "success": true,
+    "cases": 8,
+    "repetitions": 24,
+    "failed_repetitions": 0,
+    "timed_out_repetitions": 0,
+    "duration_milliseconds": 1654636,
+    "runner_artifact": {
+      "local_path": "target/phase0-platform-run",
+      "run_sha256": "42ebb1260fdb47639f352b47522928a27ca88f715eec360a984c93224c32e42e",
+      "manifest_sha256": "c0266b836291a0aec01dfcc4cb4ae8972c786185a4937787fd76a08058f62132",
+      "manifest_verified": true
+    }
+  },
+  "s3_put": {
+    "configuration": {
+      "duration_seconds_per_repetition": 60,
+      "repetitions": 5,
+      "object_bytes": 4096,
+      "concurrency": 8,
+      "object_count": 1024,
+      "payload_profile": "incompressible"
+    },
+    "successes": 5783,
+    "failures": 0,
+    "operations_per_second": [
+      41.381939947576214,
+      18.517147418759162,
+      14.043809099509478,
+      11.804353885211777,
+      10.059531006669307
+    ],
+    "p50_milliseconds": [
+      156.768,
+      400.353,
+      545.138,
+      656.693,
+      756.44
+    ],
+    "p95_milliseconds": [
+      415.406,
+      752.669,
+      943.642,
+      1122.72,
+      1282.403
+    ],
+    "finding": "Zero-failure throughput degraded by 75.7 percent from repetition one to five while p50 increased by 4.8 times; accumulating metadata, durability, repair, and Raft work must be isolated before shared-layer performance claims.",
+    "detailed_wall_time_attribution_reference": {
+      "path": "benchmarks/pepper-phase0/evidence/s3-put-cost-smoke-2026-07-23.json",
+      "coverage_percent": 99.5237493759442,
+      "passes_95_percent_gate": true
+    },
+    "artifact_sha256": {
+      "s3-1.json": "59f8fce430ebb8d519ab55e40ad8441887889f42df629e63b13d49b1d43038ff",
+      "s3-2.json": "cecb4ab744768a90bdee6e328286cbbda87d3d13d8f5db404c464ab17ce960bc",
+      "s3-3.json": "7cd46f7800ad3eed059b160470721ecb7579e9eedb3df984e2645b4549c03c5b",
+      "s3-4.json": "0c67b69ac24c63820d53009343a339dca062932cccf2ebf65bc19ee320be3daf",
+      "s3-5.json": "b4764fc6fa91d911ec246d559de1ceb3bb85ec7f739a3a9262d7fc1953b05dc7"
+    }
+  },
+  "filesystem": {
+    "configuration": {
+      "files": 1000,
+      "file_bytes": 4096,
+      "mutation_percent": 10,
+      "iterations": 10,
+      "verified_files": 10000,
+      "verified_bytes": 40960000
+    },
+    "initial_upload_operations_per_second": 402.3499945080634,
+    "initial_commit_p50_milliseconds": 79395.760371,
+    "mutation_upload_p50_milliseconds": 252.791011,
+    "mutation_commit_p50_milliseconds": 113289.629841,
+    "mutation_commit_p95_milliseconds": 139758.267129,
+    "checkout_resolution_p50_milliseconds": 29.105401,
+    "checkout_materialization_p50_milliseconds": 62.310061,
+    "end_to_end_p50_milliseconds": 113530.984239,
+    "end_to_end_p95_milliseconds": 140030.773369,
+    "wall_time_attribution_percent": 99.99987012964,
+    "passes_95_percent_gate": true,
+    "explicit_payload_allocated_bytes": 8407328000,
+    "explicit_payload_copy_bytes": 26912000,
+    "shared_payload_references": 8000,
+    "rpc_request_bytes": 975073104,
+    "rpc_response_bytes": 68182131,
+    "artifact": {
+      "local_path": "target/phase0-native-platform/artifacts/filesystem.json",
+      "sha256": "23a69bbddc26ffaaa83ab415158300e1434789487baad9d40553a2e861b5f124"
+    }
+  },
+  "sqlite": {
+    "repetitions": 5,
+    "all_integrity_checks": "ok",
+    "wall_time_attribution_percent": [
+      100.0,
+      100.0,
+      100.0,
+      100.0,
+      100.0
+    ],
+    "passes_95_percent_gate": true,
+    "representative_pepper_p50_microseconds": {
+      "cached_point_read": 0.7,
+      "sequential_scan": 334.229,
+      "reopen_point_read": 46738.151,
+      "autocommit_insert": 220791.554,
+      "transaction_10": 218696.36,
+      "transaction_100": 222165.23,
+      "transaction_1000": 230375.364
+    },
+    "representative_filesystem_p50_microseconds": {
+      "cached_point_read": 7.71,
+      "sequential_scan": 396.859,
+      "reopen_point_read": 64.27,
+      "autocommit_insert": 1157.866,
+      "transaction_10": 1200.126,
+      "transaction_100": 1346.606,
+      "transaction_1000": 2274.672
+    },
+    "per_repetition_cost": {
+      "commits": 42,
+      "explicit_payload_allocated_bytes": 179179356,
+      "explicit_payload_copy_bytes": 9899868,
+      "shared_payload_references": 706
+    },
+    "artifact_sha256": {
+      "sqlite-1.json": "b4c42546fcd6baaf5e178d72c0bcaeb401aa149438b4bb250431ef0f4cd957f1",
+      "sqlite-2.json": "1355a9f491dfcb05e47ee564bb193c9904d80c5ccef9f95304860f2fe21bf73a",
+      "sqlite-3.json": "3f1e61a23b7d6c4b86b3a899d3800b55c915e5a7d77739e87afa9b117cef9a26",
+      "sqlite-4.json": "ef1aa99723c6867e17656d776d25dd4b716224b825c1e67727deb33675a03a2e",
+      "sqlite-5.json": "1a127daa315eff17c527449f2db703f7829b782ab724e28fd699e28ad5f489fb"
+    }
+  },
+  "storage_and_network": {
+    "native_group_commit_repetitions_passed": 5,
+    "authenticated_quic_failover_repetitions_passed": 5,
+    "failover_repetition_duration_milliseconds": [
+      20399,
+      4130,
+      4265,
+      4753,
+      4454
+    ]
+  },
+  "consensus_density": {
+    "100": {
+      "leaders_ready": 100,
+      "startup_milliseconds": 31,
+      "readiness_milliseconds": 0,
+      "rss_delta_kib": 8668,
+      "thread_delta": 0,
+      "file_descriptor_delta": 0
+    },
+    "1000": {
+      "leaders_ready": 1000,
+      "startup_milliseconds": 583,
+      "readiness_milliseconds": 9,
+      "rss_delta_kib": 60460,
+      "thread_delta": 0,
+      "file_descriptor_delta": 0
+    },
+    "10000": {
+      "leaders_ready": 10000,
+      "startup_milliseconds": 26715,
+      "readiness_milliseconds": 149,
+      "rss_delta_kib": 628884,
+      "thread_delta": 0,
+      "file_descriptor_delta": 0
+    }
+  },
+  "kafka_comparator": {
+    "classification": "same-host-short-comparator-baseline",
+    "version": "4.3.1",
+    "image_digest": "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837",
+    "success": true,
+    "produce_repetitions": 5,
+    "consume_repetitions": 5,
+    "steady_state_produce_records_per_second_range": [
+      322580.645161,
+      364963.50365
+    ],
+    "steady_state_produce_p99_milliseconds_range": [
+      5,
+      16
+    ],
+    "end_to_end_consume_mebibytes_per_second_range": [
+      55.0331,
+      56.514
+    ],
+    "evidence_reference": "benchmarks/pepper-phase0/evidence/kafka-comparator-smoke-2026-07-23.json",
+    "runner_artifact": {
+      "local_path": "target/phase0-kafka-xfs-smoke",
+      "run_sha256": "e03bf1da62fc7a28b7a52f3e374136857206cb34d7f902ec181e8b5b470d4e81",
+      "manifest_sha256": "153f083d4b8b3375cf4a855cd54d844468693aa7b81e90b99fbea3a15a9bc810"
+    }
+  },
+  "gate_decision": {
+    "phase0_exit_criteria_satisfied": true,
+    "baseline_artifacts_complete": true,
+    "representative_wall_time_attribution_at_least_95_percent": true,
+    "duplicate_write_question_resolved": "Kafka payload bytes must be appended once per replica through the native ordered-log extent path and must not be duplicated in control-plane Raft or object publication.",
+    "failover_safety_question_resolved": "Per-partition replicated state, leader epochs, committed-prefix recovery, RF=3, minISR=2, and unclean election disabled are fixed by accepted ADRs and executable state models."
+  },
+  "limitations": [
+    "The source worktree was dirty; every artifact records the exact base revision, lockfile hash, expanded commands, and dirty-state flag.",
+    "All Pepper peers and all Kafka containers shared one physical host and one storage class, so these results are architecture baselines rather than multi-host release claims.",
+    "The Kafka comparator was intentionally short and does not satisfy the Phase 13 release workload matrix.",
+    "The Pepper filesystem load caused a large number of recoverable 250 ms Raft RPC timeouts and warning logs even though the suite passed and groups returned to zero lag.",
+    "Stopping one loaded Pepper peer exposed a Tokio-runtime-shutdown panic; this is a follow-up reliability defect and is not evidence of data loss.",
+    "Explicit allocation and copy counters are reviewed lower bounds, not allocator-wide measurements."
+  ]
+}

@@ -66,6 +66,8 @@ pub struct PepperConfig {
     #[serde(default)]
     pub sqlite: SqliteConfig,
     #[serde(default)]
+    pub kafka: KafkaConfig,
+    #[serde(default)]
     pub fast_path: FastPathConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -537,6 +539,116 @@ impl Default for S3Config {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaScramCredentialConfig {
+    pub username: String,
+    pub password_path: PathBuf,
+    #[serde(default = "default_kafka_scram_iterations")]
+    pub iterations: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaAclConfig {
+    pub principal: String,
+    pub resource_type: String,
+    pub resource: String,
+    #[serde(default = "default_kafka_acl_pattern")]
+    pub pattern: String,
+    #[serde(default = "default_kafka_acl_operation")]
+    pub operation: String,
+    #[serde(default = "default_kafka_acl_effect")]
+    pub effect: String,
+}
+
+/// Opt-in Kafka-compatible broker listener.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_kafka_bind_addr")]
+    pub bind_addr: String,
+    pub advertise_addr: Option<String>,
+    #[serde(default)]
+    pub broker_id: i32,
+    #[serde(default = "default_kafka_cluster_id")]
+    pub cluster_id: String,
+    #[serde(default = "default_kafka_maximum_connections")]
+    pub maximum_connections: usize,
+    #[serde(default = "default_kafka_maximum_frame_bytes")]
+    pub maximum_frame_bytes: usize,
+    #[serde(default = "default_kafka_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "default_kafka_timeout_seconds")]
+    pub write_timeout_seconds: u64,
+    #[serde(default = "default_kafka_inflight_response_bytes")]
+    pub maximum_inflight_response_bytes: usize,
+    /// Zero disables the broker-wide byte-rate quota.
+    #[serde(default)]
+    pub broker_bytes_per_second: u64,
+    /// Zero disables independent per-partition byte-rate quotas.
+    #[serde(default)]
+    pub partition_bytes_per_second: u64,
+    #[serde(default = "default_kafka_quota_burst_bytes")]
+    pub quota_burst_bytes: u64,
+    pub tls_certificate_chain_path: Option<PathBuf>,
+    pub tls_private_key_path: Option<PathBuf>,
+    pub tls_client_ca_path: Option<PathBuf>,
+    pub security_metadata_path: Option<PathBuf>,
+    #[serde(default)]
+    pub scram_credentials: Vec<KafkaScramCredentialConfig>,
+    #[serde(default)]
+    pub acls: Vec<KafkaAclConfig>,
+    #[serde(default = "default_kafka_maximum_principals")]
+    pub maximum_principals: usize,
+    #[serde(default)]
+    pub principal_requests_per_second: u64,
+    #[serde(default)]
+    pub principal_ingress_bytes_per_second: u64,
+    #[serde(default)]
+    pub principal_egress_bytes_per_second: u64,
+    #[serde(default = "default_kafka_maximum_audit_events")]
+    pub maximum_audit_events: usize,
+    /// Explicit acknowledgement that a development listener is plaintext and
+    /// unauthenticated when bound beyond loopback.
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
+}
+
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_kafka_bind_addr(),
+            advertise_addr: None,
+            broker_id: 0,
+            cluster_id: default_kafka_cluster_id(),
+            maximum_connections: default_kafka_maximum_connections(),
+            maximum_frame_bytes: default_kafka_maximum_frame_bytes(),
+            request_timeout_seconds: default_kafka_timeout_seconds(),
+            write_timeout_seconds: default_kafka_timeout_seconds(),
+            maximum_inflight_response_bytes: default_kafka_inflight_response_bytes(),
+            broker_bytes_per_second: 0,
+            partition_bytes_per_second: 0,
+            quota_burst_bytes: default_kafka_quota_burst_bytes(),
+            tls_certificate_chain_path: None,
+            tls_private_key_path: None,
+            tls_client_ca_path: None,
+            security_metadata_path: None,
+            scram_credentials: Vec::new(),
+            acls: Vec::new(),
+            maximum_principals: default_kafka_maximum_principals(),
+            principal_requests_per_second: 0,
+            principal_ingress_bytes_per_second: 0,
+            principal_egress_bytes_per_second: 0,
+            maximum_audit_events: default_kafka_maximum_audit_events(),
+            allow_insecure_remote: false,
+        }
+    }
+}
+
 /// Per-core S3 execution ownership and admission configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -786,6 +898,58 @@ fn default_bulk_bandwidth_burst_bytes() -> u64 {
 
 fn default_api_bind_addr() -> String {
     "127.0.0.1:9080".to_string()
+}
+
+fn default_kafka_bind_addr() -> String {
+    "127.0.0.1:9092".to_string()
+}
+
+fn default_kafka_cluster_id() -> String {
+    "pepper".to_string()
+}
+
+fn default_kafka_maximum_connections() -> usize {
+    10_000
+}
+
+fn default_kafka_maximum_frame_bytes() -> usize {
+    100 * 1024 * 1024
+}
+
+fn default_kafka_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_kafka_inflight_response_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+fn default_kafka_quota_burst_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_kafka_scram_iterations() -> u32 {
+    4_096
+}
+
+fn default_kafka_acl_pattern() -> String {
+    "literal".into()
+}
+
+fn default_kafka_acl_operation() -> String {
+    "all".into()
+}
+
+fn default_kafka_acl_effect() -> String {
+    "allow".into()
+}
+
+fn default_kafka_maximum_principals() -> usize {
+    10_000
+}
+
+fn default_kafka_maximum_audit_events() -> usize {
+    10_000
 }
 
 fn default_sqlite_max_open_sessions() -> usize {
@@ -1203,6 +1367,106 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
             "api.bind_addr must use a loopback address unless api.allow_insecure_remote is explicitly enabled; use a TLS reverse proxy for production remote access".to_string(),
         ));
     }
+    let kafka_addr = config.kafka.bind_addr.parse::<SocketAddr>().map_err(|e| {
+        ConfigError::Invalid(format!("kafka.bind_addr is not a socket address: {e}"))
+    })?;
+    if config.kafka.enabled {
+        let tls_enabled = config.kafka.tls_certificate_chain_path.is_some()
+            && config.kafka.tls_private_key_path.is_some();
+        if config.kafka.tls_certificate_chain_path.is_some()
+            != config.kafka.tls_private_key_path.is_some()
+        {
+            return Err(ConfigError::Invalid(
+                "kafka TLS certificate chain and private key paths must be configured together"
+                    .to_string(),
+            ));
+        }
+        if !kafka_addr.ip().is_loopback() && !tls_enabled && !config.kafka.allow_insecure_remote {
+            return Err(ConfigError::Invalid(
+                "kafka.bind_addr must use loopback unless TLS is configured or kafka.allow_insecure_remote is explicitly enabled"
+                    .to_string(),
+            ));
+        }
+        if (config.kafka.tls_client_ca_path.is_some()
+            || !config.kafka.scram_credentials.is_empty()
+            || !config.kafka.acls.is_empty())
+            && !tls_enabled
+        {
+            return Err(ConfigError::Invalid(
+                "Kafka mTLS, SCRAM, and ACL configuration requires TLS".to_string(),
+            ));
+        }
+        if kafka_addr == api_addr || kafka_addr == listen_addr || kafka_addr == bulk_listen_addr {
+            return Err(ConfigError::Invalid(
+                "kafka.bind_addr must differ from API and Pepper transport listeners".to_string(),
+            ));
+        }
+        if let Some(advertise) = &config.kafka.advertise_addr {
+            let advertise = advertise.parse::<SocketAddr>().map_err(|e| {
+                ConfigError::Invalid(format!("kafka.advertise_addr is not a socket address: {e}"))
+            })?;
+            if advertise.ip().is_unspecified() || advertise.ip().is_multicast() {
+                return Err(ConfigError::Invalid(
+                    "kafka.advertise_addr must be a unicast address".to_string(),
+                ));
+            }
+        } else if kafka_addr.ip().is_unspecified() {
+            return Err(ConfigError::Invalid(
+                "kafka.advertise_addr is required for an unspecified bind address".to_string(),
+            ));
+        }
+        if config.kafka.broker_id < 0
+            || config.kafka.cluster_id.is_empty()
+            || config.kafka.cluster_id.len() > 255
+            || config.kafka.maximum_connections == 0
+            || !(1024..=1024 * 1024 * 1024).contains(&config.kafka.maximum_frame_bytes)
+            || !(1..=3600).contains(&config.kafka.request_timeout_seconds)
+            || !(1..=3600).contains(&config.kafka.write_timeout_seconds)
+            || !(1024..=u32::MAX as usize).contains(&config.kafka.maximum_inflight_response_bytes)
+            || config.kafka.maximum_inflight_response_bytes < config.kafka.maximum_frame_bytes
+            || config.kafka.quota_burst_bytes == 0
+            || config.kafka.maximum_principals == 0
+            || config.kafka.maximum_audit_events == 0
+            || config.kafka.scram_credentials.len() > 100_000
+            || config.kafka.acls.len() > 100_000
+        {
+            return Err(ConfigError::Invalid(
+                "Kafka identity, connection, frame, response, quota, or timeout settings are outside supported ranges"
+                    .to_string(),
+            ));
+        }
+        for credential in &config.kafka.scram_credentials {
+            if credential.username.is_empty()
+                || credential.username.len() > 256
+                || credential.iterations < 4_096
+                || credential.iterations > 1_000_000
+            {
+                return Err(ConfigError::Invalid(
+                    "Kafka SCRAM username or iteration count is invalid".to_string(),
+                ));
+            }
+        }
+        for acl in &config.kafka.acls {
+            if acl.principal.is_empty()
+                || acl.resource.is_empty()
+                || !matches!(
+                    acl.resource_type.as_str(),
+                    "cluster" | "topic" | "group" | "transactional-id"
+                )
+                || !matches!(acl.pattern.as_str(), "literal" | "prefix")
+                || !matches!(
+                    acl.operation.as_str(),
+                    "all" | "read" | "write" | "create" | "delete" | "describe" | "alter"
+                )
+                || !matches!(acl.effect.as_str(), "allow" | "deny")
+            {
+                return Err(ConfigError::Invalid(
+                    "Kafka ACL contains an invalid principal, resource, type, pattern, operation, or effect"
+                        .to_string(),
+                ));
+            }
+        }
+    }
 
     if config.node.name.trim().is_empty() {
         return Err(ConfigError::Invalid(
@@ -1440,6 +1704,12 @@ pub fn validate(config: &PepperConfig) -> Result<(), ConfigError> {
                     "fast_path.{name} must be greater than zero"
                 )));
             }
+        }
+        if config.fast_path.queue_depth < 2 {
+            return Err(ConfigError::Invalid(
+                "fast_path.queue_depth must be at least 2 so one key cannot consume the entire owner queue"
+                    .to_string(),
+            ));
         }
     }
     if config
@@ -1773,6 +2043,9 @@ impl PepperConfig {
         if self.compute.enabled {
             fs::create_dir_all(&self.compute.work_dir)?;
         }
+        if self.kafka.enabled {
+            fs::create_dir_all(self.data.path.join("kafka"))?;
+        }
         Ok(())
     }
 
@@ -1824,6 +2097,8 @@ mod tests {
         assert!(!cfg.namespace.enabled);
         assert!(!cfg.s3.enabled);
         assert!(!cfg.sqlite.enabled);
+        assert!(!cfg.kafka.enabled);
+        assert_eq!(cfg.kafka.bind_addr, "127.0.0.1:9092");
         assert_eq!(cfg.sqlite.default_page_size, 4096);
         assert_eq!(cfg.sqlite.page_pack_target_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.s3.region, "us-east-1");
@@ -1964,6 +2239,58 @@ mod tests {
         invalid.network.bulk.stream_receive_window_bytes =
             invalid.network.bulk.connection_receive_window_bytes + 1;
         assert!(validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_kafka_broker_configuration() {
+        let cfg: PepperConfig = toml::from_str(
+            r#"
+            [kafka]
+            enabled = true
+            bind_addr = "127.0.0.1:19092"
+            broker_id = 7
+            cluster_id = "test-cluster"
+            maximum_connections = 128
+            maximum_frame_bytes = 1048576
+            [[storage.locations]]
+            path = "/tmp/pepper-config-kafka-test"
+            max_capacity_bytes = 1024
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.kafka.broker_id, 7);
+
+        let mut remote = cfg.clone();
+        remote.kafka.bind_addr = "0.0.0.0:19092".into();
+        assert!(validate(&remote).is_err());
+        remote.kafka.advertise_addr = Some("127.0.0.1:19092".into());
+        remote.kafka.allow_insecure_remote = true;
+        validate(&remote).unwrap();
+
+        let mut secure = cfg.clone();
+        secure.kafka.bind_addr = "0.0.0.0:19092".into();
+        secure.kafka.advertise_addr = Some("127.0.0.1:19092".into());
+        secure.kafka.tls_certificate_chain_path = Some("/secure/kafka.crt".into());
+        secure.kafka.tls_private_key_path = Some("/secure/kafka.key".into());
+        validate(&secure).unwrap();
+        secure.kafka.tls_private_key_path = None;
+        assert!(validate(&secure).is_err());
+
+        let mut insecure_scram = cfg.clone();
+        insecure_scram
+            .kafka
+            .scram_credentials
+            .push(KafkaScramCredentialConfig {
+                username: "alice".into(),
+                password_path: "/secure/alice.password".into(),
+                iterations: 4_096,
+            });
+        assert!(validate(&insecure_scram).is_err());
+
+        let mut unbounded = cfg.clone();
+        unbounded.kafka.maximum_frame_bytes = usize::MAX;
+        assert!(validate(&unbounded).is_err());
     }
 
     #[test]

@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "pepper-phase0-kafka-comparator"
+environment_label = "external Kafka on the same qualification hardware as Pepper"
+required_environment = [
+  "KAFKA_CONTAINER",
+  "KAFKA_BOOTSTRAP_SERVERS",
+  "KAFKA_BENCHMARK_TOPIC",
+  "KAFKA_BENCHMARK_PARTITIONS",
+  "KAFKA_BENCHMARK_RECORDS",
+]
+
+[[cases]]
+name = "broker-config"
+product = "kafka-comparator"
+command = [
+  "docker", "exec", "${KAFKA_CONTAINER}",
+  "cat", "/opt/kafka/config/server.properties",
+]
+repetitions = 1
+timeout_seconds = 300
+required_stdout = [
+  "min.insync.replicas=2",
+  "unclean.leader.election.enable=false",
+  "log.flush.interval.messages=",
+]
+
+[[cases]]
+name = "create-topic"
+product = "kafka-comparator"
+command = [
+  "docker", "exec", "${KAFKA_CONTAINER}",
+  "/opt/kafka/bin/kafka-topics.sh",
+  "--bootstrap-server", "${KAFKA_BOOTSTRAP_SERVERS}",
+  "--create", "--if-not-exists",
+  "--topic", "${KAFKA_BENCHMARK_TOPIC}-${PEPPER_PHASE0_REPETITION}",
+  "--partitions", "${KAFKA_BENCHMARK_PARTITIONS}",
+  "--replication-factor", "3",
+  "--config", "min.insync.replicas=2",
+  "--config", "unclean.leader.election.enable=false",
+]
+repetitions = 5
+timeout_seconds = 300
+required_stdout = ["Created topic"]
+
+[[cases]]
+name = "describe-topic"
+product = "kafka-comparator"
+command = [
+  "docker", "exec", "${KAFKA_CONTAINER}",
+  "/opt/kafka/bin/kafka-topics.sh",
+  "--bootstrap-server", "${KAFKA_BOOTSTRAP_SERVERS}",
+  "--describe",
+  "--topic", "${KAFKA_BENCHMARK_TOPIC}-${PEPPER_PHASE0_REPETITION}",
+]
+repetitions = 5
+timeout_seconds = 300
+required_stdout = ["ReplicationFactor: 3", "min.insync.replicas=2"]
+
+[[cases]]
+name = "produce-1k-acks-all"
+product = "kafka-comparator"
+command = [
+  "docker", "exec", "${KAFKA_CONTAINER}",
+  "/opt/kafka/bin/kafka-producer-perf-test.sh",
+  "--bootstrap-server", "${KAFKA_BOOTSTRAP_SERVERS}",
+  "--topic", "${KAFKA_BENCHMARK_TOPIC}-${PEPPER_PHASE0_REPETITION}",
+  "--num-records", "${KAFKA_BENCHMARK_RECORDS}",
+  "--record-size", "1024",
+  "--throughput", "-1",
+  "--warmup-records", "100000",
+  "--print-metrics",
+  "--command-property",
+  "acks=all",
+  "enable.idempotence=false",
+  "compression.type=none",
+  "linger.ms=5",
+  "batch.size=65536",
+]
+repetitions = 5
+timeout_seconds = 3600
+required_stdout = ["records/sec", "produce-throttle-time"]
+
+[[cases]]
+name = "consume-earliest"
+product = "kafka-comparator"
+command = [
+  "docker", "exec", "${KAFKA_CONTAINER}",
+  "/opt/kafka/bin/kafka-consumer-perf-test.sh",
+  "--bootstrap-server", "${KAFKA_BOOTSTRAP_SERVERS}",
+  "--topic", "${KAFKA_BENCHMARK_TOPIC}-${PEPPER_PHASE0_REPETITION}",
+  "--group", "pepper-phase0-${PEPPER_PHASE0_REPETITION}",
+  "--num-records", "${KAFKA_BENCHMARK_RECORDS}",
+  "--timeout", "300000",
+  "--print-metrics",
+]
+repetitions = 5
+timeout_seconds = 3600
+required_stdout = ["MB.sec", "records-lag"]

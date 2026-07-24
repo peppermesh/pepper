@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[node]
+name = "phase0-node-2"
+listen_addr = "127.0.0.1:31002"
+bulk_listen_addr = "127.0.0.1:31102"
+bulk_advertise_addr = "127.0.0.1:31102"
+failure_domain = "phase0-rack-b"
+
+[node.placement_labels]
+region = "phase0"
+zone = "phase0-b"
+rack = "phase0-rack-b"
+disk_class = "xfs"
+
+[data]
+path = "./target/phase0-native-platform/node2/data"
+
+[identity]
+key_path = "./target/phase0-native-platform/node2/data/node.key"
+generate_if_missing = true
+
+[api]
+bind_addr = "127.0.0.1:31081"
+
+[[storage.locations]]
+path = "./target/phase0-native-platform/node2/storage"
+max_capacity_bytes = 10737418240
+
+[network]
+bootstrap_peers = ["127.0.0.1:31001", "127.0.0.1:31003"]
+
+[namespace]
+enabled = true
+consensus_enabled = true
+heartbeat_interval_ms = 250
+election_timeout_min_ms = 1500
+election_timeout_max_ms = 3000
+
+[replication]
+default_factor = 3
+repair_interval_seconds = 5
+
+[compute]
+enabled = false
+runtime = "firecracker"
+max_concurrent_jobs = 1
+work_dir = "./target/phase0-native-platform/node2/compute"
+
+[s3]
+enabled = true
+region = "us-east-1"
+access_key_id = "pepper-dev"
+secret_access_key_path = "./dev/s3.secret"
+max_clock_skew_seconds = 900
+bucket_partitions = 16
+
+[sqlite]
+enabled = true
+
+[fast_path]
+workers = 8
+control_cores = 2
+queue_depth = 256
+requests_per_worker = 128
+writes_per_worker = 4
+replications_per_worker = 8
+stripe_reads_per_worker = 32
+response_frames = 8
+pin_cpus = false
+
+[limits]
+max_block_bytes = 67108864
+max_object_bytes = 5368709120
+http_requests_per_minute = 10000000
+rpc_requests_per_minute = 10000000
+
+[logging]
+format = "json"

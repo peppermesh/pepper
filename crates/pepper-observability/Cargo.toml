@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-observability"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Bounded-cardinality operation identity, cost telemetry, and fault boundaries for Pepper"
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

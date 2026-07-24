@@ -12,12 +12,17 @@ use super::*;
 use crate::placement::PlacementSnapshot;
 use axum::body::HttpBody;
 use pepper_config::FastPathConfig;
+use pepper_keyed_runtime::{
+    Admission, BudgetLimit, DispatchError, KeyedDispatcher, KeyedWorker, RuntimeConfig,
+    WorkerDescriptor,
+};
 use std::{
     future::Future,
     pin::Pin,
     sync::OnceLock,
     sync::atomic::{AtomicBool, AtomicUsize},
     thread::JoinHandle,
+    time::Instant,
 };
 
 type S3Future = Pin<Box<dyn Future<Output = Result<Response, S3Error>> + Send + 'static>>;
@@ -30,11 +35,7 @@ struct WorkItem {
     enqueued_at: time::Instant,
     future: S3Future,
     response: oneshot::Sender<Result<Response, S3Error>>,
-}
-
-enum OwnerCommand {
-    Execute(WorkItem),
-    Shutdown,
+    operation: Option<Arc<OperationScope>>,
 }
 
 struct OwnerMetrics {
@@ -110,7 +111,6 @@ pub(super) struct OwnerContext {
 struct OwnerHandle {
     id: usize,
     cpu_id: usize,
-    sender: tokio::sync::mpsc::Sender<OwnerCommand>,
     healthy: Arc<AtomicBool>,
     context: Arc<OwnerContext>,
     metrics: Arc<OwnerMetrics>,
@@ -118,7 +118,6 @@ struct OwnerHandle {
 
 struct OwnerBootstrap {
     healthy: Arc<AtomicBool>,
-    requests_per_worker: usize,
     pin_cpus: bool,
     block_store: Arc<BlockStore>,
     network: Option<NetworkHandle>,
@@ -140,10 +139,15 @@ pub(super) struct OwnerSnapshot {
     pub(super) response_bytes: u64,
     pub(super) buffer_hits: u64,
     pub(super) buffer_misses: u64,
+    pub(super) scheduler_queued_by_class: [u64; 3],
+    pub(super) scheduler_active_by_class: [u64; 3],
+    pub(super) scheduler_queue_micros: u64,
+    pub(super) scheduler_service_micros: u64,
 }
 
 pub(super) struct FastPathRuntime {
     owners: Vec<OwnerHandle>,
+    dispatcher: KeyedDispatcher<WorkItem>,
     _threads: Vec<JoinHandle<()>>,
     reserved_control_cores: usize,
     cpu_pinning_enabled: bool,
@@ -155,9 +159,7 @@ pub(super) struct FastPathRuntime {
 
 impl Drop for FastPathRuntime {
     fn drop(&mut self) {
-        for owner in &self.owners {
-            let _ = owner.sender.try_send(OwnerCommand::Shutdown);
-        }
+        self.dispatcher.try_shutdown();
     }
 }
 
@@ -189,10 +191,43 @@ impl FastPathRuntime {
         .max(1);
         owner_cpus.truncate(desired);
 
+        let descriptors = owner_cpus
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(id, cpu_id)| WorkerDescriptor {
+                id,
+                cpu_affinity: config.pin_cpus.then_some(cpu_id),
+            })
+            .collect::<Vec<_>>();
+        let active = config.requests_per_worker;
+        let key_requests =
+            ((config.queue_depth / 4).max(1)).min(config.queue_depth.saturating_sub(1)) as u64;
+        let runtime_config = RuntimeConfig {
+            queue_depth_per_worker: config.queue_depth,
+            active_per_worker: active,
+            reserved_control_slots: usize::from(active >= 2),
+            reserved_foreground_slots: usize::from(active >= 3),
+            key_limit: BudgetLimit {
+                requests: key_requests,
+                bytes: 1024 * 1024 * 1024,
+            },
+            worker_limit: BudgetLimit {
+                requests: config.queue_depth as u64,
+                bytes: 4 * 1024 * 1024 * 1024,
+            },
+            global_limit: BudgetLimit {
+                requests: config.queue_depth.saturating_mul(desired) as u64,
+                bytes: (4 * 1024 * 1024 * 1024_u64).saturating_mul(desired as u64),
+            },
+            ..RuntimeConfig::default()
+        };
+        let (dispatcher, workers) =
+            pepper_keyed_runtime::build::<WorkItem>(runtime_config, descriptors)
+                .map_err(|error| anyhow::anyhow!("invalid keyed runtime configuration: {error}"))?;
         let mut owners = Vec::with_capacity(desired);
         let mut threads = Vec::with_capacity(desired);
-        for (id, cpu_id) in owner_cpus.into_iter().enumerate() {
-            let (sender, receiver) = tokio::sync::mpsc::channel(config.queue_depth);
+        for ((id, cpu_id), worker) in owner_cpus.into_iter().enumerate().zip(workers) {
             let healthy = Arc::new(AtomicBool::new(true));
             let metrics = Arc::new(OwnerMetrics::new());
             let context = Arc::new(OwnerContext {
@@ -215,7 +250,6 @@ impl FastPathRuntime {
             let worker_healthy = healthy.clone();
             let worker_context = context.clone();
             let pin_cpus = config.pin_cpus;
-            let requests_per_worker = config.requests_per_worker;
             let owner_block_store = block_store.clone();
             let owner_network = network.cloned();
             let replica_streams = config.replications_per_worker;
@@ -225,10 +259,9 @@ impl FastPathRuntime {
                 .spawn(move || {
                     run_owner(
                         worker_context,
-                        receiver,
+                        worker,
                         OwnerBootstrap {
                             healthy: worker_healthy,
-                            requests_per_worker,
                             pin_cpus,
                             block_store: owner_block_store,
                             network: owner_network,
@@ -255,7 +288,6 @@ impl FastPathRuntime {
             owners.push(OwnerHandle {
                 id,
                 cpu_id,
-                sender,
                 healthy,
                 context,
                 metrics,
@@ -264,6 +296,7 @@ impl FastPathRuntime {
         }
         Ok(Arc::new(Self {
             owners,
+            dispatcher,
             _threads: threads,
             reserved_control_cores: reserved,
             cpu_pinning_enabled: config.pin_cpus,
@@ -319,13 +352,12 @@ impl FastPathRuntime {
         }
     }
 
+    #[allow(dead_code)] // Retained as the compatibility adapter during migration.
     pub(super) fn owner_for(&self, affinity: &[u8]) -> usize {
-        let digest = blake3::hash(affinity);
-        let mut encoded = [0u8; 8];
-        encoded.copy_from_slice(&digest.as_bytes()[..8]);
-        (u64::from_le_bytes(encoded) as usize) % self.owners.len()
+        self.dispatcher.owner_for(WorkKey::from_bytes(affinity))
     }
 
+    #[allow(dead_code)] // Retained as the compatibility adapter during migration.
     pub(super) async fn execute<F>(
         &self,
         affinity: &[u8],
@@ -335,55 +367,60 @@ impl FastPathRuntime {
     where
         F: Future<Output = Result<Response, S3Error>> + Send + 'static,
     {
-        let preferred = self.owner_for(affinity);
-        let (response, receive) = oneshot::channel();
-        let mut item = WorkItem {
-            enqueued_at: time::Instant::now(),
-            future: Box::pin(future),
-            response,
-        };
-        let mut selected = None;
-        for offset in 0..self.owners.len() {
-            let index = (preferred + offset) % self.owners.len();
-            let owner = &self.owners[index];
-            if !owner.healthy.load(Ordering::Acquire) {
-                continue;
-            }
-            match owner.sender.try_send(OwnerCommand::Execute(item)) {
-                Ok(()) => {
-                    selected = Some(index);
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_returned)) => {
-                    self.rejections.fetch_add(1, Ordering::Relaxed);
-                    return Err(S3Error::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "SlowDown",
-                        format!("S3 owner {index} admission queue is full"),
-                        resource,
-                    )
-                    .with_retry_after(1));
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(returned)) => {
-                    owner.healthy.store(false, Ordering::Release);
-                    item = match returned {
-                        OwnerCommand::Execute(item) => item,
-                        OwnerCommand::Shutdown => unreachable!("execute never sends shutdown"),
-                    };
-                }
-            }
-        }
-        let Some(selected) = selected else {
+        self.execute_admitted(
+            affinity,
+            resource,
+            Admission::foreground(0, Instant::now() + Duration::from_secs(1)),
+            future,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_admitted<F>(
+        &self,
+        affinity: &[u8],
+        resource: &str,
+        admission: Admission,
+        future: F,
+    ) -> Result<Response, S3Error>
+    where
+        F: Future<Output = Result<Response, S3Error>> + Send + 'static,
+    {
+        let key = WorkKey::from_bytes(affinity);
+        let selected = self.dispatcher.owner_for(key);
+        if !self.owners[selected].healthy.load(Ordering::Acquire) {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(S3Error::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ServiceUnavailable",
-                "all per-core S3 owners are unavailable",
+                format!("S3 owner {selected} is unavailable"),
                 resource,
             ));
+        }
+        let (response, receive) = oneshot::channel();
+        let item = WorkItem {
+            enqueued_at: time::Instant::now(),
+            future: Box::pin(future),
+            response,
+            operation: current_operation(),
         };
-        if selected != preferred {
-            self.failovers.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.dispatcher.dispatch(key, admission, item).await {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
+            let (code, message) = match error {
+                DispatchError::Deadline
+                | DispatchError::BudgetExhausted(_)
+                | DispatchError::KeyDraining => ("SlowDown", error.to_string()),
+                DispatchError::WorkerClosed | DispatchError::ShuttingDown => {
+                    self.owners[selected]
+                        .healthy
+                        .store(false, Ordering::Release);
+                    ("ServiceUnavailable", error.to_string())
+                }
+            };
+            return Err(
+                S3Error::new(StatusCode::SERVICE_UNAVAILABLE, code, message, resource)
+                    .with_retry_after(1),
+            );
         }
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.cross_core_hops.fetch_add(1, Ordering::Relaxed);
@@ -415,7 +452,10 @@ impl FastPathRuntime {
                     .and_then(NetworkHandle::local_transport_addr)
                     .map_or(0, |address| address.port()),
                 healthy: owner.healthy.load(Ordering::Acquire),
-                queue_depth: owner.sender.max_capacity() - owner.sender.capacity(),
+                queue_depth: self
+                    .dispatcher
+                    .worker_snapshot(owner.id)
+                    .map_or(0, |snapshot| snapshot.queued as usize),
                 requests: owner.metrics.requests.load(Ordering::Relaxed),
                 active: owner.metrics.active.load(Ordering::Relaxed),
                 queue_micros: owner.metrics.queue_micros.load(Ordering::Relaxed),
@@ -423,6 +463,22 @@ impl FastPathRuntime {
                 response_bytes: owner.metrics.response_bytes.load(Ordering::Relaxed),
                 buffer_hits: owner.metrics.buffer_hits.load(Ordering::Relaxed),
                 buffer_misses: owner.metrics.buffer_misses.load(Ordering::Relaxed),
+                scheduler_queued_by_class: self
+                    .dispatcher
+                    .worker_snapshot(owner.id)
+                    .map_or([0; 3], |snapshot| snapshot.queued_by_class),
+                scheduler_active_by_class: self
+                    .dispatcher
+                    .worker_snapshot(owner.id)
+                    .map_or([0; 3], |snapshot| snapshot.active_by_class),
+                scheduler_queue_micros: self
+                    .dispatcher
+                    .worker_snapshot(owner.id)
+                    .map_or(0, |snapshot| snapshot.queue_microseconds),
+                scheduler_service_micros: self
+                    .dispatcher
+                    .worker_snapshot(owner.id)
+                    .map_or(0, |snapshot| snapshot.service_microseconds),
             })
             .collect()
     }
@@ -434,6 +490,10 @@ impl FastPathRuntime {
             self.failovers.load(Ordering::Relaxed),
             self.cross_core_hops.load(Ordering::Relaxed),
         )
+    }
+
+    pub(super) fn governor_snapshot(&self) -> pepper_keyed_runtime::RuntimeSnapshot {
+        self.dispatcher.snapshot()
     }
 
     pub(super) fn read_diagnostics(&self) -> Vec<ReadDiagnosticRecord> {
@@ -454,32 +514,11 @@ impl FastPathRuntime {
         records.sort_by_key(|record| record.sequence);
         records
     }
-
-    #[cfg(test)]
-    async fn shutdown_owner(&self, owner: usize) {
-        self.owners[owner]
-            .sender
-            .send(OwnerCommand::Shutdown)
-            .await
-            .unwrap();
-        for _ in 0..100 {
-            if !self.owners[owner].healthy.load(Ordering::Acquire) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("owner did not stop");
-    }
 }
 
-fn run_owner(
-    context: Arc<OwnerContext>,
-    mut receiver: tokio::sync::mpsc::Receiver<OwnerCommand>,
-    bootstrap: OwnerBootstrap,
-) {
+fn run_owner(context: Arc<OwnerContext>, worker: KeyedWorker<WorkItem>, bootstrap: OwnerBootstrap) {
     let OwnerBootstrap {
         healthy,
-        requests_per_worker,
         pin_cpus,
         block_store,
         network,
@@ -506,7 +545,6 @@ fn run_owner(
         let _ = ready.send(Err("Tokio runtime creation failed".to_string()));
         return;
     };
-    let request_slots = Arc::new(Semaphore::new(requests_per_worker));
     runtime.block_on(async move {
         if let Some(network) = network {
             let isolated = match network.isolated_data_endpoint(replica_streams) {
@@ -530,42 +568,58 @@ fn run_owner(
             "owner block writer is initialized exactly once"
         );
         let _ = ready.send(Ok(()));
-        while let Ok(permit) = request_slots.clone().acquire_owned().await {
-            let Some(command) = receiver.recv().await else {
-                break;
-            };
-            let item = match command {
-                OwnerCommand::Execute(item) => item,
-                OwnerCommand::Shutdown => break,
-            };
-            let owner = context.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let queue_elapsed = item.enqueued_at.elapsed();
-                owner.metrics.queue_micros.fetch_add(
-                    queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
-                    Ordering::Relaxed,
-                );
-                owner.metrics.requests.fetch_add(1, Ordering::Relaxed);
-                owner.metrics.active.fetch_add(1, Ordering::Relaxed);
-                let started = time::Instant::now();
-                let scoped_owner = owner.clone();
-                let response = OWNER
-                    .scope(owner.clone(), async move {
+        let worker_context = context.clone();
+        worker
+            .run(move |item| {
+                let owner = worker_context.clone();
+                async move {
+                    let queue_elapsed = item.enqueued_at.elapsed();
+                    if let Some(operation) = &item.operation {
+                        operation.observe(OperationStage::OwnerQueue);
+                        operation.add(
+                            OperationCostMetric::QueueMicroseconds,
+                            queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+                        );
+                    }
+                    owner.metrics.queue_micros.fetch_add(
+                        queue_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                    owner.metrics.requests.fetch_add(1, Ordering::Relaxed);
+                    owner.metrics.active.fetch_add(1, Ordering::Relaxed);
+                    let started = time::Instant::now();
+                    let scoped_owner = owner.clone();
+                    let execution = OWNER.scope(owner.clone(), async move {
                         match item.future.await {
                             Ok(response) => Ok(detach_response_body(response, &scoped_owner).await),
                             Err(error) => Err(error),
                         }
-                    })
-                    .await;
-                owner.metrics.execution_micros.fetch_add(
-                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                    Ordering::Relaxed,
-                );
-                owner.metrics.active.fetch_sub(1, Ordering::Relaxed);
-                let _ = item.response.send(response);
-            });
-        }
+                    });
+                    let response = if let Some(operation) = item.operation {
+                        scope_operation(operation, async move {
+                            observe_current_stage(OperationStage::OwnerExecution);
+                            let response = execution.await;
+                            add_current_cost(
+                                OperationCostMetric::ExecutionMicroseconds,
+                                started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                            );
+                            response
+                        })
+                        .await
+                    } else {
+                        execution.await
+                    };
+                    let execution_micros =
+                        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    owner
+                        .metrics
+                        .execution_micros
+                        .fetch_add(execution_micros, Ordering::Relaxed);
+                    owner.metrics.active.fetch_sub(1, Ordering::Relaxed);
+                    let _ = item.response.send(response);
+                }
+            })
+            .await;
         healthy.store(false, Ordering::Release);
     });
 }
@@ -920,7 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unhealthy_owner_uses_deterministic_standby() {
+    async fn key_ownership_moves_only_after_old_owner_drains() {
         let temp = tempfile::tempdir().unwrap();
         let metadata = Arc::new(
             pepper_metadata::MetadataStore::open_or_create(temp.path().join("metadata.redb"))
@@ -946,7 +1000,23 @@ mod tests {
             FastPathRuntime::start(&config, store, PlacementSnapshot::default(), None).unwrap();
         let affinity = b"bucket\0owner-failover";
         let preferred = runtime.owner_for(affinity);
-        runtime.shutdown_owner(preferred).await;
+        runtime
+            .execute(affinity, "/bucket/key", async {
+                Ok(StatusCode::NO_CONTENT.into_response())
+            })
+            .await
+            .unwrap();
+        let target = (preferred + 1) % runtime.owner_count();
+        runtime
+            .dispatcher
+            .drain_and_remap(
+                WorkKey::from_bytes(affinity),
+                target,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.owner_for(affinity), target);
         let response = runtime
             .execute(affinity, "/bucket/key", async {
                 Ok(StatusCode::NO_CONTENT.into_response())
@@ -954,7 +1024,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(runtime.totals().2, 1);
+        let snapshots = runtime.snapshots();
+        assert_eq!(snapshots[preferred].requests, 1);
+        assert_eq!(snapshots[target].requests, 1);
     }
 
     #[tokio::test]

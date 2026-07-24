@@ -2,87 +2,68 @@
 
 //! Bounded cache for verified immutable blocks and page packs.
 
+use pepper_dataset::{CacheAdmission, SnapshotCache, SnapshotLease};
 use pepper_types::Cid;
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
-};
-
-#[derive(Debug)]
-struct CacheState {
-    entries: HashMap<Cid, Arc<Vec<u8>>>,
-    order: VecDeque<Cid>,
-    bytes: usize,
-}
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct ImmutableBlockCache {
-    maximum_bytes: usize,
-    state: Mutex<CacheState>,
+    cache: SnapshotCache,
 }
 
 impl ImmutableBlockCache {
     pub fn new(maximum_bytes: usize) -> Self {
         Self {
-            maximum_bytes,
-            state: Mutex::new(CacheState {
-                entries: HashMap::new(),
-                order: VecDeque::new(),
-                bytes: 0,
-            }),
+            cache: SnapshotCache::new(maximum_bytes),
         }
     }
 
     pub fn get(&self, cid: &Cid) -> Option<Arc<Vec<u8>>> {
-        let mut state = self.state.lock().ok()?;
-        let value = state.entries.get(cid)?.clone();
-        if let Some(index) = state.order.iter().position(|item| item == cid) {
-            state.order.remove(index);
-        }
-        state.order.push_back(cid.clone());
-        Some(value)
+        self.cache.get(cid)
     }
 
     /// Insert bytes only when their content verifies against the key.
     pub fn insert_verified(&self, cid: Cid, bytes: Vec<u8>) -> bool {
-        if !cid.verify(&bytes) || bytes.len() > self.maximum_bytes {
-            return false;
-        }
-        self.insert(cid, bytes)
+        self.cache
+            .insert_verified(None, cid, bytes, CacheAdmission::ReuseExpected)
     }
 
     /// Insert logical object bytes returned by a trusted resolver. Manifest
     /// CIDs commit to their child graph rather than directly to these bytes.
     pub fn insert_resolved(&self, cid: Cid, bytes: Vec<u8>) -> bool {
-        if bytes.len() > self.maximum_bytes {
-            return false;
-        }
-        self.insert(cid, bytes)
+        self.cache
+            .insert_resolved(None, cid, bytes, CacheAdmission::ReuseExpected)
     }
 
-    fn insert(&self, cid: Cid, bytes: Vec<u8>) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if state.entries.contains_key(&cid) {
-            return true;
-        }
-        while state.bytes.saturating_add(bytes.len()) > self.maximum_bytes {
-            let Some(oldest) = state.order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = state.entries.remove(&oldest) {
-                state.bytes = state.bytes.saturating_sub(removed.len());
-            }
-        }
-        state.bytes = state.bytes.saturating_add(bytes.len());
-        state.order.push_back(cid.clone());
-        state.entries.insert(cid, Arc::new(bytes));
-        true
+    pub fn lease_snapshot(&self, snapshot: Cid) -> SnapshotLease {
+        self.cache.lease(snapshot)
+    }
+
+    pub fn retain_for_snapshot(&self, snapshot: Cid, cid: &Cid) -> bool {
+        self.cache.retain_for_snapshot(snapshot, cid)
+    }
+
+    pub fn insert_resolved_for_snapshot(
+        &self,
+        snapshot: Cid,
+        cid: Cid,
+        bytes: Vec<u8>,
+        scan: bool,
+    ) -> bool {
+        self.cache.insert_resolved(
+            Some(snapshot),
+            cid,
+            bytes,
+            if scan {
+                CacheAdmission::Scan
+            } else {
+                CacheAdmission::ReuseExpected
+            },
+        )
     }
 
     pub fn current_bytes(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.bytes)
+        self.cache.current_bytes()
     }
 }
 

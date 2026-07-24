@@ -1,0 +1,21 @@
+{
+  "schema": "pepper.phase12.compaction-tiering-qualification.v1",
+  "compaction_density": {
+    "keyed_updates": 1000000,
+    "unique_keys": 100000,
+    "obsolete_updates": 900000,
+    "obsolete_percent": 90,
+    "scheduler_tasks": 1,
+    "maximum_in_flight_per_device": 1,
+    "all_pass": true
+  },
+  "replacement_recovery_boundaries": 4,
+  "cold_cache_bounded": true,
+  "concurrent_misses_coalesced": true,
+  "hot_replica_retained": true,
+  "erasure_data_shards": 3,
+  "erasure_parity_shards": 2,
+  "tolerated_missing_shards": 2,
+  "beyond_policy_failed_closed": true,
+  "all_pass": true
+}

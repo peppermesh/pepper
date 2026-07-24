@@ -32,6 +32,10 @@ use pepper_network::{NetworkError, NetworkHandle, NetworkNamespaceService, proto
 use pepper_placement::{
     ConsensusPlacementNode, select_namespace_replacement, select_namespace_replicas_with_count,
 };
+use pepper_rsm::{
+    BatchProcessor, GroupId as RsmGroupId, GroupRegistry, LazyBatcher, LinearizableReadGate,
+    ProposalGuard, ReadLease, ReplicatedStateMachine, StorageScope,
+};
 use pepper_sqlite::{
     AcquisitionStatus, CommitAttempt, GuardedCommitRequest, WriterControlRequest,
     WriterControlResponse, WriterCoordinator, WriterTicket,
@@ -52,12 +56,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 const PROPOSAL_BATCH_MAX_COMMANDS: usize = 32;
 const PROPOSAL_BATCH_MAX_DELAY: Duration = Duration::from_micros(250);
-const PROPOSAL_BATCH_CHANNEL_CAPACITY: usize = 256;
 const INITIAL_MEMBERSHIP_EPOCH: u64 = 1;
 const SQLITE_HEAD_KEY: &[u8] = b"\xffsqlite/head";
 const SQLITE_WRITER_RPC_MAX_BYTES: usize = 64 * 1024;
@@ -79,36 +82,47 @@ fn validate_sqlite_guard_command(
     guard: &GuardedCommitRequest,
     command: &CommandEnvelope,
 ) -> Result<(), ConsensusError> {
-    let NamespaceCommand::ApplyTransaction { transaction } = &command.command else {
-        return Err(ConsensusError::Sqlite(
-            "SQLite guard requires a namespace transaction".into(),
-        ));
-    };
-    let valid_mutation = matches!(
-        transaction.mutations.as_slice(),
-        [NamespaceMutation::Put {
-            key_hex,
-            value_cid,
-            metadata,
-            precondition: KeyPrecondition::Match { generation, cid },
-            ..
-        }] if key_hex == &hex::encode(SQLITE_HEAD_KEY)
-            && value_cid == &guard.new_snapshot_cid
-            && *generation == guard.base_generation
-            && cid == &guard.base_snapshot_cid
-            && metadata.get("leader_term") == Some(&guard.ticket.leader_term.to_string())
-    );
-    if command.request_id != guard.idempotency_key
-        || command.writer_identity != guard.ticket.holder
-        || guard.ticket.base_snapshot_cid != guard.base_snapshot_cid
-        || guard.ticket.base_generation != guard.base_generation
-        || !valid_mutation
-    {
-        return Err(ConsensusError::Sqlite(
-            "SQLite guard does not match the protected head mutation".into(),
-        ));
+    SqliteCommandGuard(guard).validate(&(), command)
+}
+
+struct SqliteCommandGuard<'a>(&'a GuardedCommitRequest);
+
+impl ProposalGuard<(), CommandEnvelope> for SqliteCommandGuard<'_> {
+    type Error = ConsensusError;
+
+    fn validate(&self, _state: &(), command: &CommandEnvelope) -> Result<(), Self::Error> {
+        let guard = self.0;
+        let NamespaceCommand::ApplyTransaction { transaction } = &command.command else {
+            return Err(ConsensusError::Sqlite(
+                "SQLite guard requires a namespace transaction".into(),
+            ));
+        };
+        let valid_mutation = matches!(
+            transaction.mutations.as_slice(),
+            [NamespaceMutation::Put {
+                key_hex,
+                value_cid,
+                metadata,
+                precondition: KeyPrecondition::Match { generation, cid },
+                ..
+            }] if key_hex == &hex::encode(SQLITE_HEAD_KEY)
+                && value_cid == &guard.new_snapshot_cid
+                && *generation == guard.base_generation
+                && cid == &guard.base_snapshot_cid
+                && metadata.get("leader_term") == Some(&guard.ticket.leader_term.to_string())
+        );
+        if command.request_id != guard.idempotency_key
+            || command.writer_identity != guard.ticket.holder
+            || guard.ticket.base_snapshot_cid != guard.base_snapshot_cid
+            || guard.ticket.base_generation != guard.base_generation
+            || !valid_mutation
+        {
+            return Err(ConsensusError::Sqlite(
+                "SQLite guard does not match the protected head mutation".into(),
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 const NAMESPACE_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("namespace_groups");
@@ -502,6 +516,50 @@ impl MerkleWriteStore for BufferedConsensusDataStore {
             .await
             .insert(cid.to_string(), (codec, payload));
         Ok(cid)
+    }
+}
+
+/// Namespace policy adapter for the product-neutral deterministic RSM
+/// contract. Consensus storage and OpenRaft never need to know how a
+/// namespace command mutates Merkle state.
+struct NamespaceRsmAdapter {
+    store: BufferedConsensusDataStore,
+}
+
+#[async_trait]
+impl ReplicatedStateMachine for NamespaceRsmAdapter {
+    type State = NamespaceState;
+    type Command = CommandEnvelope;
+    type Response = ApplyResult;
+    type Error = NamespaceError;
+
+    async fn apply(
+        &self,
+        state: &mut Self::State,
+        command: Self::Command,
+    ) -> Result<Self::Response, Self::Error> {
+        let mut machine = NamespaceStateMachine::new(self.store.clone(), state.clone())?;
+        let result = machine.apply(command).await?;
+        *state = machine.state().clone();
+        Ok(result)
+    }
+
+    fn encode_state(&self, state: &Self::State) -> Result<Vec<u8>, Self::Error> {
+        serde_json::to_vec(state).map_err(|error| NamespaceError::InvalidPayload(error.to_string()))
+    }
+
+    fn decode_state(&self, encoded: &[u8]) -> Result<Self::State, Self::Error> {
+        serde_json::from_slice(encoded)
+            .map_err(|error| NamespaceError::InvalidPayload(error.to_string()))
+    }
+
+    fn command_class(&self, command: &Self::Command) -> &'static str {
+        match command.command {
+            NamespaceCommand::ApplyTransaction { .. } => "apply_transaction",
+            NamespaceCommand::CreateSnapshot { .. } => "create_snapshot",
+            NamespaceCommand::DeleteSnapshot { .. } => "delete_snapshot",
+            NamespaceCommand::Rollback { .. } => "rollback",
+        }
     }
 }
 
@@ -1597,17 +1655,14 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
                 EntryPayload::Normal(command) => {
                     resolved_log_indexes.push(log_index);
                     let buffered_store = BufferedConsensusDataStore::new(self.data_store.clone());
+                    let machine = NamespaceRsmAdapter {
+                        store: buffered_store.clone(),
+                    };
                     let mut command_responses = Vec::with_capacity(command.commands.len());
                     for command in command.commands {
                         let request_id = command.request_id.clone();
-                        let mut machine = NamespaceStateMachine::new(
-                            buffered_store.clone(),
-                            next.namespace_state.clone(),
-                        )
-                        .map_err(|error| apply_error(&entry.log_id, error))?;
-                        match machine.apply(command).await {
+                        match machine.apply(&mut next.namespace_state, command).await {
                             Ok(result) => {
-                                next.namespace_state = machine.state().clone();
                                 publication_intents.extend(result.pin_intents.iter().map(
                                     |intent| {
                                         committed_publication_intent(
@@ -1758,6 +1813,7 @@ fn snapshot_replica_node_ids(state: &PersistedStateMachine) -> Vec<String> {
 pub struct StorageBundle {
     pub log_store: RedbLogStore,
     pub state_machine: RedbStateMachineStore,
+    pub storage_scope: StorageScope,
 }
 
 impl StorageBundle {
@@ -1769,6 +1825,7 @@ impl StorageBundle {
         max_log_bytes: u64,
     ) -> Result<Self, ConsensusError> {
         let group = namespace_id.to_string();
+        let storage_scope = StorageScope::new(&namespace_rsm_group(namespace_id));
         let io_lock = Arc::new(Mutex::new(()));
         Ok(Self {
             log_store: RedbLogStore::new(
@@ -1784,6 +1841,7 @@ impl StorageBundle {
                 data_store,
                 initial_state,
             )?,
+            storage_scope,
         })
     }
 }
@@ -2022,78 +2080,20 @@ struct RateBucket {
 
 struct PendingProposal {
     command: CommandEnvelope,
-    encoded_bytes: usize,
     queued_at: Instant,
-    response: oneshot::Sender<Result<ConsensusResponse, String>>,
 }
 
-#[derive(Clone)]
-struct ProposalBatcher {
-    sender: mpsc::Sender<PendingProposal>,
-}
-
-impl ProposalBatcher {
-    fn spawn(raft: NamespaceRaft, max_command_bytes: u64) -> Self {
-        let (sender, receiver) = mpsc::channel(PROPOSAL_BATCH_CHANNEL_CAPACITY);
-        tokio::spawn(run_proposal_batcher(raft, max_command_bytes, receiver));
-        Self { sender }
-    }
-
-    async fn submit(
-        &self,
-        command: CommandEnvelope,
-        encoded_bytes: usize,
-    ) -> Result<ConsensusResponse, ConsensusError> {
-        let (response, result) = oneshot::channel();
-        self.sender
-            .send(PendingProposal {
-                command,
-                encoded_bytes,
-                queued_at: Instant::now(),
-                response,
-            })
-            .await
-            .map_err(|_| ConsensusError::Raft("namespace proposal batcher stopped".to_string()))?;
-        result
-            .await
-            .map_err(|_| ConsensusError::Raft("namespace proposal response dropped".to_string()))?
-            .map_err(ConsensusError::Raft)
-    }
-}
-
-async fn run_proposal_batcher(
+struct NamespaceProposalProcessor {
     raft: NamespaceRaft,
-    max_command_bytes: u64,
-    mut receiver: mpsc::Receiver<PendingProposal>,
-) {
-    let mut carry = None;
-    loop {
-        let first = match carry.take() {
-            Some(request) => request,
-            None => match receiver.recv().await {
-                Some(request) => request,
-                None => break,
-            },
-        };
-        let mut encoded_bytes = first.encoded_bytes.saturating_add(32);
-        let mut requests = vec![first];
-        let deadline = tokio::time::Instant::now() + PROPOSAL_BATCH_MAX_DELAY;
-        while requests.len() < PROPOSAL_BATCH_MAX_COMMANDS {
-            let next = match tokio::time::timeout_at(deadline, receiver.recv()).await {
-                Ok(Some(request)) => request,
-                Ok(None) | Err(_) => break,
-            };
-            let next_bytes = encoded_bytes
-                .saturating_add(next.encoded_bytes)
-                .saturating_add(1);
-            if next_bytes as u64 > max_command_bytes {
-                carry = Some(next);
-                break;
-            }
-            encoded_bytes = next_bytes;
-            requests.push(next);
-        }
+}
 
+#[async_trait]
+impl BatchProcessor for NamespaceProposalProcessor {
+    type Input = PendingProposal;
+    type Output = ConsensusResponse;
+    type Error = String;
+
+    async fn process(&self, requests: Vec<Self::Input>) -> Result<Vec<Self::Output>, Self::Error> {
         let request_count = requests.len() as u64;
         PROPOSAL_REQUESTS.fetch_add(request_count, Ordering::Relaxed);
         PROPOSAL_BATCHES.fetch_add(1, Ordering::Relaxed);
@@ -2111,38 +2111,68 @@ async fn run_proposal_batcher(
         }
         let payload = ConsensusCommandBatch {
             commands: requests
-                .iter()
-                .map(|request| request.command.clone())
+                .into_iter()
+                .map(|request| request.command)
                 .collect(),
         };
-        let result = raft.client_write(payload).await;
+        let response = self
+            .raft
+            .client_write(payload)
+            .await
+            .map_err(|error| error.to_string())?;
         PROPOSAL_EXECUTION_MICROS.fetch_add(
             submitted_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        match result {
-            Ok(response) if response.data.responses.len() == requests.len() => {
-                for (request, response) in requests.into_iter().zip(response.data.responses) {
-                    let _ = request.response.send(Ok(response));
-                }
-            }
-            Ok(response) => {
-                let error = format!(
-                    "namespace proposal batch response count mismatch: expected {}, got {}",
-                    requests.len(),
-                    response.data.responses.len()
-                );
-                for request in requests {
-                    let _ = request.response.send(Err(error.clone()));
-                }
-            }
-            Err(error) => {
-                let error = error.to_string();
-                for request in requests {
-                    let _ = request.response.send(Err(error.clone()));
-                }
-            }
+        if response.data.responses.len() != request_count as usize {
+            return Err(format!(
+                "namespace proposal batch response count mismatch: expected {}, got {}",
+                request_count,
+                response.data.responses.len()
+            ));
         }
+        Ok(response.data.responses)
+    }
+}
+
+#[derive(Clone)]
+struct ProposalBatcher {
+    batcher: Arc<LazyBatcher<NamespaceProposalProcessor>>,
+}
+
+impl ProposalBatcher {
+    fn new(raft: NamespaceRaft, max_command_bytes: u64) -> Self {
+        let maximum_bytes = usize::try_from(max_command_bytes).unwrap_or(usize::MAX);
+        Self {
+            batcher: LazyBatcher::new(
+                Arc::new(NamespaceProposalProcessor { raft }),
+                PROPOSAL_BATCH_MAX_COMMANDS,
+                maximum_bytes,
+                PROPOSAL_BATCH_MAX_DELAY,
+            )
+            .expect("validated consensus batching limits"),
+        }
+    }
+
+    async fn submit(
+        &self,
+        command: CommandEnvelope,
+        encoded_bytes: usize,
+    ) -> Result<ConsensusResponse, ConsensusError> {
+        self.batcher
+            .submit(
+                PendingProposal {
+                    command,
+                    queued_at: Instant::now(),
+                },
+                encoded_bytes.saturating_add(32),
+            )
+            .await
+            .map_err(|error| ConsensusError::Raft(error.to_string()))
+    }
+
+    fn active_runners(&self) -> u64 {
+        self.batcher.stats().active_runners
     }
 }
 
@@ -2154,9 +2184,7 @@ pub struct GroupHandle {
     membership_epoch: Arc<AtomicU64>,
     rate: Mutex<RateBucket>,
     initialize_lock: Mutex<()>,
-    linearizable_arrivals: AtomicU64,
-    linearizable_covered: AtomicU64,
-    linearizable_lock: Mutex<()>,
+    linearizable_reads: LinearizableReadGate,
     last_known_leader: RwLock<Option<(NodeId, u64)>>,
     proposal_batcher: ProposalBatcher,
 }
@@ -2179,9 +2207,15 @@ fn leader_read_lease_current(
     last_applied_index: Option<u64>,
     last_log_index: Option<u64>,
 ) -> bool {
-    current_leader == Some(local_node)
-        && millis_since_quorum_ack.is_some_and(|millis| millis <= heartbeat_interval_ms)
-        && last_applied_index >= last_log_index
+    ReadLease {
+        local_node,
+        current_leader,
+        millis_since_quorum_ack,
+        maximum_age_millis: heartbeat_interval_ms,
+        last_applied_index,
+        last_log_index,
+    }
+    .is_current()
 }
 
 impl GroupHandle {
@@ -2234,23 +2268,15 @@ impl GroupHandle {
     /// requests each start their own quorum round and can exhaust the QUIC
     /// stream budget that Raft heartbeats also need.
     pub async fn ensure_linearizable(&self) -> Result<(), ConsensusError> {
-        let arrival = self.linearizable_arrivals.fetch_add(1, Ordering::AcqRel) + 1;
-        let _guard = self.linearizable_lock.lock().await;
-        if self.linearizable_covered.load(Ordering::Acquire) >= arrival {
-            return Ok(());
-        }
-        // Give concurrently arriving reads a small window to join this quorum
-        // confirmation. The arrival watermark is captured after the window, so
-        // a request that begins after the proof starts can never reuse it.
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        let cover_through = self.linearizable_arrivals.load(Ordering::Acquire);
-        self.raft
-            .ensure_linearizable()
+        self.linearizable_reads
+            .ensure(|| async {
+                self.raft
+                    .ensure_linearizable()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| ConsensusError::Raft(error.to_string()))
+            })
             .await
-            .map_err(|error| ConsensusError::Raft(error.to_string()))?;
-        self.linearizable_covered
-            .store(cover_through, Ordering::Release);
-        Ok(())
     }
 
     pub async fn voter_identities(&self) -> Vec<String> {
@@ -2387,9 +2413,14 @@ pub struct NamespaceGroupManager {
     network: Option<NetworkHandle>,
     default_data_store: Option<ConsensusDataStore>,
     config: ConsensusConfig,
-    groups: RwLock<HashMap<String, Arc<GroupHandle>>>,
+    groups: GroupRegistry<GroupHandle>,
     command_metrics: Mutex<BTreeMap<String, ConsensusCommandAccumulator>>,
     sqlite_writers: Mutex<HashMap<String, WriterCoordinator>>,
+}
+
+fn namespace_rsm_group(namespace_id: &NamespaceId) -> RsmGroupId {
+    RsmGroupId::new("namespace", namespace_id.to_string())
+        .expect("canonical namespace IDs are valid RSM group components")
 }
 
 impl NamespaceGroupManager {
@@ -2421,6 +2452,8 @@ impl NamespaceGroupManager {
     ) -> Result<Self, ConsensusError> {
         config.validate()?;
         let node_id = raft_node_id(&node_identity);
+        let groups = GroupRegistry::new(config.max_namespace_groups)
+            .map_err(|error| ConsensusError::InvalidConfig(error.to_string()))?;
         Ok(Self {
             node_identity,
             node_id,
@@ -2429,7 +2462,7 @@ impl NamespaceGroupManager {
             network: None,
             default_data_store: None,
             config,
-            groups: RwLock::new(HashMap::new()),
+            groups,
             command_metrics: Mutex::new(BTreeMap::new()),
             sqlite_writers: Mutex::new(HashMap::new()),
         })
@@ -2443,6 +2476,8 @@ impl NamespaceGroupManager {
     ) -> Result<Self, ConsensusError> {
         config.validate()?;
         let node_id = raft_node_id(&node_identity);
+        let groups = GroupRegistry::new(config.max_namespace_groups)
+            .map_err(|error| ConsensusError::InvalidConfig(error.to_string()))?;
         Ok(Self {
             node_identity,
             node_id,
@@ -2451,7 +2486,7 @@ impl NamespaceGroupManager {
             network: Some(network),
             default_data_store: None,
             config,
-            groups: RwLock::new(HashMap::new()),
+            groups,
             command_metrics: Mutex::new(BTreeMap::new()),
             sqlite_writers: Mutex::new(HashMap::new()),
         })
@@ -2475,6 +2510,7 @@ impl NamespaceGroupManager {
         data_store: ConsensusDataStore,
     ) -> Result<Arc<GroupHandle>, ConsensusError> {
         let group = state.namespace_id.to_string();
+        let group_id = namespace_rsm_group(&state.namespace_id);
         if usize::from(state.descriptor.replication_factor) != self.config.voter_count {
             return Err(ConsensusError::InvalidConfig(format!(
                 "namespace {group} has {} voters but this node is configured for {}",
@@ -2506,11 +2542,10 @@ impl NamespaceGroupManager {
         if !assigned {
             return Err(ConsensusError::NotAssigned(group));
         }
-        let mut groups = self.groups.write().await;
-        if groups.contains_key(&group) {
+        if self.groups.get(&group_id).is_ok() {
             return Err(ConsensusError::GroupAlreadyRunning(group));
         }
-        if groups.len() >= self.config.max_namespace_groups {
+        if self.groups.len() >= self.config.max_namespace_groups {
             return Err(ConsensusError::GroupLimit(self.config.max_namespace_groups));
         }
         let restore_started = std::time::Instant::now();
@@ -2572,7 +2607,7 @@ impl NamespaceGroupManager {
             created_at_unix_seconds: unix_seconds(),
         };
         write_json_table(&self.metadata, NAMESPACE_GROUPS, &group, &metadata)?;
-        let proposal_batcher = ProposalBatcher::spawn(raft.clone(), self.config.max_command_bytes);
+        let proposal_batcher = ProposalBatcher::new(raft.clone(), self.config.max_command_bytes);
         let handle = Arc::new(GroupHandle {
             namespace_id: state.namespace_id,
             raft,
@@ -2584,9 +2619,7 @@ impl NamespaceGroupManager {
                 count: 0,
             }),
             initialize_lock: Mutex::new(()),
-            linearizable_arrivals: AtomicU64::new(0),
-            linearizable_covered: AtomicU64::new(0),
-            linearizable_lock: Mutex::new(()),
+            linearizable_reads: LinearizableReadGate::new(Duration::from_millis(2)),
             last_known_leader: RwLock::new(None),
             proposal_batcher,
         });
@@ -2595,9 +2628,17 @@ impl NamespaceGroupManager {
         {
             let _ = handle.raft.trigger().snapshot().await;
         }
-        groups.insert(group, handle.clone());
+        if let Err(error) = self.groups.insert(group_id, handle.clone()) {
+            self.router.unregister(&group, &self.node_id).await;
+            let _ = handle.raft.shutdown().await;
+            return Err(match error {
+                pepper_rsm::HostError::GroupExists => ConsensusError::GroupAlreadyRunning(group),
+                pepper_rsm::HostError::GroupLimit(limit) => ConsensusError::GroupLimit(limit),
+                other => ConsensusError::InvalidConfig(other.to_string()),
+            });
+        }
         if let Some(network) = &self.network {
-            network.update_namespace_group_count(groups.len() as u64);
+            network.update_namespace_group_count(self.groups.len() as u64);
         }
         Ok(handle)
     }
@@ -2725,9 +2766,8 @@ impl NamespaceGroupManager {
         }
         if self
             .groups
-            .read()
-            .await
-            .contains_key(&state.namespace_id.to_string())
+            .get(&namespace_rsm_group(&state.namespace_id))
+            .is_ok()
         {
             return Err(ConsensusError::InvalidReplacement(
                 "stop the existing group before disaster recovery".to_string(),
@@ -4011,21 +4051,16 @@ impl NamespaceGroupManager {
         namespace_id: &NamespaceId,
     ) -> Result<Arc<GroupHandle>, ConsensusError> {
         self.groups
-            .read()
-            .await
-            .get(&namespace_id.to_string())
-            .cloned()
-            .ok_or_else(|| ConsensusError::GroupNotRunning(namespace_id.to_string()))
+            .get(&namespace_rsm_group(namespace_id))
+            .map_err(|_| ConsensusError::GroupNotRunning(namespace_id.to_string()))
     }
 
     pub async fn shutdown_group(&self, namespace_id: &NamespaceId) -> Result<(), ConsensusError> {
         let group_key = namespace_id.to_string();
         let handle = self
             .groups
-            .write()
-            .await
-            .remove(&group_key)
-            .ok_or_else(|| ConsensusError::GroupNotRunning(group_key.clone()))?;
+            .remove(&namespace_rsm_group(namespace_id))
+            .map_err(|_| ConsensusError::GroupNotRunning(group_key.clone()))?;
         self.router.unregister(&group_key, &self.node_id).await;
         handle
             .raft
@@ -4044,17 +4079,19 @@ impl NamespaceGroupManager {
     }
 
     pub async fn group_count(&self) -> usize {
-        self.groups.read().await.len()
+        self.groups.len()
+    }
+
+    pub fn active_proposal_runners(&self) -> u64 {
+        self.groups
+            .handles()
+            .iter()
+            .map(|group| group.proposal_batcher.active_runners())
+            .sum()
     }
 
     pub async fn operational_statuses(&self) -> Vec<NamespaceOperationalStatus> {
-        let groups = self
-            .groups
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let groups = self.groups.handles();
         let mut statuses = Vec::with_capacity(groups.len());
         for group in groups {
             let metrics = group.raft.metrics().borrow().clone();
@@ -4126,13 +4163,7 @@ impl NamespaceGroupManager {
     /// partition maintenance uses this bounded local inventory rather than
     /// discovering every namespace through peer RPCs.
     pub async fn local_leader_namespace_states(&self) -> Vec<NamespaceState> {
-        let groups = self
-            .groups
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let groups = self.groups.handles();
         let mut states = Vec::new();
         for group in groups {
             let metrics = group.raft.metrics().borrow().clone();
@@ -4199,9 +4230,9 @@ impl NamespaceGroupManager {
     }
 
     pub async fn backup_records(&self) -> Vec<NamespaceBackupRecord> {
-        let groups = self.groups.read().await;
+        let groups = self.groups.handles();
         let mut records = Vec::new();
-        for group in groups.values() {
+        for group in groups {
             let state = group.namespace_state().await;
             let metrics = group.raft.metrics().borrow().clone();
             let checkpoint_cid = group
@@ -5541,17 +5572,25 @@ mod tests {
         wait_for_revision(&a, 2).await;
         wait_for_revision(&b, 2).await;
         wait_for_revision(&c, 2).await;
+        let mut canonical_state = None;
         for node in [&a, &b, &c] {
-            assert_eq!(
-                node.manager
-                    .group(&namespace_id)
-                    .await
-                    .unwrap()
-                    .namespace_state()
-                    .await
-                    .current_root_cid,
-                committed_root
-            );
+            let state = node
+                .manager
+                .group(&namespace_id)
+                .await
+                .unwrap()
+                .namespace_state()
+                .await;
+            assert_eq!(state.current_root_cid, committed_root);
+            let encoded = serde_json::to_vec(&state).unwrap();
+            if let Some(expected) = &canonical_state {
+                assert_eq!(
+                    &encoded, expected,
+                    "independent replicas did not replay to byte-identical state"
+                );
+            } else {
+                canonical_state = Some(encoded);
+            }
         }
     }
 
@@ -6290,5 +6329,155 @@ mod tests {
                 .await,
             Err(ConsensusError::WriteRateLimited)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "explicit Phase 0 consensus-density qualification benchmark"]
+    async fn phase0_consensus_group_density_benchmark() {
+        let groups = std::env::var("PEPPER_CONSENSUS_DENSITY_GROUPS")
+            .expect("PEPPER_CONSENSUS_DENSITY_GROUPS must be set")
+            .parse::<usize>()
+            .expect("PEPPER_CONSENSUS_DENSITY_GROUPS must be a positive integer");
+        assert!(groups > 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
+        );
+        let data_store = ConsensusDataStore::new(MemoryDataBackend::default());
+        let manager = Arc::new(
+            NamespaceGroupManager::new(
+                "node-a".to_string(),
+                metadata,
+                InProcessRouter::default(),
+                ConsensusConfig {
+                    voter_count: 1,
+                    max_namespace_groups: groups,
+                    ..ConsensusConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let before = density_process_snapshot();
+        let io_before = process_io_stats();
+        let started = Instant::now();
+        let mut namespace_ids = Vec::with_capacity(groups);
+        for index in 0..groups {
+            let descriptor = NamespaceDescriptor::new(
+                NamespaceKind::Kv,
+                vec!["node-a".into()],
+                "phase0-density",
+                "00",
+                i64::try_from(index).unwrap() + 1,
+            );
+            let created = create_namespace(
+                &data_store,
+                descriptor,
+                NamespaceLimits::default(),
+                MerkleLimits::default(),
+            )
+            .await
+            .unwrap();
+            manager
+                .start_group(created.state.clone(), data_store.clone())
+                .await
+                .unwrap();
+            manager
+                .initialize(
+                    &created.namespace_id,
+                    raft_members(&["node-a".into()]).unwrap(),
+                )
+                .await
+                .unwrap();
+            namespace_ids.push(created.namespace_id);
+        }
+        let startup = started.elapsed();
+        let readiness_started = Instant::now();
+        let ready = loop {
+            let ready = manager
+                .operational_statuses()
+                .await
+                .into_iter()
+                .filter(|status| status.leader_raft_id == Some(raft_node_id("node-a")))
+                .count();
+            if ready == groups || readiness_started.elapsed() >= Duration::from_secs(60) {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let readiness = readiness_started.elapsed();
+        let after = density_process_snapshot();
+        let io_after = process_io_stats();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "groups_requested": groups,
+                "groups_running": manager.group_count().await,
+                "groups_leader_ready": ready,
+                "idle_proposal_runners": manager.active_proposal_runners(),
+                "startup_milliseconds": startup.as_millis(),
+                "readiness_milliseconds": readiness.as_millis(),
+                "before": before,
+                "after": after,
+                "deltas": {
+                    "rss_kib": after["rss_kib"].as_u64().unwrap_or(0).saturating_sub(before["rss_kib"].as_u64().unwrap_or(0)),
+                    "threads": after["threads"].as_u64().unwrap_or(0).saturating_sub(before["threads"].as_u64().unwrap_or(0)),
+                    "open_file_descriptors": after["open_file_descriptors"].as_u64().unwrap_or(0).saturating_sub(before["open_file_descriptors"].as_u64().unwrap_or(0)),
+                    "log_append_observations": io_after.log_append_observations.saturating_sub(io_before.log_append_observations),
+                    "log_append_entries": io_after.log_append_entries.saturating_sub(io_before.log_append_entries),
+                    "log_append_queue_micros": io_after.log_append_queue_micros.saturating_sub(io_before.log_append_queue_micros),
+                    "log_append_execution_micros": io_after.log_append_execution_micros.saturating_sub(io_before.log_append_execution_micros),
+                    "state_apply_observations": io_after.state_apply_observations.saturating_sub(io_before.state_apply_observations),
+                    "state_apply_entries": io_after.state_apply_entries.saturating_sub(io_before.state_apply_entries),
+                    "state_apply_queue_micros": io_after.state_apply_queue_micros.saturating_sub(io_before.state_apply_queue_micros),
+                    "state_apply_execution_micros": io_after.state_apply_execution_micros.saturating_sub(io_before.state_apply_execution_micros),
+                }
+            }))
+            .unwrap()
+        );
+        assert_eq!(manager.group_count().await, groups);
+        assert_eq!(
+            manager.active_proposal_runners(),
+            0,
+            "idle groups retained proposal runner tasks"
+        );
+        assert_eq!(
+            ready, groups,
+            "not all groups elected a leader in 60 seconds"
+        );
+
+        for namespace_id in namespace_ids {
+            manager.shutdown_group(&namespace_id).await.unwrap();
+        }
+    }
+
+    fn density_process_snapshot() -> serde_json::Value {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let value = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    (key == name).then(|| {
+                        value
+                            .split_whitespace()
+                            .next()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0)
+                    })
+                })
+                .unwrap_or(0)
+        };
+        let open_file_descriptors = std::fs::read_dir("/proc/self/fd")
+            .map(|entries| entries.count() as u64)
+            .unwrap_or(0);
+        serde_json::json!({
+            "rss_kib": value("VmRSS"),
+            "virtual_memory_kib": value("VmSize"),
+            "peak_rss_kib": value("VmHWM"),
+            "threads": value("Threads"),
+            "open_file_descriptors": open_file_descriptors,
+        })
     }
 }

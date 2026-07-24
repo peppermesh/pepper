@@ -1,0 +1,61 @@
+{
+  "schema": "pepper.phase9.qualification-context.v1",
+  "date_utc": "2026-07-23",
+  "base_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "host": {
+    "kernel": "Linux surya 7.0.0-27-generic #27-Ubuntu SMP PREEMPT_DYNAMIC Thu Jun 18 19:13:49 UTC 2026 x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "cargo": "cargo 1.96.1 (356927216 2026-06-26)"
+  },
+  "retained_phase8": {
+    "result_sha256": "042766f253d23e4d39e4b7ea6505dc8be5fb48974bdf6117e8f848b80c56c2b2",
+    "binary_sha256": "2bd26427b9452c0c1ac2f784b717f7697c4b4efc74c711c7c2fa0863aced6291",
+    "retained_binary": "benchmarks/pepper-phase0/evidence/phase8-pepper-kafka-benchmark-2026-07-23"
+  },
+  "performance": {
+    "candidate_command": "target/release/pepper-kafka-benchmark --phase9-paired --repetitions 5 --output benchmarks/pepper-phase0/evidence/phase9-kafka-candidate-2026-07-23.json",
+    "qualification_command": "target/release/pepper-kafka-operations-benchmark benchmarks/pepper-phase0/evidence/phase8-qualification-2026-07-23.json benchmarks/pepper-phase0/evidence/phase9-kafka-candidate-2026-07-23.json benchmarks/pepper-phase0/evidence/phase9-qualification-2026-07-23.json",
+    "candidate_sha256": "59d588f834b6dd7d6f2681c4ebee55ed991459b85906555844ce7c8ee6edc75a",
+    "qualification_sha256": "ae822adcb9f0031ea5d473ce078093c2cf07fdab80ed46a2bc39f4a0d9852e45",
+    "qualification_binary_sha256": "c57f0c7c0b32d156e31f227c754160a4d69f12e5cfe10cbfbf0d2e9f04afce3a",
+    "paired_comparator": "Within each repetition the same Phase 9 binary alternates the full Kafka path with only response-byte admission disabled, holding Kafka schemas, TCP, validation, offset assignment, persistence, extent reads, and scatter/gather framing constant. The retained Phase 8 binary and result hashes anchor the rollback point.",
+    "matrix": {
+      "record_batch_bytes": [1024, 16384, 1048576],
+      "producer_concurrency": [1, 8, 32],
+      "repetitions_after_warmup": 5,
+      "small_batches": 4096,
+      "medium_batches": 1024,
+      "large_batches": 128
+    },
+    "largest_append_throughput_regression_percent": 1.5548965368629153,
+    "largest_append_p99_regression_percent": 2.7845861470722433,
+    "largest_fetch_throughput_regression_percent": 1.7345841434737275,
+    "largest_fetch_p99_regression_percent": 4.385964912280693,
+    "result": "pass"
+  },
+  "waiters": {
+    "scheduler_tasks": 1,
+    "waiter_handle_bytes": 32,
+    "targeted_wakeup_microseconds_at_100000": 8,
+    "targeted_wakeup_count_at_100000": 1,
+    "remaining_after_targeted_wakeup_at_100000": 99999,
+    "result": "pass"
+  },
+  "correctness_commands": [
+    "cargo test -p pepper-buffer -p pepper-extent -p pepper-ordered-log -p pepper-kafka",
+    "cargo test -p pepper-config",
+    "cargo check -p pepper-agent",
+    "cargo fmt --all -- --check",
+    "cargo test --workspace"
+  ],
+  "correctness": {
+    "long_poll_wakeup_and_timeout": "pass",
+    "100000_waiter_targeting_and_cleanup": "pass",
+    "physical_retention_and_reopen": "pass",
+    "replica_offline_catchup": "pass",
+    "reassignment": "pass",
+    "rolling_restart": "pass",
+    "hot_and_cold_partition_quota_isolation": "pass",
+    "zero_protocol_payload_copy_counter": 0
+  }
+}

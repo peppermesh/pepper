@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "pepper-phase0-local-smoke"
+environment_label = "developer host; correctness and artifact-schema smoke only"
+
+[[cases]]
+name = "kafka-model"
+product = "model"
+command = ["cargo", "run", "-q", "-p", "pepper-kafka-model", "--bin", "model-check"]
+repetitions = 1
+timeout_seconds = 120
+required_stdout = ['"result": "pass"']
+
+[[cases]]
+name = "native-storage"
+product = "storage"
+command = ["cargo", "test", "-q", "-p", "pepper-storage", "tests::native_group_commit_uses_one_barrier_per_device", "--", "--exact"]
+repetitions = 3
+timeout_seconds = 300
+required_stdout = ["1 passed"]
+
+[[cases]]
+name = "consensus-batching"
+product = "consensus"
+command = ["cargo", "test", "-q", "-p", "pepper-consensus", "tests::consensus_command_uses_uniform_batch_wire_shape", "--", "--exact"]
+repetitions = 3
+timeout_seconds = 300
+required_stdout = ["1 passed"]
