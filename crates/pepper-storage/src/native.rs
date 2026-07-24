@@ -10,6 +10,10 @@
 
 use super::*;
 use pepper_config::NativeStorageConfig;
+use pepper_durability::{
+    BarrierTarget, DeviceId, DurabilityRequest as SchedulerRequest, DurabilityScheduler,
+    OrderingKey, SchedulerConfig,
+};
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     collections::{BTreeMap, HashMap, HashSet},
@@ -17,7 +21,7 @@ use std::{
     io,
     ptr::NonNull,
     sync::{RwLock, Weak, mpsc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(target_os = "linux")]
@@ -165,15 +169,9 @@ struct NativeInner {
     next_segment_id: AtomicU64,
     live_bytes: AtomicU64,
     dead_bytes: AtomicU64,
-    #[cfg(test)]
     device_barriers: Arc<AtomicU64>,
-    durability: mpsc::SyncSender<DurabilityRequest>,
+    durability: DurabilityScheduler,
     allocated_by_location: Vec<AtomicU64>,
-}
-
-struct DurabilityRequest {
-    files: Vec<(i32, Arc<File>)>,
-    result: mpsc::SyncSender<Result<(), String>>,
 }
 
 #[derive(Clone)]
@@ -217,7 +215,16 @@ impl NativeEngine {
         let group_delay = Duration::from_micros(config.group_commit_delay_microseconds);
         let group_max = config.group_commit_max_requests;
         let queue_depth = group_max.saturating_mul(4).max(1);
-        let (durability, durability_receiver) = mpsc::sync_channel(queue_depth);
+        let durability = DurabilityScheduler::start(
+            format!("pepper-{thread_name}-durability"),
+            SchedulerConfig {
+                maximum_group_delay: group_delay,
+                maximum_batch_bytes: config.segment_bytes.saturating_mul(group_max as u64).max(1),
+                maximum_requests: group_max,
+                queue_depth,
+            },
+        )
+        .map_err(|error| StorageError::Native(error.to_string()))?;
         let device_barriers = Arc::new(AtomicU64::new(0));
         let inner = Arc::new(NativeInner {
             locations,
@@ -229,19 +236,12 @@ impl NativeEngine {
             next_segment_id: AtomicU64::new(1),
             live_bytes: AtomicU64::new(0),
             dead_bytes: AtomicU64::new(0),
-            #[cfg(test)]
             device_barriers: Arc::clone(&device_barriers),
             durability,
             allocated_by_location: (0..location_count).map(|_| AtomicU64::new(0)).collect(),
         });
         inner.recover()?;
         inner.sync_segment_directories()?;
-        std::thread::Builder::new()
-            .name(format!("pepper-{thread_name}-durability"))
-            .spawn(move || {
-                durability_loop(durability_receiver, group_delay, group_max, device_barriers)
-            })
-            .map_err(|error| StorageError::Native(error.to_string()))?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -730,23 +730,41 @@ impl NativeInner {
     }
 
     fn durability_barrier(&self, staged: &[(usize, RecordLocation)]) -> Result<(), StorageError> {
-        let mut files = BTreeMap::<i32, Arc<File>>::new();
+        let mut devices = BTreeMap::<u64, Arc<File>>::new();
         for (_, record) in staged {
-            files
-                .entry(record.segment.file.as_raw_fd())
+            let device = record
+                .segment
+                .file
+                .metadata()
+                .map_err(|source| StorageError::Io {
+                    path: record.segment.path.display().to_string(),
+                    source,
+                })?
+                .dev();
+            devices
+                .entry(device)
                 .or_insert_with(|| record.segment.file.clone());
         }
-        let (result, receiver) = mpsc::sync_channel(1);
-        self.durability
-            .send(DurabilityRequest {
-                files: files.into_iter().collect(),
-                result,
+        let targets = devices
+            .into_iter()
+            .map(|(device, file)| {
+                Arc::new(NativeDeviceBarrier {
+                    device: DeviceId(device),
+                    file,
+                    device_barriers: Arc::clone(&self.device_barriers),
+                }) as Arc<dyn BarrierTarget>
             })
-            .map_err(|_| StorageError::Native("durability coordinator stopped".to_string()))?;
-        receiver
-            .recv()
-            .map_err(|_| StorageError::Native("durability coordinator stopped".to_string()))?
-            .map_err(StorageError::Native)
+            .collect();
+        let bytes = staged.iter().map(|(_, record)| record.padded_size).sum();
+        let mut request = SchedulerRequest::local_durable(OrderingKey(0), bytes, targets);
+        request.maximum_group_delay =
+            Duration::from_micros(self.config.group_commit_delay_microseconds);
+        self.durability
+            .submit(request)
+            .map(|_| {
+                NATIVE_DURABILITY_GROUP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            })
+            .map_err(|error| StorageError::Native(error.to_string()))
     }
 
     fn read_record(&self, record: &RecordLocation) -> Result<Vec<u8>, StorageError> {
@@ -1140,59 +1158,34 @@ impl NativeInner {
     }
 }
 
-fn durability_loop(
-    receiver: mpsc::Receiver<DurabilityRequest>,
-    delay: Duration,
-    maximum_requests: usize,
+struct NativeDeviceBarrier {
+    device: DeviceId,
+    file: Arc<File>,
     device_barriers: Arc<AtomicU64>,
-) {
-    while let Ok(first) = receiver.recv() {
-        let mut requests = vec![first];
-        let deadline = Instant::now() + delay;
-        let mut disconnected = false;
-        while requests.len() < maximum_requests {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match receiver.recv_timeout(remaining) {
-                Ok(request) => requests.push(request),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
-        let mut files = BTreeMap::<i32, Arc<File>>::new();
-        for request in &requests {
-            for (descriptor, file) in &request.files {
-                files.entry(*descriptor).or_insert_with(|| Arc::clone(file));
-            }
-        }
-        let outcome = sync_native_files(files.into_values(), &device_barriers);
-        if outcome.is_ok() {
-            NATIVE_DURABILITY_GROUPS.fetch_add(1, Ordering::Relaxed);
-            NATIVE_DURABILITY_GROUP_REQUESTS.fetch_add(requests.len() as u64, Ordering::Relaxed);
-        }
-        for request in requests {
-            let _ = request.result.send(outcome.clone());
-        }
-        if disconnected {
-            break;
-        }
-    }
 }
 
-fn sync_native_files(
-    files: impl IntoIterator<Item = Arc<File>>,
-    device_barriers: &AtomicU64,
-) -> Result<(), String> {
-    for file in files {
-        file.sync_data()
-            .map_err(|error| format!("native segment data sync failed: {error}"))?;
+impl BarrierTarget for NativeDeviceBarrier {
+    fn device_id(&self) -> DeviceId {
+        self.device
     }
-    device_barriers.fetch_add(1, Ordering::Relaxed);
-    NATIVE_DURABILITY_BARRIERS.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+
+    fn description(&self) -> &str {
+        "native-segment-device"
+    }
+
+    fn barrier(&self) -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        rustix::fs::syncfs(&self.file)
+            .map_err(|error| format!("native device sync failed: {error}"))?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        self.file
+            .sync_data()
+            .map_err(|error| format!("native segment sync failed: {error}"))?;
+        self.device_barriers.fetch_add(1, Ordering::Relaxed);
+        NATIVE_DURABILITY_BARRIERS.fetch_add(1, Ordering::Relaxed);
+        NATIVE_DURABILITY_GROUPS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 fn compactor_loop(inner: Weak<NativeInner>, receiver: mpsc::Receiver<()>) {

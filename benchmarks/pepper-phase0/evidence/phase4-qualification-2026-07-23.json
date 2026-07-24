@@ -1,0 +1,328 @@
+{
+  "schema_version": 1,
+  "classification": "phase4-generic-commit-engine-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "phase3_agent_binary_sha256": "9dfa0e4c6baf043efa6492366d0cf766c564a997bd4d3e932098e86772e28435",
+  "phase4_agent_binary_sha256": "6fd235411d199ea1f3d4b01a7fcb796e32b87aff64f99ae5ae989d5fc0b0856d",
+  "phase4_sqlite_benchmark_binary_sha256": "e2e7e4dc3c7c3c41c9e4bb6c1a2f57f0ee00d5a70ccab96ca1b75116aaf9f82f",
+  "cargo_lock_sha256": "7e3844249c0866119c1c3492e40d7e52040a85c6021702fc753ae2a2739a2cde",
+  "working_tree_diff_sha256": "00c6fd8dec288276402e8ab7502dcbf1a8055fc4723459fe009554fe357a567d",
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "topology": "three local Pepper peers, replication factor 3, eight S3 owner workers per peer",
+    "comparison_method": "the exact qualified Phase 3 agent binary and the Phase 4 agent ran sequentially on the same host and ports from independent byte copies of one quiesced state"
+  },
+  "predeclared_budget": {
+    "s3_median_throughput_regression_percent": 5.0,
+    "s3_median_p99_regression_percent": 5.0,
+    "sqlite_aggregate_write_elapsed_regression_percent": 5.0,
+    "sqlite_reopen_elapsed_regression_percent": 5.0,
+    "sqlite_submillisecond_p99_regression_percent": 15.0,
+    "sqlite_submillisecond_p99_absolute_allowance_microseconds": 250.0,
+    "sqlite_low_sample_p99_regression_percent": 25.0,
+    "correctness_failure_tolerance": 0,
+    "ordinary_success_extra_durability_calls": 0,
+    "ordinary_success_extra_durability_barriers": 0,
+    "ordinary_success_result_lookups": 0
+  },
+  "s3": {
+    "configuration": {
+      "operation": "put",
+      "payload_bytes": 4096,
+      "concurrency": 8,
+      "duration_seconds": 60,
+      "object_count": 1024,
+      "repetitions": 5
+    },
+    "phase3": {
+      "operations_per_second": [
+        29.23811631002916,
+        17.444116087448577,
+        13.657386301461463,
+        11.550323460973877,
+        10.079325433762651
+      ],
+      "p99_milliseconds": [
+        668.783,
+        1083.569,
+        1374.024,
+        1510.388,
+        1591.287
+      ],
+      "median_operations_per_second": 13.657386301461463,
+      "median_p99_milliseconds": 1374.024,
+      "successes": 4953,
+      "failures": 0
+    },
+    "phase4": {
+      "operations_per_second": [
+        29.45111189010882,
+        17.52200443554469,
+        13.663067970824486,
+        11.449586477212467,
+        9.91610199995255
+      ],
+      "p99_milliseconds": [
+        723.988,
+        1041.608,
+        1196.275,
+        1610.803,
+        1789.517
+      ],
+      "median_operations_per_second": 13.663067970824486,
+      "median_p99_milliseconds": 1196.275,
+      "successes": 4953,
+      "failures": 0
+    },
+    "throughput_regression_percent": -0.041601439965,
+    "p99_regression_percent": -12.936382479491,
+    "passes": true
+  },
+  "sqlite": {
+    "configuration": {
+      "page_size": 4096,
+      "seed_rows": 10000,
+      "payload_bytes": 256,
+      "point_reads": 2000,
+      "scans": 3,
+      "reopen_reads": 25,
+      "transactions_per_batch": 10,
+      "batch_sizes": [
+        1,
+        10,
+        100,
+        1000
+      ],
+      "journal_mode": "DELETE",
+      "synchronous": "FULL",
+      "repetitions": 5
+    },
+    "final_isolated_comparison": [
+      {
+        "workload": "insert_autocommit_1",
+        "samples_per_repetition": 10,
+        "phase3_median_elapsed_seconds": 0.527037682,
+        "phase4_median_elapsed_seconds": 0.508896417,
+        "elapsed_regression_percent": -3.442119153826,
+        "phase3_median_p99_microseconds": 55705.769,
+        "phase4_median_p99_microseconds": 58395.94,
+        "p99_regression_percent": 4.829250270291,
+        "passes": true
+      },
+      {
+        "workload": "insert_transaction_10",
+        "samples_per_repetition": 10,
+        "phase3_median_elapsed_seconds": 0.565022015,
+        "phase4_median_elapsed_seconds": 0.518689762,
+        "elapsed_regression_percent": -8.20007924824,
+        "phase3_median_p99_microseconds": 82127.304,
+        "phase4_median_p99_microseconds": 55842.379,
+        "p99_regression_percent": -32.005099059382,
+        "passes": true
+      },
+      {
+        "workload": "insert_transaction_100",
+        "samples_per_repetition": 10,
+        "phase3_median_elapsed_seconds": 0.56099657,
+        "phase4_median_elapsed_seconds": 0.574495711,
+        "elapsed_regression_percent": 2.406278705055,
+        "phase3_median_p99_microseconds": 62064.467,
+        "phase4_median_p99_microseconds": 65275.625,
+        "p99_regression_percent": 5.173907318015,
+        "passes": true
+      },
+      {
+        "workload": "insert_transaction_1000",
+        "samples_per_repetition": 10,
+        "phase3_median_elapsed_seconds": 0.685488301,
+        "phase4_median_elapsed_seconds": 0.682847831,
+        "elapsed_regression_percent": -0.385195487093,
+        "phase3_median_p99_microseconds": 78748.927,
+        "phase4_median_p99_microseconds": 74851.26,
+        "p99_regression_percent": -4.949485851407,
+        "passes": true
+      },
+      {
+        "workload": "point_read_connection_cache",
+        "samples_per_repetition": 2000,
+        "phase3_median_elapsed_seconds": 0.001647004,
+        "phase4_median_elapsed_seconds": 0.001600454,
+        "elapsed_regression_percent": -2.826344076881,
+        "phase3_median_p99_microseconds": 0.98,
+        "phase4_median_p99_microseconds": 0.95,
+        "p99_regression_percent": -3.061224489796,
+        "passes": true
+      },
+      {
+        "workload": "point_read_reopen",
+        "samples_per_repetition": 25,
+        "phase3_median_elapsed_seconds": 0.195518806,
+        "phase4_median_elapsed_seconds": 0.204443934,
+        "elapsed_regression_percent": 4.564843752166,
+        "phase3_median_p99_microseconds": 9984.605,
+        "phase4_median_p99_microseconds": 11021.731,
+        "p99_regression_percent": 10.387251173181,
+        "passes": true
+      },
+      {
+        "workload": "sequential_scan_connection_cache",
+        "samples_per_repetition": 3,
+        "phase3_median_elapsed_seconds": 0.001205186,
+        "phase4_median_elapsed_seconds": 0.001221016,
+        "elapsed_regression_percent": 1.313490199853,
+        "phase3_median_p99_microseconds": 424.739,
+        "phase4_median_p99_microseconds": 431.559,
+        "p99_regression_percent": 1.605691966125,
+        "p99_delta_microseconds": 6.82,
+        "passes": true
+      }
+    ],
+    "aggregate_write_elapsed_seconds": {
+      "phase3": 2.338544568,
+      "phase4": 2.284929721,
+      "regression_percent": -2.2926587645,
+      "passes": true
+    },
+    "integrity_checks": {
+      "phase3_ok": 5,
+      "phase4_ok": 5,
+      "failures": 0
+    },
+    "investigation_record": {
+      "initial_combined_run": {
+        "result": "failed_noise_gate",
+        "phase3_reopen_elapsed_seconds": 1.250096275,
+        "phase4_reopen_elapsed_seconds": 1.330173439,
+        "reopen_regression_percent": 6.4057,
+        "phase3_scan_p99_microseconds": 393.859,
+        "phase4_scan_p99_microseconds": 649.278,
+        "scan_p99_delta_microseconds": 255.419,
+        "note": "The SQLite matrix followed ten minutes of S3 load and failed both the 5% reopen gate and the 250 microsecond absolute small-cell allowance."
+      },
+      "isolated_pre_fix_run": {
+        "result": "confirmed_regression",
+        "phase3_reopen_elapsed_seconds": 0.195518806,
+        "phase4_reopen_elapsed_seconds": 0.205936608,
+        "reopen_regression_percent": 5.3283
+      },
+      "fix": "UnixSocketBackend now pools up to eight successfully negotiated Unix streams, eliminating one reconnect and Hello exchange per local-protocol operation.",
+      "final_run": "five fresh Phase 4 repetitions after the transport fix, compared with the five isolated Phase 3 repetitions"
+    },
+    "passes": true
+  },
+  "commit_engine": {
+    "ordinary_success": {
+      "prepared": 2225,
+      "staged": 2225,
+      "durable": 2225,
+      "proposed": 2225,
+      "reconciled": 2225,
+      "finalized": 2225,
+      "ambiguous": 0,
+      "recovered": 0,
+      "result_lookups_in_unit_test": 0
+    },
+    "contract_tests": {
+      "ordinary_success_skips_result_lookup": "pass",
+      "ambiguous_result_reconstruction": "pass",
+      "bounded_independent_batch": "pass",
+      "clear_failure_cleanup": "pass",
+      "all_transition_faults_retry_deterministically": "pass"
+    },
+    "path_audit": {
+      "product_payload_bytes_enter_consensus": false,
+      "ordinary_success_adds_durability_establishment_call": false,
+      "ordinary_success_adds_durability_barrier": false,
+      "ordinary_success_adds_linearizable_result_lookup": false,
+      "lookup_is_restricted_to_ambiguous_proposal_outcome": true,
+      "existing_namespace_durability_policy_preserved": true
+    },
+    "passes": true
+  },
+  "implementation_validation": [
+    {
+      "command": "cargo test -q -p pepper-commit",
+      "result": "pass",
+      "tests": 5
+    },
+    {
+      "command": "cargo test -q -p pepper-sqlite-vfs",
+      "result": "pass",
+      "tests": 8
+    },
+    {
+      "command": "cargo test -q -p pepper-namespace",
+      "result": "pass",
+      "tests": 16
+    },
+    {
+      "command": "cargo test -q -p pepper-publication",
+      "result": "pass",
+      "tests": 2
+    },
+    {
+      "command": "cargo test -q -p pepper-agent --bin pepper-agent",
+      "result": "pass",
+      "tests": 47
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -q --workspace",
+      "result": "pass"
+    }
+  ],
+  "raw_artifacts": {
+    "phase3_s3": {
+      "s3-1.json": "f69991ee13b2b42b7d51a8121530c95b8d5e230c748caa44d6c2176d5edf24bf",
+      "s3-2.json": "41f29d961ff9b87033ad6c79608b8b92fe01893ed712652dae5fed45bd7ee312",
+      "s3-3.json": "e1f452fdf29a15cff1c896b86cff95ef3315d9dd95dddcb9d74c6db67c2d4db8",
+      "s3-4.json": "195e91d54d74dfb84ee20af544a3962b11bec5c42a35bf0272514c6a2f279a1a",
+      "s3-5.json": "0f4b8293e27d1822cd4a72c7fa64f512d7fa248bf8c2a358b6590102ff18162e",
+      "metrics-before.prom": "f34f460c54a226121de916374a4bbbe741ef7d6e37a0ac3215ec46dab7f68859",
+      "metrics-after.prom": "97d030f59e40d487df6d546e69992b085d0cb75265bed8065fa9b0b2c69a0273"
+    },
+    "phase4_s3": {
+      "s3-1.json": "578a19a330765fcf4c195b4df6a4cdd385e2af4a0b8064a2c2e04f9d50c7e0b3",
+      "s3-2.json": "2f7cc1c21af1dcf4dd83974d8df67547ad5d2018fde1bc6cf45efe7c14fa8417",
+      "s3-3.json": "432aac3cda5bad7ff01a353c37a835f82409f111fed1aecf6ff56694e336864a",
+      "s3-4.json": "373d7dbf2a199c05667ddecc1ea34be5f329c0736c39735a02f7e3010563f6eb",
+      "s3-5.json": "bce080df6bf5a0e02a2486309f43d8f38c7b51a88c9e04bfca2178f676dab8ee",
+      "metrics-before.prom": "6c6f6a48264c8bba151e6ba281410549e7f31feb139afc105ad2d319c757707f",
+      "metrics-after.prom": "b8eeddd57a1773ac1f6335b851ddb49a67d469f3971feef2ca8fe5efd459354d"
+    },
+    "phase3_sqlite_isolated": {
+      "sqlite-1.json": "3946e189c7fe361b150aded93ac16cdfb8863ca98d87dca60aab8a2a2eec72cd",
+      "sqlite-2.json": "e9a34dd581f64f756146f75c3f98cbc3fe403dc786ec38ff1ca3f6ada6394ddf",
+      "sqlite-3.json": "8997c74045da0f001ae2e68e06c544e6fbd21e1af2f7efd75183f7a2bc5590e6",
+      "sqlite-4.json": "96a80e12d77dbe541fdb4b26fc97326175b4fb35ffbf6800e3262215c1d07b6a",
+      "sqlite-5.json": "17a9c36458b6e36ee3f6884b288cc0e6df3cf83e4b8ed77927aaa64287510e0c"
+    },
+    "phase4_sqlite_isolated_after_fix": {
+      "sqlite-1.json": "c8a4ad8a0f95ff8d0c154c6b2806f3cd37e355c28be1b40afabdf5a7e500019a",
+      "sqlite-2.json": "a459643e72895e9b11c688e402d93a558b9f8c28ea35eee20fada9ad9f3ab01f",
+      "sqlite-3.json": "bf40dd91d7dea62b81ea128d4811494f1879a1544bcb61eedbbc2815135480e1",
+      "sqlite-4.json": "53b6ea1c3365e1a97f82226875da4f4cb84b27066505a0dce6e8950e01506cce",
+      "sqlite-5.json": "2e737b6e0146d61ddcdb2d6aae36b78c5e1c00b0c864223d80463cba227e1aa5"
+    }
+  },
+  "limitations": [
+    "The generic engine deliberately delegates command semantics, durability policy, and exact result reconstruction to product adapters.",
+    "An unresolved ambiguous proposal follows the existing namespace policy and releases staging; callers resolve committed intent through the replicated idempotency record on retry.",
+    "The bounded batch API runs independent workflows concurrently; consensus command coalescing remains the responsibility of the existing proposal batcher.",
+    "The S3 and SQLite runs are local-host qualification cells, not an external Kafka parity claim.",
+    "Large raw reports and Prometheus captures remain under target; their hashes, aggregates, failed diagnostic run, and final gate decision are tracked here."
+  ],
+  "gate": {
+    "phase4_complete": true,
+    "decision": "pass"
+  }
+}

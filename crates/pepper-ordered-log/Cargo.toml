@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-ordered-log"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Product-neutral replicated ordered-log engine for Pepper"
+
+[dependencies]
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+pepper-buffer = { path = "../pepper-buffer", version = "0.3.0" }
+pepper-extent = { path = "../pepper-extent", version = "0.3.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = "3.23"

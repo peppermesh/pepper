@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "classification": "phase1-shared-observability-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "implementation": {
+    "crate": "crates/pepper-observability",
+    "operation_id_header": "x-pepper-operation-id",
+    "workload_classes": 11,
+    "cost_metrics": 16,
+    "metric_series": 176,
+    "operation_stages": 9,
+    "fault_boundaries": 10
+  },
+  "validation": [
+    {
+      "command": "cargo test -q -p pepper-observability",
+      "result": "pass",
+      "tests_passed": 6,
+      "tests_ignored": 1
+    },
+    {
+      "command": "cargo test -q -p pepper-agent operation_identity_tests",
+      "result": "pass",
+      "tests_passed": 2
+    },
+    {
+      "command": "cargo test -q -p pepper-publication",
+      "result": "pass",
+      "tests_passed": 2
+    },
+    {
+      "command": "cargo test -q -p pepper-storage",
+      "result": "pass",
+      "tests_passed": 34
+    },
+    {
+      "command": "cargo test -q -p pepper-network",
+      "result": "pass",
+      "tests_passed": 11
+    },
+    {
+      "command": "cargo check -q -p pepper-storage -p pepper-network -p pepper-consensus -p pepper-publication -p pepper-agent",
+      "result": "pass"
+    },
+    {
+      "command": "PEPPER_OBSERVABILITY_OVERHEAD_ITERATIONS=1000 PEPPER_OBSERVABILITY_OVERHEAD_TRIALS=7 cargo test --release -q -p pepper-observability tests::phase1_observability_overhead -- --ignored --exact --nocapture",
+      "result": "pass",
+      "throughput_overhead_percent": 0.05862732145125196,
+      "p99_overhead_percent": 0.0
+    }
+  ],
+  "flow_coverage": [
+    "s3_put",
+    "filesystem_commit",
+    "sqlite_commit",
+    "kafka_produce"
+  ],
+  "boundaries": [
+    "storage_before",
+    "storage_after",
+    "replication_before",
+    "replication_after",
+    "durability_before",
+    "durability_after",
+    "publication_before",
+    "publication_after",
+    "state_application_before",
+    "state_application_after"
+  ],
+  "gate": {
+    "cross_product_identity_and_cost_attribution": true,
+    "bounded_metric_cardinality": true,
+    "all_fault_boundaries_tested": true,
+    "observability_overhead_below_3_percent": true,
+    "phase_complete": true
+  },
+  "limitations": [
+    "The four-flow full-stage test uses the shared instrumentation contract directly; product-specific HTTP and storage/network/publication wiring is separately compiled and unit tested.",
+    "The overhead cell isolates the shared observability path around a 1 MiB data-plane operation and is not an end-to-end product release benchmark.",
+    "Fault injection is an in-process scoped test mechanism in Phase 1; operator-facing controls are deferred to release hardening."
+  ]
+}

@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "classification": "phase2-owned-buffer-extent-durability-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "base_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "cargo_lock_sha256": "cfc4e1b62c6ac8098162993a62ab8825af132e53e1f20707488b81facf6fab3e",
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "source_snapshot_tree_sha256": "57ea69c660bd734614a60fe5cb7360ccf5f589b2e7b7a9486d62bfd12995052b",
+    "topology": "three local Pepper peers, replication factor 3",
+    "comparison_method": "base and current clusters started sequentially from independent byte copies of one quiesced source snapshot"
+  },
+  "predeclared_budget": {
+    "s3_median_throughput_regression_percent": 5.0,
+    "s3_median_p99_regression_percent": 5.0,
+    "sqlite_write_and_reopen_elapsed_regression_percent": 5.0,
+    "sqlite_submillisecond_p99_regression_percent": 15.0,
+    "sqlite_submillisecond_absolute_allowance_microseconds": 250.0,
+    "sqlite_fewer_than_100_samples_p99_regression_percent": 25.0,
+    "correctness_failure_tolerance": 0
+  },
+  "s3": {
+    "configuration": {
+      "operation": "put",
+      "payload_bytes": 4096,
+      "concurrency": 8,
+      "duration_seconds": 60,
+      "object_count": 1024,
+      "repetitions": 5
+    },
+    "base": {
+      "median_operations_per_second": 2.7985178421296792,
+      "median_p50_milliseconds": 564.741,
+      "median_p99_milliseconds": 10831.094,
+      "successes": 872,
+      "failures": 0
+    },
+    "phase2": {
+      "median_operations_per_second": 2.7497277015358743,
+      "median_p50_milliseconds": 559.501,
+      "median_p99_milliseconds": 10459.146,
+      "successes": 852,
+      "failures": 0
+    },
+    "throughput_regression_percent": 1.7434278909823033,
+    "p99_regression_percent": -3.4340760037720894,
+    "passes": true
+  },
+  "sqlite": {
+    "configuration": {
+      "page_size": 4096,
+      "seed_rows": 10000,
+      "point_reads": 2000,
+      "reopen_reads": 25,
+      "batch_sizes": [1, 10, 100, 1000],
+      "transactions_per_batch": 10,
+      "repetitions": 5
+    },
+    "integrity": {
+      "base_reports_ok": 5,
+      "phase2_reports_ok": 5,
+      "failures": 0
+    },
+    "median_write_workload_total_seconds": {
+      "base": 26.536353169,
+      "phase2": 26.456551026,
+      "regression_percent": -0.30072761879438487
+    },
+    "cells": [
+      {
+        "name": "insert_autocommit_1",
+        "samples": 10,
+        "elapsed_regression_percent": -1.0633728251686059,
+        "p99_regression_percent": -10.272230730916679,
+        "passes": true
+      },
+      {
+        "name": "insert_transaction_10",
+        "samples": 10,
+        "elapsed_regression_percent": -1.208603578123205,
+        "p99_regression_percent": -9.017229568243998,
+        "passes": true
+      },
+      {
+        "name": "insert_transaction_100",
+        "samples": 10,
+        "elapsed_regression_percent": -1.0731784572493777,
+        "p99_regression_percent": -3.615593798391496,
+        "passes": true
+      },
+      {
+        "name": "insert_transaction_1000",
+        "samples": 10,
+        "elapsed_regression_percent": 1.2594064406684278,
+        "p99_regression_percent": 11.478125404571028,
+        "passes": true
+      },
+      {
+        "name": "point_read_connection_cache",
+        "samples": 2000,
+        "base_p99_microseconds": 0.86,
+        "phase2_p99_microseconds": 0.93,
+        "p99_regression_percent": 8.139534883720925,
+        "absolute_regression_microseconds": 0.07,
+        "passes": true
+      },
+      {
+        "name": "point_read_reopen",
+        "samples": 25,
+        "elapsed_regression_percent": -2.0351661667639225,
+        "p99_regression_percent": -25.258402382947594,
+        "passes": true
+      },
+      {
+        "name": "sequential_scan_connection_cache",
+        "samples": 3,
+        "base_p99_microseconds": 650.427,
+        "phase2_p99_microseconds": 669.498,
+        "p99_regression_percent": 2.9320738530227106,
+        "absolute_regression_microseconds": 19.071,
+        "passes": true
+      }
+    ],
+    "passes": true
+  },
+  "implementation_validation": [
+    {
+      "command": "cargo test -q --workspace",
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -q -p pepper-buffer -p pepper-durability -p pepper-extent -p pepper-storage",
+      "result": "pass",
+      "phase2_tests": {
+        "buffer": 3,
+        "durability": 3,
+        "extent": 4,
+        "storage": 35
+      }
+    },
+    {
+      "command": "cargo check -q -p pepper-network -p pepper-agent",
+      "result": "pass"
+    }
+  ],
+  "raw_artifacts": {
+    "base": {
+      "s3-1.json": "fb93cb84001c58ebc629e20c5f12a92a3158bc61ae57aea5d45d9f2ba4c059af",
+      "s3-2.json": "86695965ddb22ed8a073f5fe599213b9f76aae00814b52d5984985c96c94ea6b",
+      "s3-3.json": "19edb55bb9493d32aec0a795dfebb2ebf3107e9d3ba39768ec3ac5d0dcd5db94",
+      "s3-4.json": "8db95b6fee17e34b35a26851c0a3c0637b1830abc5ebf85e0ce700d8ff0b3518",
+      "s3-5.json": "f7c92639be4ce84461f7feab9a1f71015bfd577377fd8026a6dcc12273356c0c",
+      "sqlite-1.json": "569417597f53cf0a6257d21f72d186f7a8a5b64b727edcc0bd6735541dc0cd8a",
+      "sqlite-2.json": "29f02fb7f75398ff6003dc400110c18cdbe85cda1794639b7aca9e4d70587467",
+      "sqlite-3.json": "db970716674a63af55cef73162907fed552928157a4e3a37dc5f6749f730bbd9",
+      "sqlite-4.json": "be6beec0d4b9f0b13a30a87a0afd870a8f84e22d90a795636df7354d9e893fee",
+      "sqlite-5.json": "4fc33b1ea11b314229adc899f7f47feaed10f27347a47e46ebf61f787da7a944"
+    },
+    "phase2": {
+      "s3-1.json": "ec2285b67f857e56663e9f34e2dd1fe218793daa3d8d34978c011be46f94c2dc",
+      "s3-2.json": "c185c4d93630aa9a9c85eb6a0a6cae2661808980fd94d48adcc72c966da2f0af",
+      "s3-3.json": "b0ab74011ee4b274608689d1bbec4805e59c6bdf1170803664800f3092167422",
+      "s3-4.json": "519b826cc4904ad61dfe44f5c35d932e0f9e72a5ba37e8e3c3853638ffb264c9",
+      "s3-5.json": "14699a8b958facce5931d2ce4c2146479cefd4481dad38746b086899a7ebd2f6",
+      "sqlite-1.json": "bbb3f33b0333333e025340d138dcb65ea01f6628996e20442cba7dadfcdbefcc",
+      "sqlite-2.json": "4294128f1db74e95c83a0df7ef7f6835b2d9a849eac8087290ebe182d4d42bdf",
+      "sqlite-3.json": "42a937a8ea3391b9f0801f24a4bd488a8c377468f91c2944c8deed7141ede771",
+      "sqlite-4.json": "6d3e61cd402d8f7074f0211702f4bf8f27c3afd0cf42202d11a04790ea102997",
+      "sqlite-5.json": "892371ded799fda3c2930de60a2881b32a2617aaa7e69b2287fc3364b8eaf1b0"
+    },
+    "location": "target/phase2-qualification-rerun/{base,current}/artifacts"
+  },
+  "gate": {
+    "one_payload_allocation_or_borrowed_chain": true,
+    "shared_device_barrier": true,
+    "block_golden_and_recovery_unchanged": true,
+    "torn_tail_never_exposed": true,
+    "s3_non_regression": true,
+    "sqlite_non_regression": true,
+    "phase_complete": true
+  },
+  "limitations": [
+    "The long-lived source snapshot retains the pre-existing S3 catalog-growth slowdown; the byte-identical A/B isolates regression but does not claim release-level absolute throughput.",
+    "The product-neutral extent engine is a new versioned format. Existing native block segments remain readable through their compatibility engine and are not rewritten in place.",
+    "Direct I/O remains implemented by the legacy native block engine; the generic extent store hides alignment with buffered vectored I/O in Phase 2.",
+    "Raw benchmark reports remain under target because they include large metric snapshots; every report is content-addressed above."
+  ]
+}

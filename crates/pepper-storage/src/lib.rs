@@ -5,6 +5,9 @@ mod native;
 use fs2::FileExt;
 use pepper_config::{SmallObjectPackConfig, StorageConfig, StorageEngine, StorageLocationConfig};
 use pepper_metadata::MetadataStore;
+use pepper_observability::{
+    CostMetric as OperationCostMetric, OperationStage, add_current_cost, observe_current_stage,
+};
 use pepper_types::{
     Block, BlockStatResponse, CODEC_BUCKET_OBJECT, CODEC_MERKLE_NODE, CODEC_NAMESPACE_CHECKPOINT,
     CODEC_NAMESPACE_COMMIT, CODEC_NAMESPACE_DESCRIPTOR, CODEC_RAW, CODEC_SMALL_OBJECT, Cid, Codec,
@@ -859,6 +862,10 @@ impl BlockStore {
             }
             PROCESS_DATA_DURABILITY_BARRIERS.fetch_add(data_files, Ordering::Relaxed);
             PROCESS_DATA_FILES_DURABLE.fetch_add(data_files, Ordering::Relaxed);
+            if data_files > 0 {
+                observe_current_stage(OperationStage::Durability);
+                add_current_cost(OperationCostMetric::DurabilityBarriers, data_files);
+            }
         }
         for block in &mut prepared {
             drop(block.temp_file.take());
@@ -949,6 +956,13 @@ impl BlockStore {
             }
             PROCESS_DATA_DURABILITY_BARRIERS.fetch_add(filesystems.len() as u64, Ordering::Relaxed);
             PROCESS_DATA_FILES_DURABLE.fetch_add(data_files, Ordering::Relaxed);
+            if !filesystems.is_empty() {
+                observe_current_stage(OperationStage::Durability);
+                add_current_cost(
+                    OperationCostMetric::DurabilityBarriers,
+                    filesystems.len() as u64,
+                );
+            }
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         for parent in changed_parents {
@@ -959,6 +973,8 @@ impl BlockStore {
                     source,
                 })?;
             PROCESS_DIRECTORY_DURABILITY_BARRIERS.fetch_add(1, Ordering::Relaxed);
+            observe_current_stage(OperationStage::Durability);
+            add_current_cost(OperationCostMetric::DurabilityBarriers, 1);
         }
         let metas = prepared
             .iter()
@@ -3248,6 +3264,67 @@ mod tests {
 
         assert_eq!(puts.len(), blocks.len());
         assert_eq!(engine.device_barriers() - before, 1);
+    }
+
+    #[test]
+    fn block_encoding_round_trips_through_product_neutral_extent_adapter() {
+        use pepper_buffer::{BufferChain, OwnedBuffer};
+        use pepper_extent::{
+            AppendPlan, ExtentStore, FileExtentConfig, FileExtentStore, RangeRead, RecordId,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
+        );
+        let block_root = directory.path().join("blocks");
+        fs::create_dir_all(&block_root).unwrap();
+        let store = BlockStore::open(
+            metadata,
+            &[StorageLocationConfig {
+                path: block_root,
+                max_capacity_bytes: 64 * 1024 * 1024,
+            }],
+        )
+        .unwrap();
+        let extent_store = FileExtentStore::open(
+            directory.path().join("extents"),
+            FileExtentConfig::default(),
+        )
+        .unwrap();
+        let extent_id = extent_store.create().unwrap();
+        let logical = incompressible_bytes(128 * 1024);
+        let encoded = store.encode(CODEC_RAW, &logical).unwrap();
+        let cid = encoded.cid().clone();
+        let logical_size = encoded.logical_size_bytes();
+        let encoded_bytes = encoded.into_bytes();
+        let encoded_len = encoded_bytes.len() as u64;
+        let plan = AppendPlan::new(
+            extent_id,
+            RecordId::new(cid.to_string().into_bytes()).unwrap(),
+            BufferChain::from_buffer(OwnedBuffer::from_vec(encoded_bytes)),
+        );
+        let receipt = extent_store.append(plan).unwrap();
+        let recovered = extent_store
+            .read_range(RangeRead {
+                extent_id,
+                record_index: receipt.record_index,
+                offset: 0,
+                length: encoded_len,
+            })
+            .unwrap();
+        let verified = store
+            .validate_encoded_replica(cid.clone(), logical_size, recovered.bytes().to_vec())
+            .unwrap();
+        store.put_encoded(&verified).unwrap();
+        assert_eq!(store.get(&cid).unwrap().payload, logical);
+
+        let mut corrupt = recovered.bytes().to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            store.validate_encoded_replica(cid, logical_size, corrupt),
+            Err(StorageError::HashMismatch(_) | StorageError::InvalidEncodedBlock(_))
+        ));
     }
 
     #[test]

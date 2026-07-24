@@ -4,8 +4,8 @@
 
 use super::*;
 use pepper_filesystem::{
-    FilesystemError, FilesystemLimits, InodeKind, TreeInputEntry, build_tree, diff_trees,
-    flatten_tree, get_inode, get_root,
+    FilesystemError, FilesystemLimits, InodeKind, TreeInputEntry, TreeMutation,
+    apply_tree_mutations, build_tree_prepared, diff_trees, flatten_tree, get_inode, get_root,
 };
 use pepper_namespace::{
     CommandEnvelope, KeyPrecondition, NamespaceCommand, NamespaceKind, NamespaceMutation,
@@ -26,7 +26,10 @@ pub(super) struct FsCreateRequest {
 pub(super) struct FsCommitRequest {
     filesystem: String,
     base_revision: u64,
+    #[serde(default)]
     entries: Vec<TreeInputEntry>,
+    #[serde(default)]
+    mutations: Vec<TreeMutation>,
     #[serde(default = "default_root_mode")]
     root_mode: u32,
     message: Option<String>,
@@ -108,6 +111,8 @@ pub(super) async fn fs_commit(
     State(state): State<AppState>,
     Json(request): Json<FsCommitRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    observe_current_stage(OperationStage::OwnerExecution);
+    let _execution = OperationCostTimer::start(OperationCostMetric::ExecutionMicroseconds);
     let namespace_id = parse_namespace(&state, &request.filesystem)?;
     let namespace_state = namespace_manager(&state)?
         .linearizable_namespace_state(&namespace_id)
@@ -131,22 +136,64 @@ pub(super) async fn fs_commit(
         None => KeyPrecondition::Absent,
     };
     let previous = base_value.map(|value| value.cid);
+    if !request.entries.is_empty() && !request.mutations.is_empty() {
+        return Err(ApiError::bad_request(
+            "filesystem commit accepts either entries or mutations, not both",
+        ));
+    }
     let staged_bytes = request
         .entries
         .iter()
         .map(|entry| entry.logical_size)
+        .chain(
+            request
+                .mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    TreeMutation::Put { entry } => Some(entry.logical_size),
+                    TreeMutation::Delete { .. } => None,
+                }),
+        )
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(|| ApiError::bad_request("filesystem size overflow"))?;
-    let (filesystem_root, descriptor) = build_tree(
-        &state.namespace_data_store,
-        request.entries,
-        namespace_state.current_revision.saturating_add(1),
-        previous,
-        request.root_mode,
-        FilesystemLimits::default(),
-    )
-    .await
+    observe_current_stage(OperationStage::Storage);
+    add_current_cost(OperationCostMetric::StorageBytes, staged_bytes);
+    add_current_cost(
+        OperationCostMetric::StorageOperations,
+        request
+            .entries
+            .len()
+            .saturating_add(request.mutations.len()) as u64,
+    );
+    let build = if request.mutations.is_empty() {
+        build_tree_prepared(
+            &state.namespace_data_store,
+            request.entries,
+            request.base_revision.saturating_add(1),
+            previous,
+            request.root_mode,
+            FilesystemLimits::default(),
+        )
+        .await
+    } else {
+        let base = previous.ok_or_else(|| {
+            ApiError::bad_request("incremental filesystem commit requires an existing root")
+        })?;
+        apply_tree_mutations(
+            &state.namespace_data_store,
+            base,
+            request.mutations,
+            request.base_revision.saturating_add(1),
+            FilesystemLimits::default(),
+        )
+        .await
+    }
     .map_err(filesystem_error)?;
+    // The builder validates the product-level exact base and changed
+    // immutable frontier. Namespace publication independently guards the
+    // authoritative namespace revision/root below.
+    let filesystem_root = build.root_cid;
+    let descriptor = build.descriptor;
     let command = CommandEnvelope {
         request_id: request.request_id,
         writer_identity: "filesystem-http".into(),
@@ -187,6 +234,9 @@ pub(super) async fn fs_checkout(
     State(state): State<AppState>,
     Json(request): Json<FsRevisionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    observe_current_stage(OperationStage::OwnerExecution);
+    observe_current_stage(OperationStage::Storage);
+    let _execution = OperationCostTimer::start(OperationCostMetric::ExecutionMicroseconds);
     let namespace_id = parse_namespace(&state, &request.filesystem)?;
     let root = filesystem_root_for_revision(&state, &namespace_id, request.revision).await?;
     let current_revision = namespace_manager(&state)?

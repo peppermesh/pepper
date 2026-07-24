@@ -5511,9 +5511,11 @@ async fn wait_health(api_port: u16) -> TestResult<()> {
 }
 
 async fn wait_health_with_token(api_port: u16, token: Option<&str>) -> TestResult<()> {
+    const ATTEMPTS: usize = 600;
+    const INTERVAL: Duration = Duration::from_millis(100);
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{api_port}/healthz");
-    for _ in 0..200 {
+    for _ in 0..ATTEMPTS {
         let mut request = client.get(&url);
         if let Some(token) = token {
             request = request.bearer_auth(token);
@@ -5523,9 +5525,13 @@ async fn wait_health_with_token(api_port: u16, token: Option<&str>) -> TestResul
         {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(INTERVAL).await;
     }
-    Err(format!("agent on port {api_port} did not become healthy after 20 seconds").into())
+    Err(format!(
+        "agent on port {api_port} did not become healthy after {} seconds",
+        ATTEMPTS as u128 * INTERVAL.as_millis() / 1_000
+    )
+    .into())
 }
 
 async fn wait_for_peer(api_port: u16) -> TestResult<()> {

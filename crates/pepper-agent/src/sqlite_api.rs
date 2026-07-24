@@ -8,6 +8,7 @@
 
 use super::*;
 use axum::http::HeaderName;
+use pepper_dataset::{PackReadPlan, PackSlice};
 use pepper_merkle::{MerkleLimits, MerkleValue};
 use pepper_namespace::{
     CommandEnvelope, KeyPrecondition, NamespaceCommand, NamespaceKind, NamespaceMutation,
@@ -119,6 +120,7 @@ pub(super) struct SqliteReadSession {
     snapshot_cid: Cid,
     snapshot: SnapshotDescriptor,
     lease_id: String,
+    _cache_lease: Arc<pepper_dataset::SnapshotLease>,
     expires_at_unix_seconds: i64,
 }
 
@@ -1254,6 +1256,7 @@ pub(super) async fn sqlite_session_create(
         snapshot_cid: snapshot_cid.clone(),
         snapshot: snapshot.clone(),
         lease_id,
+        _cache_lease: Arc::new(state.sqlite_pack_cache.lease_snapshot(snapshot_cid.clone())),
         expires_at_unix_seconds: expires_at,
     };
     state
@@ -1353,30 +1356,45 @@ pub(super) async fn sqlite_session_pages(
         .get_many(&store, &session.snapshot.page_table_root_cid, &page_numbers)
         .await
         .map_err(sqlite_error)?;
-    let mut payload = Vec::with_capacity(
-        page_numbers.len() * usize::try_from(session.snapshot.page_size).unwrap_or(65_536),
-    );
-    for (number, reference) in page_numbers.iter().zip(references) {
-        let reference = reference.ok_or_else(|| {
-            ApiError::internal(format!("SQLite snapshot is missing page {number}"))
-        })?;
+    let slices = references
+        .into_iter()
+        .enumerate()
+        .map(|(output_index, reference)| {
+            let reference = reference.ok_or_else(|| {
+                ApiError::internal(format!(
+                    "SQLite snapshot is missing page {}",
+                    page_numbers[output_index]
+                ))
+            })?;
+            Ok(PackSlice {
+                output_index,
+                pack: reference.pack_cid,
+                offset: reference.offset,
+                length: reference.length,
+                blake3_hex: Some(reference.page_hash),
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let maximum_output_bytes = page_numbers
+        .len()
+        .checked_mul(usize::try_from(session.snapshot.page_size).unwrap_or(65_536))
+        .ok_or_else(|| ApiError::bad_request("SQLite page batch size overflow"))?;
+    let plan = PackReadPlan::build(slices, 256, maximum_output_bytes)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut packs = HashMap::with_capacity(plan.distinct_pack_count());
+    for pack_cid in plan.packs() {
         let pack = store
-            .get_page_pack(&reference.pack_cid)
+            .get_page_pack(pack_cid)
             .await
             .map_err(|error| sqlite_error(SqliteError::Storage(error)))?;
-        let start = reference.offset as usize;
-        let end = start
-            .checked_add(reference.length as usize)
-            .filter(|end| *end <= pack.len())
-            .ok_or_else(|| ApiError::internal("SQLite page reference exceeds its pack"))?;
-        let page = &pack[start..end];
-        if blake3::hash(page).to_hex().as_str() != reference.page_hash {
-            return Err(ApiError::internal(format!(
-                "SQLite page {number} failed verification"
-            )));
-        }
-        payload.extend_from_slice(page);
+        state
+            .sqlite_pack_cache
+            .retain_for_snapshot(session.snapshot_cid.clone(), pack_cid);
+        packs.insert(pack_cid.clone(), pack);
     }
+    let payload = plan
+        .assemble(&packs)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     SQLITE_PAGE_READS.fetch_add(
         page_numbers.len() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -1785,6 +1803,8 @@ pub(super) async fn sqlite_incremental_commit(
     Query(query): Query<SqliteIncrementalCommitQuery>,
     body: Body,
 ) -> Result<Response, ApiError> {
+    observe_current_stage(OperationStage::OwnerExecution);
+    let _execution = OperationCostTimer::start(OperationCostMetric::ExecutionMicroseconds);
     let mut commit_metric = SqliteCommitMetric::begin();
     let configured = sqlite_config(&state)?;
     if query.request_id.is_empty() || query.request_id.len() > 128 {
@@ -1821,6 +1841,13 @@ pub(super) async fn sqlite_incremental_commit(
         expected_bytes,
         "SQLite transaction",
     )?;
+    observe_current_stage(OperationStage::Storage);
+    add_current_cost(OperationCostMetric::OwnedBytes, expected_bytes);
+    add_current_cost(OperationCostMetric::StorageBytes, expected_bytes);
+    add_current_cost(
+        OperationCostMetric::StorageOperations,
+        page_numbers.len() as u64,
+    );
     let ticket = WriterTicket {
         ticket_id: query.ticket_id,
         acquisition_id: query.acquisition_id,
@@ -1842,6 +1869,7 @@ pub(super) async fn sqlite_incremental_commit(
         .into_data_stream()
         .map_err(|error| std::io::Error::other(error.to_string()));
     let mut reader = StreamReader::new(stream);
+    let changed_page_count = page_numbers.len();
     let candidate = build_incremental_snapshot_stream(
         &store,
         config_value.cid,
@@ -1870,12 +1898,14 @@ pub(super) async fn sqlite_incremental_commit(
     let proof = IncrementalDurabilityProof::build(
         IncrementalProofInput {
             protected_base_snapshot: query.base_snapshot.clone(),
+            protected_base_generation: query.base_generation,
             protected_base_descriptor: base_descriptor,
             new_snapshot: candidate.snapshot_cid.clone(),
             new_snapshot_descriptor: candidate.descriptor.clone(),
             new_page_table_nodes: candidate.new_page_table_nodes.clone(),
             new_page_pack_roots: candidate.new_page_pack_roots.clone(),
             verified_descendants: candidate.verified_descendants.clone(),
+            changed_page_count,
             durability_receipts: receipts.clone(),
             builder_identity: state.status.node_id.clone(),
         },
@@ -2267,6 +2297,9 @@ async fn handle_protocol_request(
                         snapshot_cid: snapshot_cid.clone(),
                         snapshot: descriptor.clone(),
                         lease_id,
+                        _cache_lease: Arc::new(
+                            state.sqlite_pack_cache.lease_snapshot(snapshot_cid.clone()),
+                        ),
                         expires_at_unix_seconds: expires,
                     },
                 );

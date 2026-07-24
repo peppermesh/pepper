@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -258,6 +264,21 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec 0.8.0",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bit-vec"
@@ -543,6 +564,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -800,6 +836,22 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
+
+[[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
@@ -1410,6 +1462,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kafka-protocol"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6509e79955e012e08bce83c5f8ef2a40c69ed1c807ec7c4f7670f70a5feb1e5b"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crc",
+ "crc32c",
+ "flate2",
+ "indexmap",
+ "lz4",
+ "paste",
+ "snap",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1481,6 +1552,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lz4"
+version = "1.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20b523e860d03443e98350ceaac5e71c6ba89aea7d960769ec3ce37f4de5af4"
+dependencies = [
+ "lz4-sys",
+]
+
+[[package]]
+name = "lz4-sys"
+version = "1.11.1+lz4-1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,6 +1627,16 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
 
 [[package]]
 name = "mio"
@@ -1714,6 +1814,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1745,16 +1851,22 @@ dependencies = [
  "memmap2",
  "multer",
  "pepper-bucket",
+ "pepper-buffer",
  "pepper-compute",
  "pepper-config",
  "pepper-consensus",
  "pepper-crypto",
  "pepper-dag",
+ "pepper-dataset",
  "pepper-filesystem",
+ "pepper-kafka",
+ "pepper-kafka-protocol",
+ "pepper-keyed-runtime",
  "pepper-merkle",
  "pepper-metadata",
  "pepper-namespace",
  "pepper-network",
+ "pepper-observability",
  "pepper-placement",
  "pepper-publication",
  "pepper-sqlite",
@@ -1762,10 +1874,12 @@ dependencies = [
  "pepper-storage",
  "pepper-types",
  "quick-xml",
+ "rcgen",
  "redb",
  "reed-solomon-erasure",
  "reqwest",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
@@ -1775,6 +1889,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1798,6 +1913,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-buffer"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "pepper-observability",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "pepper-cli"
 version = "0.3.0"
 dependencies = [
@@ -1812,6 +1937,15 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "pepper-commit"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "tokio",
 ]
 
 [[package]]
@@ -1852,6 +1986,7 @@ dependencies = [
  "pepper-namespace",
  "pepper-network",
  "pepper-placement",
+ "pepper-rsm",
  "pepper-sqlite",
  "pepper-storage",
  "pepper-types",
@@ -1895,11 +2030,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-dataset"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "pepper-types",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "pepper-durability"
+version = "0.3.0"
+dependencies = [
+ "pepper-observability",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "pepper-extent"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "crc32c",
+ "hex",
+ "pepper-buffer",
+ "pepper-durability",
+ "pepper-observability",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "pepper-filesystem"
 version = "0.3.0"
 dependencies = [
  "async-trait",
  "pepper-dag",
+ "pepper-dataset",
  "pepper-merkle",
  "pepper-types",
  "serde",
@@ -1909,11 +2082,123 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-filesystem-benchmark"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "futures-util",
+ "pepper-filesystem",
+ "pepper-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pepper-guest-agent"
 version = "0.3.0"
 dependencies = [
  "clap",
  "serde_json",
+]
+
+[[package]]
+name = "pepper-kafka"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "blake3",
+ "bytes",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "kafka-protocol",
+ "pepper-buffer",
+ "pepper-config",
+ "pepper-extent",
+ "pepper-kafka-protocol",
+ "pepper-metadata",
+ "pepper-ordered-log",
+ "pepper-rsm",
+ "pepper-storage",
+ "pepper-types",
+ "rcgen",
+ "reed-solomon-erasure",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+]
+
+[[package]]
+name = "pepper-kafka-benchmark"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "kafka-protocol",
+ "pepper-kafka",
+ "pepper-kafka-protocol",
+ "pepper-ordered-log",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "pepper-kafka-model"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "pepper-rsm",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "pepper-kafka-operations-benchmark"
+version = "0.3.0"
+dependencies = [
+ "pepper-kafka",
+ "pepper-rsm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pepper-kafka-protocol"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "kafka-protocol",
+ "pepper-buffer",
+ "proptest",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "pepper-keyed-runtime"
+version = "0.3.0"
+dependencies = [
+ "pepper-observability",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -1974,8 +2259,10 @@ dependencies = [
  "blake3",
  "getrandom 0.3.4",
  "hex",
+ "pepper-buffer",
  "pepper-crypto",
  "pepper-metadata",
+ "pepper-observability",
  "pepper-types",
  "prost",
  "prost-build",
@@ -1994,6 +2281,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-observability"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pepper-ordered-log"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "crc32c",
+ "pepper-buffer",
+ "pepper-extent",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "pepper-ordered-log-benchmark"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "pepper-buffer",
+ "pepper-extent",
+ "pepper-ordered-log",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "pepper-phase0"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "pepper-placement"
 version = "0.3.0"
 dependencies = [
@@ -2009,18 +2350,32 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "hex",
+ "pepper-commit",
  "pepper-config",
  "pepper-consensus",
  "pepper-dag",
  "pepper-merkle",
  "pepper-metadata",
  "pepper-namespace",
+ "pepper-observability",
  "pepper-storage",
  "pepper-types",
  "redb",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "pepper-rsm"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
 ]
@@ -2051,6 +2406,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "pepper-dag",
+ "pepper-dataset",
  "pepper-merkle",
  "pepper-types",
  "rusqlite",
@@ -2100,8 +2456,12 @@ dependencies = [
  "hex",
  "io-uring",
  "libc",
+ "pepper-buffer",
  "pepper-config",
+ "pepper-durability",
+ "pepper-extent",
  "pepper-metadata",
+ "pepper-observability",
  "pepper-types",
  "redb",
  "rustix",
@@ -2223,6 +2583,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proptest"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+dependencies = [
+ "bit-set",
+ "bit-vec 0.8.0",
+ "bitflags 2.13.0",
+ "num-traits",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rand_xorshift",
+ "regex-syntax",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
 ]
 
 [[package]]
@@ -2359,6 +2738,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
@@ -2511,6 +2896,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+dependencies = [
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2863,6 +3257,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "rusty-fork"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
+dependencies = [
+ "fnv",
+ "quick-error",
+ "tempfile",
+ "wait-timeout",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3079,6 +3485,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3101,6 +3513,12 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"
@@ -3590,6 +4008,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3643,7 +4067,9 @@ version = "1.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
@@ -3673,6 +4099,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "walkdir"
@@ -4106,7 +4541,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.9.1",
  "time",
 ]
 

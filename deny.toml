@@ -11,6 +11,9 @@ ignore = [
     # Transitive through reed-solomon-erasure -> parking_lot 0.11. It is an
     # unmaintained-crate warning, not a known vulnerability.
     { id = "RUSTSEC-2024-0384", reason = "No maintained replacement is available through reed-solomon-erasure 6" },
+    # Transitive build-time macro through kafka-protocol 0.15.1. The advisory
+    # reports that paste is archived; it does not report a vulnerability.
+    { id = "RUSTSEC-2024-0436", reason = "No maintained replacement is available through the pinned kafka-protocol 0.15.1 dependency" },
 ]
 
 [licenses]

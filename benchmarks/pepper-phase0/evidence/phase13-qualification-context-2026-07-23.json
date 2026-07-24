@@ -1,0 +1,55 @@
+{
+  "schema": "pepper.phase13.qualification-context.v1",
+  "date_utc": "2026-07-23",
+  "base_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "working_tree_note": "Phase 13 was qualified from the implementation working tree before commit; artifact and binary hashes identify the retained runs.",
+  "host": {
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "performance": {
+    "command": "pepper-kafka-benchmark --phase9-paired --repetitions 11; pepper-kafka-operations-benchmark --phase13-compare PHASE12 CANDIDATE OUTPUT",
+    "candidate_sha256": "e74c92f05338ebef6f2e0f1c18129e3b53f07ba86ec64b1ca6add46c1dea60b5",
+    "qualification_sha256": "8d39a1dbce1ceeb21780a4f4c7aebcf5c97d16164f8c9816388b33e7244ba539",
+    "maximum_throughput_regression_percent": 2.3571837183221866,
+    "maximum_submillisecond_p99_delta_microseconds": 131.28000000000003,
+    "maximum_percentage_gated_p99_regression_percent": 4.211085750073789,
+    "result": "pass"
+  },
+  "accelerated_soak": {
+    "command": "pepper-kafka-operations-benchmark --phase13 OUTPUT",
+    "sha256": "28e681b3d274fd6201d8e2ad7a9e410206a08edf35a1f2c4a01e267d246d0663",
+    "mixed_operations": 1000000,
+    "group_rebalance_events": 10000,
+    "result": "pass"
+  },
+  "correctness_commands": [
+    "cargo test -p pepper-kafka-protocol",
+    "cargo test -p pepper-kafka security::tests",
+    "cargo test -p pepper-kafka --test security_integration",
+    "cargo test -p pepper-kafka --test kafka_mvp",
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo fmt --all -- --check"
+  ],
+  "security_cases": [
+    "TLS 1.3 only",
+    "plaintext rejection",
+    "untrusted root and hostname rejection",
+    "verified mTLS required-client path and leaf identity mapping",
+    "SCRAM success, wrong password, unknown-user concealment, stale/malformed/oversized messages",
+    "legacy v0 and Kafka-framed v1 SASL paths",
+    "default deny, explicit deny precedence, prefix confusion, cross resource/principal denial",
+    "continuous request/ingress/egress token buckets",
+    "bounded redacted audit and administrative events",
+    "atomic mode-0600 verifier and ACL persistence/reopen"
+  ],
+  "secure_client_artifact": "phase13-secure-client-qualification-2026-07-23.json",
+  "format_cases": [
+    "markerless Phase 8 floor upgrades and reopens",
+    "future format rejected before controller mutation"
+  ],
+  "production_72_hour_soak": "pending; blocks GA",
+  "engineering_all_pass": true,
+  "production_certified": false
+}

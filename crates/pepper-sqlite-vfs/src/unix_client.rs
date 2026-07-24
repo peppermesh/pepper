@@ -29,6 +29,7 @@ pub struct UnixSocketBackend {
     timeout: Duration,
     next_request: AtomicU64,
     sessions: Mutex<HashMap<String, BackendOpen>>,
+    connections: Mutex<Vec<UnixStream>>,
 }
 
 impl UnixSocketBackend {
@@ -38,6 +39,7 @@ impl UnixSocketBackend {
             timeout,
             next_request: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
+            connections: Mutex::new(Vec::with_capacity(8)),
         }
     }
 
@@ -46,6 +48,14 @@ impl UnixSocketBackend {
     }
 
     fn connect(&self) -> Result<UnixStream, SqliteError> {
+        if let Some(stream) = self
+            .connections
+            .lock()
+            .map_err(|_| SqliteError::Storage("connection pool lock poisoned".into()))?
+            .pop()
+        {
+            return Ok(stream);
+        }
         let mut stream = UnixStream::connect(&self.path)
             .map_err(|error| SqliteError::Storage(error.to_string()))?;
         stream
@@ -76,6 +86,14 @@ impl UnixSocketBackend {
             return Err(SqliteError::Storage("invalid agent hello response".into()));
         }
         Ok(stream)
+    }
+
+    fn recycle(&self, stream: UnixStream) {
+        if let Ok(mut connections) = self.connections.lock()
+            && connections.len() < 8
+        {
+            connections.push(stream);
+        }
     }
 
     fn exchange(
@@ -149,6 +167,7 @@ impl PepperVfsBackend for UnixSocketBackend {
             },
             Vec::new(),
         )?;
+        self.recycle(stream);
         let LocalMessage::Response(LocalResponse::Opened {
             session_id,
             database,
@@ -186,6 +205,7 @@ impl PepperVfsBackend for UnixSocketBackend {
             },
             Vec::new(),
         )?;
+        self.recycle(stream);
         if !matches!(
             response.message,
             LocalMessage::Response(LocalResponse::Closed)
@@ -215,6 +235,7 @@ impl PepperVfsBackend for UnixSocketBackend {
             },
             Vec::new(),
         )?;
+        self.recycle(stream);
         let LocalMessage::Response(LocalResponse::Pages {
             snapshot: actual,
             pages,
@@ -270,7 +291,9 @@ impl PepperVfsBackend for UnixSocketBackend {
             Vec::new(),
         )?;
         if let LocalMessage::Response(LocalResponse::Writer { ticket }) = &response.message {
-            return Ok(ticket.clone());
+            let ticket = ticket.clone();
+            self.recycle(stream);
+            return Ok(ticket);
         }
         if !matches!(
             response.message,
@@ -295,7 +318,10 @@ impl PepperVfsBackend for UnixSocketBackend {
                 Vec::new(),
             )?;
             match response.message {
-                LocalMessage::Response(LocalResponse::Writer { ticket }) => return Ok(ticket),
+                LocalMessage::Response(LocalResponse::Writer { ticket }) => {
+                    self.recycle(stream);
+                    return Ok(ticket);
+                }
                 LocalMessage::Response(LocalResponse::Queued { .. }) => {}
                 _ => {
                     return Err(SqliteError::Storage(
@@ -316,6 +342,7 @@ impl PepperVfsBackend for UnixSocketBackend {
             },
             Vec::new(),
         )?;
+        self.recycle(stream);
         if matches!(
             response.message,
             LocalMessage::Response(LocalResponse::Closed | LocalResponse::Aborted)
@@ -342,6 +369,7 @@ impl PepperVfsBackend for UnixSocketBackend {
             },
             Vec::new(),
         )?;
+        self.recycle(stream);
         let LocalMessage::Response(LocalResponse::Writer { ticket }) = response.message else {
             return Err(SqliteError::Storage(
                 "invalid agent renewal response".into(),
@@ -417,7 +445,10 @@ impl PepperVfsBackend for UnixSocketBackend {
             Ok(LocalFrame {
                 message: LocalMessage::Response(LocalResponse::Committed { commit }),
                 ..
-            }) => commit,
+            }) => {
+                self.recycle(stream);
+                commit
+            }
             _ => {
                 // A transport failure after Finish may have lost only the
                 // response. Resolve the replicated idempotency record through
@@ -431,6 +462,7 @@ impl PepperVfsBackend for UnixSocketBackend {
                     },
                     Vec::new(),
                 )?;
+                self.recycle(status_stream);
                 let LocalMessage::Response(LocalResponse::Committed { commit }) = status.message
                 else {
                     return Err(SqliteError::AmbiguousCommit {
@@ -454,5 +486,92 @@ impl PepperVfsBackend for UnixSocketBackend {
             .map_err(|_| SqliteError::Storage("session lock poisoned".into()))?
             .insert(session_id.into(), opened.clone());
         Ok(opened)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pepper_sqlite::protocol::ServerHello;
+    use std::os::unix::net::UnixListener;
+
+    fn write_response(
+        stream: &mut UnixStream,
+        request_id: u64,
+        response: LocalResponse,
+    ) -> Result<(), SqliteError> {
+        let frame = LocalFrame {
+            request_id,
+            deadline_unix_millis: None,
+            message: LocalMessage::Response(response),
+            payload: Vec::new(),
+        };
+        stream
+            .write_all(&frame.encode(LocalProtocolLimits::default())?)
+            .map_err(|error| SqliteError::Storage(error.to_string()))
+    }
+
+    #[test]
+    fn successful_connection_is_reused_without_a_second_hello() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            let hello = read_frame(&mut stream).unwrap();
+            assert!(matches!(
+                hello.message,
+                LocalMessage::Request(LocalRequest::Hello { .. })
+            ));
+            write_response(
+                &mut stream,
+                hello.request_id,
+                LocalResponse::Hello {
+                    hello: ServerHello {
+                        selected_version: 1,
+                        agent_identity: "test-agent".into(),
+                        enabled_features: BTreeSet::new(),
+                        max_header_bytes: LocalProtocolLimits::default().max_header_bytes as u32,
+                        max_payload_bytes: LocalProtocolLimits::default().max_payload_bytes as u32,
+                        max_read_pages: 256,
+                        max_dirty_pages: 256,
+                    },
+                },
+            )
+            .unwrap();
+
+            let request = read_frame(&mut stream).unwrap();
+            assert!(matches!(
+                request.message,
+                LocalMessage::Request(LocalRequest::Cancel {
+                    target_request_id: 9
+                })
+            ));
+            write_response(&mut stream, request.request_id, LocalResponse::Cancelled).unwrap();
+        });
+
+        let backend = UnixSocketBackend::new(&socket, Duration::from_secs(2));
+        let stream = backend.connect().unwrap();
+        backend.recycle(stream);
+        let mut reused = backend.connect().unwrap();
+        let response = backend
+            .exchange(
+                &mut reused,
+                LocalRequest::Cancel {
+                    target_request_id: 9,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            response.message,
+            LocalMessage::Response(LocalResponse::Cancelled)
+        ));
+        backend.recycle(reused);
+        server.join().unwrap();
     }
 }

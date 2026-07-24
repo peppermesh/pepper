@@ -30,16 +30,22 @@ md5 = { workspace = true }
 memmap2 = { workspace = true }
 multer = { workspace = true }
 pepper-bucket = { version = "0.3.0", path = "../pepper-bucket" }
+pepper-buffer = { version = "0.3.0", path = "../pepper-buffer" }
 pepper-compute = { version = "0.3.0", path = "../pepper-compute" }
 pepper-config = { version = "0.3.0", path = "../pepper-config" }
 pepper-consensus = { version = "0.3.0", path = "../pepper-consensus" }
 pepper-crypto = { version = "0.3.0", path = "../pepper-crypto" }
 pepper-dag = { version = "0.3.0", path = "../pepper-dag" }
+pepper-dataset = { version = "0.3.0", path = "../pepper-dataset" }
 pepper-filesystem = { version = "0.3.0", path = "../pepper-filesystem" }
+pepper-kafka = { version = "0.3.0", path = "../pepper-kafka" }
+pepper-kafka-protocol = { version = "0.3.0", path = "../pepper-kafka-protocol" }
+pepper-keyed-runtime = { version = "0.3.0", path = "../pepper-keyed-runtime" }
 pepper-merkle = { version = "0.3.0", path = "../pepper-merkle" }
 pepper-metadata = { version = "0.3.0", path = "../pepper-metadata" }
 pepper-namespace = { version = "0.3.0", path = "../pepper-namespace" }
 pepper-network = { version = "0.3.0", path = "../pepper-network" }
+pepper-observability = { version = "0.3.0", path = "../pepper-observability" }
 pepper-placement = { version = "0.3.0", path = "../pepper-placement" }
 pepper-publication = { version = "0.3.0", path = "../pepper-publication" }
 pepper-sqlite = { version = "0.3.0", path = "../pepper-sqlite" }
@@ -49,6 +55,7 @@ quick-xml = { workspace = true }
 redb = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 rusqlite = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
@@ -66,4 +73,6 @@ zstd-safe = { workspace = true }
 
 [dev-dependencies]
 pepper-sqlite-vfs = { version = "0.3.0", path = "../pepper-sqlite-vfs" }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
+tower = { workspace = true }

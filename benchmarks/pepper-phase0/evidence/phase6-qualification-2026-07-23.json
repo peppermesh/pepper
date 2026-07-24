@@ -1,0 +1,334 @@
+{
+  "schema_version": 1,
+  "classification": "phase6-versioned-dataset-and-index-engine-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "phase5_agent_binary_sha256": "320df23255deccb86b5ead749929e6d6c932c9a315d94c7329a7fa72e94dc66a",
+  "phase6_agent_binary_sha256": "574c29de679f05791ca0bfbc2d388c039cf54ef41ad4b456ab4312e20708321d",
+  "frozen_s3_load_generator_sha256": "c2ab8237bbda5173af366daaba8e18aab336779ec240e811d9a6fe082c79eba4",
+  "frozen_filesystem_benchmark_sha256": "126f17a48d4fbd9045e4c8f248449af07c9c80d20c6d07763b8a43185b8ed65f",
+  "frozen_sqlite_benchmark_sha256": "e2e7e4dc3c7c3c41c9e4bb6c1a2f57f0ee00d5a70ccab96ca1b75116aaf9f82f",
+  "cargo_lock_sha256": "7a918c96e77171bf58da9c40c908163c1ed701ccd8b249566b3e5395df578863",
+  "pre_evidence_working_tree_diff_sha256": "258fb7f3d9631834b7ad271292c797232deb5aafd4dfc22a980ad381ec6269c9",
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "topology": "three local Pepper peers, replication factor 3, eight S3 owner workers per peer",
+    "comparison_method": "The exact qualified Phase 5 server and final Phase 6 server ran sequentially from independent reflink copies of one quiesced Phase 5 state. Both used the same frozen Phase 5 benchmark clients. The final isolated sequence ran SQLite, filesystem, then S3 on each side with a ten-second quiescence interval."
+  },
+  "predeclared_budget": {
+    "maximum_median_regression_percent": 5.0,
+    "sqlite_submillisecond_p99_regression_percent": 15.0,
+    "sqlite_submillisecond_p99_absolute_allowance_microseconds": 250.0,
+    "sqlite_low_sample_p99_regression_percent": 25.0,
+    "correctness_failure_tolerance": 0,
+    "structural_fixture_keys": 65536,
+    "changed_key_cells": [1, 16, 256],
+    "retained_history_cells": [1, 1000],
+    "frontier_node_bound": "1 + changed_keys * index_depth",
+    "bulk_read_maximum_duplicate_physical_fetches": 0
+  },
+  "dataset_engine": {
+    "product_neutral_crate": "crates/pepper-dataset",
+    "contracts": [
+      "DatasetRoot",
+      "ExactBase",
+      "MutationFrontier",
+      "PreparedDatasetArtifact",
+      "IndexAdapter",
+      "BulkRead",
+      "IndexUpdate",
+      "PackReadPlan",
+      "SnapshotCache",
+      "SnapshotLease"
+    ],
+    "index_kinds": [
+      "sparse_merkle",
+      "fixed_fanout_256_depth_4"
+    ],
+    "outer_root_and_frontier_categories_are_disjoint": true,
+    "incremental_validation_reads_retained_history": false,
+    "pack_plan_preserves_caller_order": true,
+    "pack_plan_fetches_each_distinct_pack_once": true,
+    "leased_snapshot_entries_are_not_evictable": true,
+    "one_pass_scan_admission_protects_hot_set": true
+  },
+  "structural_scaling": {
+    "sparse_merkle": {
+      "fixture_keys": 65536,
+      "changed_keys": [1, 16, 256],
+      "retained_history_roots": [1, 1000],
+      "candidate_root_and_write_count_identical_across_history_cells": true,
+      "written_nodes_within_declared_bound": true,
+      "test": "pepper_merkle::tests::sparse_frontier_scales_with_changes_not_retained_history"
+    },
+    "fixed_fanout": {
+      "fixture_keys": 65536,
+      "fanout": 256,
+      "depth": 4,
+      "changed_keys": [1, 16, 256],
+      "retained_history_roots": [1, 1000],
+      "written_nodes_within_declared_bound": true,
+      "bulk_read_keys": 256,
+      "each_index_node_fetched_at_most_once": true,
+      "test": "pepper_sqlite::tests::fixed_fanout_frontier_and_bulk_reads_scale_with_changed_keys"
+    },
+    "passes": true
+  },
+  "filesystem": {
+    "configuration": {
+      "files": 100,
+      "file_bytes": 4096,
+      "files_per_directory": 16,
+      "mutation_percent": 10,
+      "iterations": 3,
+      "upload_concurrency": 8,
+      "repetitions": 5
+    },
+    "phase5": {
+      "aggregate_commit_seconds": [
+        43.826968688,
+        38.363706646,
+        38.60978939,
+        38.427968977,
+        38.859886508
+      ],
+      "checkout_seconds": [
+        0.037102403,
+        0.064077361,
+        0.043877319,
+        0.309141486,
+        0.031349105
+      ],
+      "median_aggregate_commit_seconds": 38.60978939,
+      "median_checkout_seconds": 0.043877319
+    },
+    "phase6": {
+      "aggregate_commit_seconds": [
+        44.494488262,
+        38.888691094,
+        38.687048971,
+        39.412366745,
+        39.341987806
+      ],
+      "checkout_seconds": [
+        0.035239761,
+        0.040115112,
+        0.196567482,
+        0.129552771,
+        0.035912587
+      ],
+      "median_aggregate_commit_seconds": 39.341987806,
+      "median_checkout_seconds": 0.040115112
+    },
+    "aggregate_commit_regression_percent": 1.89640613836,
+    "checkout_regression_percent": -8.574377573069,
+    "verified_files_each_side": 1500,
+    "verified_bytes_each_side": 6144000,
+    "incremental_mutation_matches_full_rebuild_root": true,
+    "stable_canonical_root_vector": true,
+    "rollback_and_diff_semantics_unchanged": true,
+    "passes": true
+  },
+  "sqlite": {
+    "configuration": {
+      "page_size": 4096,
+      "seed_rows": 10000,
+      "payload_bytes": 256,
+      "point_reads": 2000,
+      "scans": 3,
+      "reopen_reads": 25,
+      "batch_sizes": [1, 10, 100, 1000],
+      "transactions_per_batch": 10,
+      "repetitions": 5
+    },
+    "phase5": {
+      "aggregate_write_seconds": [
+        15.26861171,
+        15.432101012,
+        15.039670599,
+        16.0588151,
+        16.38788292
+      ],
+      "reopen_seconds": [
+        1.711472653,
+        1.934155257,
+        2.049761178,
+        1.947913987,
+        1.832816394
+      ],
+      "median_aggregate_write_seconds": 15.432101012,
+      "median_reopen_seconds": 1.934155257,
+      "median_scan_p99_microseconds": 465.708
+    },
+    "phase6": {
+      "aggregate_write_seconds": [
+        15.767723206,
+        15.781114036,
+        14.770726095,
+        15.454733875,
+        15.429538868
+      ],
+      "reopen_seconds": [
+        1.683499728,
+        1.619991104,
+        1.761290491,
+        1.873273706,
+        2.221700576
+      ],
+      "median_aggregate_write_seconds": 15.454733875,
+      "median_reopen_seconds": 1.761290491,
+      "median_scan_p99_microseconds": 635.098
+    },
+    "aggregate_write_regression_percent": 0.146660930889,
+    "reopen_regression_percent": -8.937481382344,
+    "scan_p99_regression_percent": 36.372576807785,
+    "scan_p99_delta_microseconds": 169.39,
+    "scan_p99_passes_absolute_allowance": true,
+    "integrity_checks_phase5_ok": 5,
+    "integrity_checks_phase6_ok": 5,
+    "incremental_export_byte_identical": true,
+    "growth_truncation_and_rollback_exact": true,
+    "passes": true
+  },
+  "s3": {
+    "configuration": {
+      "operation": "put",
+      "payload_bytes": 4096,
+      "concurrency": 8,
+      "duration_seconds": 60,
+      "object_count": 1024,
+      "repetitions": 5
+    },
+    "phase5": {
+      "operations_per_second": [
+        7.924835003865285,
+        7.157010899550611,
+        5.002149446760334,
+        4.3660676977865025,
+        4.123189944174466
+      ],
+      "p99_milliseconds": [
+        2496.602,
+        2866.8,
+        4232.568,
+        4904.463,
+        5341.896
+      ],
+      "median_operations_per_second": 5.002149446760334,
+      "median_p99_milliseconds": 4232.568,
+      "successes": 1756,
+      "failures": 0,
+      "retries": 0
+    },
+    "phase6": {
+      "operations_per_second": [
+        6.827272270036297,
+        6.35113567873538,
+        4.9621158362422255,
+        4.253933342917553,
+        3.9290043651159428
+      ],
+      "p99_milliseconds": [
+        3039.852,
+        3421.814,
+        4301.764,
+        5088.53,
+        5550.555
+      ],
+      "median_operations_per_second": 4.9621158362422255,
+      "median_p99_milliseconds": 4301.764,
+      "successes": 1613,
+      "failures": 0,
+      "retries": 0
+    },
+    "throughput_regression_percent": 0.800328157809,
+    "p99_regression_percent": 1.634846740797,
+    "metadata_migration_performed": false,
+    "metadata_migration_decision": "S3's measured metadata hot paths remain single-key conditional lookups and ordered scans; the new bulk-index and pack-read contracts do not improve those operations. S3 retains its existing canonical namespace index and independently passes conditional, listing, and throughput tests.",
+    "passes": true
+  },
+  "investigation_record": {
+    "first_combined_run": {
+      "result": "failed_noise_gate",
+      "filesystem_checkout_phase5_median_seconds": 0.035883449,
+      "filesystem_checkout_phase6_median_seconds": 0.085573533,
+      "sqlite_reopen_phase5_median_seconds": 2.946974424,
+      "sqlite_reopen_phase6_median_seconds": 3.403080396,
+      "note": "The first comparison contained bursty Raft heartbeat timeouts and was not used to qualify the phase."
+    },
+    "implementation_fix": "Request-scoped bulk readers retain cached immutable nodes by reference instead of cloning complete nodes. Cloned SQLite read sessions share one Arc-backed snapshot cache lease.",
+    "final_run": "five fresh isolated repetitions per product and side, followed by a final-binary S3 rerun in reverse side order",
+    "raw_first_run_retained": true
+  },
+  "correctness": {
+    "filesystem_incremental_and_full_root_byte_identical": "pass",
+    "filesystem_stable_cid_vector": "pass",
+    "filesystem_nonempty_directory_delete_rejected": "pass",
+    "sqlite_incremental_real_database_export_byte_identical": "pass",
+    "sqlite_growth_and_truncation_export_exact": "pass",
+    "sqlite_integrity_checks": "10/10 pass",
+    "s3_conditional_and_listing_unit_tests": "pass",
+    "pack_slice_digest_validation": "pass",
+    "snapshot_lease_and_scan_admission": "pass",
+    "full_workspace": "pass"
+  },
+  "implementation_validation": [
+    {
+      "command": "cargo test -p pepper-dataset",
+      "result": "pass",
+      "tests": 4
+    },
+    {
+      "command": "cargo test -p pepper-filesystem",
+      "result": "pass",
+      "tests": 5
+    },
+    {
+      "command": "cargo test -p pepper-merkle",
+      "result": "pass",
+      "tests": 12
+    },
+    {
+      "command": "cargo test -p pepper-sqlite",
+      "result": "pass",
+      "tests": 39
+    },
+    {
+      "command": "cargo test -p pepper-agent",
+      "result": "pass",
+      "unit_tests": 47,
+      "multinode_passed": 20,
+      "multinode_ignored": 3
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "pass"
+    },
+    {
+      "command": "cargo test --workspace",
+      "result": "pass"
+    }
+  ],
+  "artifacts": {
+    "raw_phase5_directory": "target/phase6-qualification/isolated-base/artifacts",
+    "raw_phase6_directory": "target/phase6-qualification/isolated-current/artifacts",
+    "raw_phase5_artifact_set_sha256": "dad342c20950261611a0e20946cb5c5bd1d2b1b51cef85e06bd27ab18aafd4da",
+    "raw_phase6_artifact_set_sha256": "065f23deb644c9c86e52a6b63217d5b8048b8e550b57b524c8b2c6ebcb4d0e3e",
+    "first_run_directory": "target/phase6-qualification/{base,current}/artifacts",
+    "rollback_point": "target/phase6-qualification/base-bin/pepper-agent-phase5"
+  },
+  "source_file_sha256": {
+    "crates/pepper-dataset/src/lib.rs": "963c28cc08fded331597a4a2398b97473e45d0df81b330effb54653ba6457690",
+    "crates/pepper-filesystem/src/lib.rs": "af18913ca183822547c5ef2446b2f4cb876b494997e7d281201a58b350da1946",
+    "crates/pepper-merkle/src/lib.rs": "81e11fc2f4af817ff0e933b0efad003fcec39574a989827fa6cd465c52e059c6",
+    "crates/pepper-sqlite/src/page_table.rs": "18842aa575daa192d0b1a782c836b43168812df2049b5a7ac9996dfe5ef93b8a",
+    "crates/pepper-sqlite/src/proof.rs": "6a102e27a0d95ee02b5e6d47fc921308a043ac44d91d25aee1ff110023e63a24",
+    "crates/pepper-sqlite/src/cache.rs": "fd9726df5069571fb17f3b155c1c5d0095f825d1ef03ffa17a21b3483022ddc7"
+  },
+  "passes": true
+}

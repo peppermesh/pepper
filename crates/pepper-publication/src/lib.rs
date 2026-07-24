@@ -3,6 +3,10 @@
 //! Shared publication barrier for namespace-backed KV, bucket, and filesystem writes.
 
 use async_trait::async_trait;
+use pepper_commit::{
+    ArtifactPreparer, CommitDisposition, CommitEngine, CommitInput, CommitReconciler, CommitTypes,
+    DurabilityEstablisher, GuardedProposer, ProposalAttempt, ResultLookup, StagingBackend,
+};
 use pepper_consensus::{
     ConsensusDataStore, ConsensusResponse, NamespaceGroupManager, PublicationIntentRecord,
     namespace_log_contains,
@@ -14,6 +18,9 @@ use pepper_metadata::{
 };
 use pepper_namespace::{
     ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation, PinAction,
+};
+use pepper_observability::{
+    FaultBoundary, OperationStage, apply_current_fault, observe_current_stage,
 };
 use pepper_types::{
     CODEC_ERASURE_MANIFEST, Cid, DurabilityReceipt, ErasureManifest, PlacementReference,
@@ -56,9 +63,18 @@ pub struct PublicationPhaseStats {
     pub merkle_update_micros: u64,
     pub raft_publication_observations: u64,
     pub raft_publication_micros: u64,
+    pub commit_engine_prepared: u64,
+    pub commit_engine_staged: u64,
+    pub commit_engine_durable: u64,
+    pub commit_engine_proposed: u64,
+    pub commit_engine_ambiguous: u64,
+    pub commit_engine_recovered: u64,
+    pub commit_engine_reconciled: u64,
+    pub commit_engine_finalized: u64,
 }
 
 pub fn process_phase_stats() -> PublicationPhaseStats {
+    let commit = pepper_commit::process_stats();
     PublicationPhaseStats {
         durability_observations: DURABILITY_OBSERVATIONS.load(Ordering::Relaxed),
         durability_micros: DURABILITY_MICROS.load(Ordering::Relaxed),
@@ -73,6 +89,14 @@ pub fn process_phase_stats() -> PublicationPhaseStats {
         merkle_update_micros: MERKLE_UPDATE_MICROS.load(Ordering::Relaxed),
         raft_publication_observations: RAFT_PUBLICATION_OBSERVATIONS.load(Ordering::Relaxed),
         raft_publication_micros: RAFT_PUBLICATION_MICROS.load(Ordering::Relaxed),
+        commit_engine_prepared: commit.prepared,
+        commit_engine_staged: commit.staged,
+        commit_engine_durable: commit.durable,
+        commit_engine_proposed: commit.proposed,
+        commit_engine_ambiguous: commit.ambiguous,
+        commit_engine_recovered: commit.recovered,
+        commit_engine_reconciled: commit.reconciled,
+        commit_engine_finalized: commit.finalized,
     }
 }
 
@@ -216,6 +240,12 @@ pub struct PublicationRequest {
     pub staged_bytes: u64,
     pub staging_ttl_seconds: i64,
     pub retain_uploaded_on_conflict: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchedPublicationRequest {
+    pub request: PublicationRequest,
+    pub guard: PublicationGuard,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -723,92 +753,82 @@ where
         guard: PublicationGuard,
         now: i64,
     ) -> Result<PublicationResult, PublicationError> {
-        if let PublicationGuard::Application { kind, payload } = &guard
-            && (kind.is_empty() || kind.len() > 128 || payload.len() > 64 * 1024)
-        {
-            return Err(PublicationError::Application {
-                code: "invalid_publication_guard".into(),
-                message: "application publication guard exceeds its bounds".into(),
-            });
-        }
+        validate_publication_guard(&guard)?;
         let lease_id = format!("{}:{}", request.namespace_id, request.command.request_id);
-        let expires = now
-            .checked_add(request.staging_ttl_seconds)
-            .ok_or(PublicationError::StagingUnavailable)?;
-        let command_cids = command_value_cids(&request.command);
-        let unique_metadata_only_cids = request.metadata_only_cids.iter().collect::<HashSet<_>>();
-        if unique_metadata_only_cids.len() != request.metadata_only_cids.len()
-            || request.metadata_only_cids.len() > command_cids.len()
-            || request
-                .metadata_only_cids
-                .iter()
-                .any(|cid| !command_cids.contains(cid))
-        {
-            return Err(PublicationError::Application {
-                code: "invalid_metadata_only_cid".to_string(),
-                message: "metadata-only CIDs must be command values".to_string(),
-            });
-        }
-        let mut roots = command_cids
-            .into_iter()
-            .filter(|cid| !request.metadata_only_cids.contains(cid))
-            .collect::<Vec<_>>();
-        roots.extend(request.uploaded_roots.iter().cloned());
-        roots.sort_by_key(ToString::to_string);
-        roots.dedup();
-        let mut lease = StagingLease {
-            lease_id: lease_id.clone(),
-            namespace_id: request.namespace_id.clone(),
-            request_id: request.command.request_id.clone(),
-            roots,
-            staged_bytes: request.staged_bytes,
-            created_at_unix_seconds: now,
-            expires_at_unix_seconds: expires,
-            status: "active".to_string(),
-        };
-        self.repository.put_staging(&lease)?;
-        self.fault(PublicationFaultPoint::StagingLease)?;
-        let staging_reason = format!("namespace-staging:{}", lease.lease_id);
-        self.protection
-            .protect_many(
-                &request.namespace_id,
-                &lease.roots,
-                &staging_reason,
-                Some(expires),
-            )
+        let workflow = NamespaceCommitWorkflow { coordinator: self };
+        let outcome = CommitEngine::new(workflow)
+            .execute(CommitInput {
+                request: NamespaceCommitRequest { request, now },
+                guard,
+            })
             .await?;
-
-        let result = self.publish_staged(&request, &guard, &mut lease, now).await;
-        if result.is_ok() {
-            // Permanent distributed protection must be visible before temporary
-            // staging pins are withdrawn.
-            self.reconcile_pin_intents().await?;
-        }
-        if result.is_err() && request.retain_uploaded_on_conflict {
-            self.protection
-                .protect_many(
-                    &request.namespace_id,
-                    &request.uploaded_roots,
-                    "uploaded-publication-conflict",
-                    None,
-                )
-                .await?;
-        }
-        self.release_staging(&mut lease).await?;
-        result.map(|(apply, durability)| PublicationResult {
-            apply,
-            durability,
+        Ok(PublicationResult {
+            apply: outcome.result,
+            durability: outcome.evidence,
             staging_lease_id: lease_id,
         })
     }
 
-    async fn publish_staged(
+    /// Submits independent publications with bounded concurrency. The
+    /// namespace proposal host may combine the concurrent small commands into
+    /// its existing Raft proposal batch; artifact and durability work remains
+    /// independently attributable.
+    pub async fn publish_batch(
+        &self,
+        requests: Vec<BatchedPublicationRequest>,
+        max_in_flight: usize,
+        now: i64,
+    ) -> Result<Vec<Result<PublicationResult, PublicationError>>, PublicationError> {
+        if requests.len() > 4_096 || max_in_flight == 0 || max_in_flight > 1_024 {
+            return Err(PublicationError::Application {
+                code: "invalid_publication_batch".into(),
+                message: "publication batch or concurrency exceeds its bound".into(),
+            });
+        }
+        for request in &requests {
+            validate_publication_guard(&request.guard)?;
+        }
+        let lease_ids = requests
+            .iter()
+            .map(|input| {
+                format!(
+                    "{}:{}",
+                    input.request.namespace_id, input.request.command.request_id
+                )
+            })
+            .collect::<Vec<_>>();
+        let inputs = requests
+            .into_iter()
+            .map(|input| CommitInput {
+                request: NamespaceCommitRequest {
+                    request: input.request,
+                    now,
+                },
+                guard: input.guard,
+            })
+            .collect();
+        let outcomes = CommitEngine::new(NamespaceCommitWorkflow { coordinator: self })
+            .execute_batch(inputs, max_in_flight)
+            .await;
+        Ok(outcomes
+            .into_iter()
+            .zip(lease_ids)
+            .map(|(outcome, staging_lease_id)| {
+                outcome.map(|outcome| PublicationResult {
+                    apply: outcome.result,
+                    durability: outcome.evidence,
+                    staging_lease_id,
+                })
+            })
+            .collect())
+    }
+
+    async fn establish_durability(
         &self,
         request: &PublicationRequest,
-        guard: &PublicationGuard,
         lease: &mut StagingLease,
         now: i64,
-    ) -> Result<(ApplyResult, Vec<DurabilityReceipt>), PublicationError> {
+    ) -> Result<Vec<DurabilityReceipt>, PublicationError> {
         self.fault(PublicationFaultPoint::LeaderValidation)?;
         // Command validation and conditional checks must happen against the
         // state at Raft log order. A pre-proposal state-machine preview was not
@@ -942,6 +962,10 @@ where
         lease.roots.dedup();
         self.repository.update_staging(lease)?;
 
+        apply_current_fault(FaultBoundary::DurabilityBefore)
+            .await
+            .map_err(|error| PublicationError::Storage(error.to_string()))?;
+        observe_current_stage(OperationStage::Durability);
         let receipts = {
             let _timer = PhaseTimer::start(&DURABILITY_OBSERVATIONS, &DURABILITY_MICROS);
             let mut receipts = Vec::new();
@@ -1020,7 +1044,17 @@ where
             receipts
         };
         self.fault(PublicationFaultPoint::ValueDurability)?;
+        apply_current_fault(FaultBoundary::DurabilityAfter)
+            .await
+            .map_err(|error| PublicationError::Storage(error.to_string()))?;
+        Ok(receipts)
+    }
 
+    async fn propose_durable(
+        &self,
+        request: &PublicationRequest,
+        guard: &PublicationGuard,
+    ) -> ProposalAttempt<Result<ConsensusResponse, PublicationError>, PublicationError> {
         // Only externally supplied DAGs need the pre-commit durability barrier.
         // Merkle and commit blocks are derived deterministically while every
         // Raft replica applies the command, so a quorum commit itself makes
@@ -1028,19 +1062,49 @@ where
         // stale transactions and enforce per-key preconditions at log order;
         // rejecting every revision advance here turns parallel PUTs into an
         // expensive retry cascade.
-        self.fault(PublicationFaultPoint::LocalLogPersistence)?;
-        self.fault(PublicationFaultPoint::FollowerLogPersistence)?;
+        if let Err(error) = self
+            .fault(PublicationFaultPoint::LocalLogPersistence)
+            .and_then(|()| self.fault(PublicationFaultPoint::FollowerLogPersistence))
+        {
+            return ProposalAttempt::Definitive(Err(error));
+        }
+        if let Err(error) = apply_current_fault(FaultBoundary::PublicationBefore).await {
+            return ProposalAttempt::Definitive(Err(PublicationError::Namespace(
+                error.to_string(),
+            )));
+        }
+        if let Err(error) = apply_current_fault(FaultBoundary::StateApplicationBefore).await {
+            return ProposalAttempt::Definitive(Err(PublicationError::Namespace(
+                error.to_string(),
+            )));
+        }
+        observe_current_stage(OperationStage::Publication);
         let response = {
             let _timer =
                 PhaseTimer::start(&RAFT_PUBLICATION_OBSERVATIONS, &RAFT_PUBLICATION_MICROS);
             self.proposer
                 .propose(&request.namespace_id, guard, request.command.clone())
-                .await?
+                .await
         };
-        self.fault(PublicationFaultPoint::QuorumCommit)?;
-        self.fault(PublicationFaultPoint::StateMachineApply)?;
-        self.fault(PublicationFaultPoint::CheckpointPublication)?;
-        response_to_apply(response).map(|apply| (apply, receipts))
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return ProposalAttempt::Ambiguous(error),
+        };
+        observe_current_stage(OperationStage::StateApplication);
+        if let Err(error) = apply_current_fault(FaultBoundary::StateApplicationAfter).await {
+            return ProposalAttempt::Ambiguous(PublicationError::Namespace(error.to_string()));
+        }
+        if let Err(error) = apply_current_fault(FaultBoundary::PublicationAfter).await {
+            return ProposalAttempt::Ambiguous(PublicationError::Namespace(error.to_string()));
+        }
+        if let Err(error) = self
+            .fault(PublicationFaultPoint::QuorumCommit)
+            .and_then(|()| self.fault(PublicationFaultPoint::StateMachineApply))
+            .and_then(|()| self.fault(PublicationFaultPoint::CheckpointPublication))
+        {
+            return ProposalAttempt::Ambiguous(error);
+        }
+        ProposalAttempt::Definitive(Ok(response))
     }
 
     async fn release_staging(&self, lease: &mut StagingLease) -> Result<(), PublicationError> {
@@ -1073,6 +1137,218 @@ where
 
     pub async fn expire_staging(&self, now: i64) -> Result<usize, PublicationError> {
         expire_staging_leases(&self.repository, self.protection.as_ref(), now).await
+    }
+}
+
+struct NamespaceCommitRequest {
+    request: PublicationRequest,
+    now: i64,
+}
+
+struct PreparedNamespacePublication {
+    lease: StagingLease,
+}
+
+struct NamespaceCommitWorkflow<'a, D, P> {
+    coordinator: &'a PublicationCoordinator<D, P>,
+}
+
+impl<D, P> CommitTypes for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    type Request = NamespaceCommitRequest;
+    type Prepared = PreparedNamespacePublication;
+    type Evidence = Vec<DurabilityReceipt>;
+    type Guard = PublicationGuard;
+    type Proposal = Result<ConsensusResponse, PublicationError>;
+    type Result = ApplyResult;
+    type Error = PublicationError;
+}
+
+#[async_trait]
+impl<D, P> ArtifactPreparer for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn prepare(
+        &self,
+        input: &NamespaceCommitRequest,
+    ) -> Result<PreparedNamespacePublication, PublicationError> {
+        let request = &input.request;
+        let lease_id = format!("{}:{}", request.namespace_id, request.command.request_id);
+        let expires = input
+            .now
+            .checked_add(request.staging_ttl_seconds)
+            .ok_or(PublicationError::StagingUnavailable)?;
+        let command_cids = command_value_cids(&request.command);
+        let unique_metadata_only_cids = request.metadata_only_cids.iter().collect::<HashSet<_>>();
+        if unique_metadata_only_cids.len() != request.metadata_only_cids.len()
+            || request.metadata_only_cids.len() > command_cids.len()
+            || request
+                .metadata_only_cids
+                .iter()
+                .any(|cid| !command_cids.contains(cid))
+        {
+            return Err(PublicationError::Application {
+                code: "invalid_metadata_only_cid".to_string(),
+                message: "metadata-only CIDs must be command values".to_string(),
+            });
+        }
+        let mut roots = command_cids
+            .into_iter()
+            .filter(|cid| !request.metadata_only_cids.contains(cid))
+            .collect::<Vec<_>>();
+        roots.extend(request.uploaded_roots.iter().cloned());
+        roots.sort_by_key(ToString::to_string);
+        roots.dedup();
+        Ok(PreparedNamespacePublication {
+            lease: StagingLease {
+                lease_id,
+                namespace_id: request.namespace_id.clone(),
+                request_id: request.command.request_id.clone(),
+                roots,
+                staged_bytes: request.staged_bytes,
+                created_at_unix_seconds: input.now,
+                expires_at_unix_seconds: expires,
+                status: "active".to_string(),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl<D, P> StagingBackend for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn stage(
+        &self,
+        input: &NamespaceCommitRequest,
+        prepared: &mut PreparedNamespacePublication,
+    ) -> Result<(), PublicationError> {
+        let lease = &prepared.lease;
+        self.coordinator.repository.put_staging(lease)?;
+        self.coordinator
+            .fault(PublicationFaultPoint::StagingLease)?;
+        self.coordinator
+            .protection
+            .protect_many(
+                &input.request.namespace_id,
+                &lease.roots,
+                &format!("namespace-staging:{}", lease.lease_id),
+                Some(lease.expires_at_unix_seconds),
+            )
+            .await
+    }
+
+    async fn finalize(
+        &self,
+        input: &NamespaceCommitRequest,
+        prepared: &mut PreparedNamespacePublication,
+        disposition: CommitDisposition,
+    ) -> Result<(), PublicationError> {
+        if disposition != CommitDisposition::Committed && input.request.retain_uploaded_on_conflict
+        {
+            self.coordinator
+                .protection
+                .protect_many(
+                    &input.request.namespace_id,
+                    &input.request.uploaded_roots,
+                    "uploaded-publication-conflict",
+                    None,
+                )
+                .await?;
+        }
+        self.coordinator.release_staging(&mut prepared.lease).await
+    }
+}
+
+#[async_trait]
+impl<D, P> DurabilityEstablisher for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn establish(
+        &self,
+        input: &NamespaceCommitRequest,
+        prepared: &mut PreparedNamespacePublication,
+    ) -> Result<Vec<DurabilityReceipt>, PublicationError> {
+        self.coordinator
+            .establish_durability(&input.request, &mut prepared.lease, input.now)
+            .await
+    }
+}
+
+#[async_trait]
+impl<D, P> GuardedProposer for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn propose(
+        &self,
+        input: &NamespaceCommitRequest,
+        _prepared: &PreparedNamespacePublication,
+        _evidence: &Vec<DurabilityReceipt>,
+        guard: &PublicationGuard,
+    ) -> ProposalAttempt<Result<ConsensusResponse, PublicationError>, PublicationError> {
+        self.coordinator
+            .propose_durable(&input.request, guard)
+            .await
+    }
+
+    fn interpret(
+        &self,
+        proposal: Result<ConsensusResponse, PublicationError>,
+    ) -> Result<ApplyResult, PublicationError> {
+        proposal.and_then(response_to_apply)
+    }
+}
+
+#[async_trait]
+impl<D, P> ResultLookup for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn lookup(
+        &self,
+        input: &NamespaceCommitRequest,
+        _prepared: &PreparedNamespacePublication,
+    ) -> Result<Option<ApplyResult>, PublicationError> {
+        let state = self
+            .coordinator
+            .manager
+            .linearizable_namespace_state(&input.request.namespace_id)
+            .await
+            .map_err(|error| PublicationError::Namespace(error.to_string()))?;
+        state
+            .idempotent_apply_result_for(&input.request.command)
+            .map_err(|error| PublicationError::Conflict(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl<D, P> CommitReconciler for NamespaceCommitWorkflow<'_, D, P>
+where
+    D: DurabilityBackend,
+    P: ProtectionBackend,
+{
+    async fn reconcile(
+        &self,
+        _input: &NamespaceCommitRequest,
+        _prepared: &PreparedNamespacePublication,
+        _evidence: &Vec<DurabilityReceipt>,
+        _result: &ApplyResult,
+    ) -> Result<(), PublicationError> {
+        // Permanent distributed protection must be visible before temporary
+        // staging pins are withdrawn.
+        self.coordinator.reconcile_pin_intents().await.map(|_| ())
     }
 }
 
@@ -1192,6 +1468,18 @@ fn response_to_apply(response: ConsensusResponse) -> Result<ApplyResult, Publica
     response.result.ok_or_else(|| {
         PublicationError::Namespace("consensus returned no namespace result".to_string())
     })
+}
+
+fn validate_publication_guard(guard: &PublicationGuard) -> Result<(), PublicationError> {
+    if let PublicationGuard::Application { kind, payload } = guard
+        && (kind.is_empty() || kind.len() > 128 || payload.len() > 64 * 1024)
+    {
+        return Err(PublicationError::Application {
+            code: "invalid_publication_guard".into(),
+            message: "application publication guard exceeds its bounds".into(),
+        });
+    }
+    Ok(())
 }
 
 fn write_record<T: Serialize>(
@@ -1617,6 +1905,31 @@ mod tests {
             }
         ));
 
+        let batch_base = managers[leader_index]
+            .linearizable_namespace_state(&state.namespace_id)
+            .await
+            .unwrap();
+        let batch = ["batch-alpha", "batch-beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| BatchedPublicationRequest {
+                request: PublicationRequest {
+                    namespace_id: state.namespace_id.clone(),
+                    command: command(&batch_base, &format!("batch-{index}"), key, value.clone()),
+                    uploaded_roots: vec![value.clone()],
+                    preverified_durability: Vec::new(),
+                    metadata_only_cids: Vec::new(),
+                    staged_bytes: 5,
+                    staging_ttl_seconds: 60,
+                    retain_uploaded_on_conflict: true,
+                },
+                guard: PublicationGuard::None,
+            })
+            .collect();
+        let batch_results = coordinator.publish_batch(batch, 2, 12).await.unwrap();
+        assert_eq!(batch_results.len(), 2);
+        assert!(batch_results.into_iter().all(|result| result.is_ok()));
+
         // A trusted inline metadata value is committed and fenced by the
         // Merkle/Raft transaction itself. It is intentionally absent from the
         // block store and must never enter traversal, durability, or pins.
@@ -1840,10 +2153,23 @@ mod tests {
             )
             .unwrap()
             .with_fault_injector(Arc::new(InjectAt(point)));
-            assert!(matches!(
-                injected.publish(request.clone(), 100 + index as i64).await,
-                Err(PublicationError::Injected(actual)) if actual == point
-            ));
+            let injected_result = injected.publish(request.clone(), 100 + index as i64).await;
+            if matches!(
+                point,
+                PublicationFaultPoint::QuorumCommit
+                    | PublicationFaultPoint::StateMachineApply
+                    | PublicationFaultPoint::CheckpointPublication
+            ) {
+                let recovered = injected_result.unwrap_or_else(|error| {
+                    panic!("ambiguous result was not reconstructed after {point:?}: {error}")
+                });
+                assert!(recovered.apply.replayed);
+            } else {
+                assert!(matches!(
+                    injected_result,
+                    Err(PublicationError::Injected(actual)) if actual == point
+                ));
+            }
             let retry = PublicationCoordinator::new(
                 managers[leader_index].clone(),
                 stores[leader_index].clone(),

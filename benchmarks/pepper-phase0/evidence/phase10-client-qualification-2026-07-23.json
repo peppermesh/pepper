@@ -1,0 +1,65 @@
+{
+  "schema": "pepper.phase10.client-qualification.v1",
+  "date_utc": "2026-07-23",
+  "base_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "working_tree_note": "Phase 10 was qualified from the implementation working tree before commit.",
+  "host": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "cargo": "cargo 1.96.1 (356927216 2026-06-26)"
+  },
+  "broker": {
+    "command": "target/release/pepper-kafka-smoke-server target/phase10-client-smoke-6",
+    "binary_sha256": "66e9e1a9569318c23c497daa6a2b719421510506d1614f23171c1557c61f1f67",
+    "listeners": [
+      "127.0.0.1:19092",
+      "127.0.0.1:29092",
+      "127.0.0.1:39092"
+    ]
+  },
+  "clients": [
+    {
+      "client": "Apache Java command-line clients",
+      "version": "Apache Kafka 4.3.1",
+      "container": "apache/kafka:4.3.1",
+      "container_sha256": "77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837",
+      "flow": "create RF=3 topic; produce two; group consume and commit; close; produce one; restart same group; resume at committed offset; leave; delete",
+      "result": "pass: java-one, java-two; restart returned only java-three"
+    },
+    {
+      "client": "librdkafka through confluent-kafka",
+      "version": "confluent-kafka 2.11.1 / librdkafka 2.11.1",
+      "container": "python:3.13-slim",
+      "container_sha256": "6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91",
+      "command": "pip install confluent-kafka==2.11.1 && python /smoke/librdkafka_smoke.py",
+      "result": "pass: librdkafka-one, librdkafka-two; restart returned only librdkafka-three"
+    },
+    {
+      "client": "franz-go",
+      "version": "v1.20.4 with kadm v1.17.2",
+      "container": "golang:1.24-bookworm",
+      "container_sha256": "1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac",
+      "command": "go run -mod=mod go_smoke.go",
+      "result": "pass: go-one, go-two; restart returned only go-three"
+    },
+    {
+      "client": "kafka-python-ng",
+      "version": "2.2.3",
+      "container": "python:3.13-slim",
+      "container_sha256": "6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91",
+      "command": "pip install kafka-python-ng==2.2.3 && python /smoke/python_smoke.py",
+      "compatibility_discovery": "The retained Kafka 0.11 setting uses FindCoordinator v0 and JoinGroup v2; the truthful table was widened and both boundaries were added to protocol qualification.",
+      "result": "pass: python-one, python-two; restart returned only python-three"
+    }
+  ],
+  "correctness": {
+    "tcp_group_lifecycle": "pass",
+    "stale_generation_fencing": "pass",
+    "duplicate_assignment_rejection": "pass",
+    "offset_reopen": "pass",
+    "coordinator_epoch_fencing": "pass",
+    "golden_and_truncation_boundaries": "pass",
+    "malformed_frames": 100000
+  },
+  "all_pass": true
+}

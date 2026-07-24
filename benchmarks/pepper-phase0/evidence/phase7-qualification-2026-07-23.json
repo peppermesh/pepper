@@ -1,0 +1,892 @@
+{
+  "schema": "pepper.phase7.qualification.v1",
+  "repetitions": 5,
+  "cases": [
+    {
+      "batch_bytes": 1024,
+      "concurrency": 1,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1209.8964539107023,
+          "append_p99_us": 881.627,
+          "fetch_mebibytes_per_second": 523.4827376332438,
+          "fetch_p99_us": 7.920000000000001,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1209.0099501896716,
+          "append_p99_us": 1015.8870000000001,
+          "fetch_mebibytes_per_second": 506.0209749067572,
+          "fetch_p99_us": 6.93,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1217.3676516882892,
+          "append_p99_us": 885.2270000000001,
+          "fetch_mebibytes_per_second": 482.28037594719865,
+          "fetch_p99_us": 13.93,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1210.1111899322077,
+          "append_p99_us": 971.187,
+          "fetch_mebibytes_per_second": 476.4712160561906,
+          "fetch_p99_us": 7.84,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1191.2708289826612,
+          "append_p99_us": 921.067,
+          "fetch_mebibytes_per_second": 491.535110025219,
+          "fetch_p99_us": 13.26,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1205.1648545004473,
+          "append_p99_us": 976.436,
+          "fetch_mebibytes_per_second": 401.5178445237249,
+          "fetch_p99_us": 10.24,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1213.097755814643,
+          "append_p99_us": 925.797,
+          "fetch_mebibytes_per_second": 326.9523852702283,
+          "fetch_p99_us": 27.68,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1210.374665930288,
+          "append_p99_us": 916.457,
+          "fetch_mebibytes_per_second": 385.2175092144028,
+          "fetch_p99_us": 10.17,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1194.9154852458432,
+          "append_p99_us": 945.037,
+          "fetch_mebibytes_per_second": 417.5593156926585,
+          "fetch_p99_us": 10.33,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1189.7629966084692,
+          "append_p99_us": 908.957,
+          "fetch_mebibytes_per_second": 364.631343126845,
+          "fetch_p99_us": 10.609,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "append_throughput_regression_percent": 0.3910747399053273,
+      "append_p99_regression_percent": 0.5135348459992615,
+      "fetch_throughput_regression_percent": 21.62970633071591,
+      "fetch_p99_regression_percent": 30.429292929292917,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 1024,
+      "concurrency": 8,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1181.2015174452945,
+          "append_p99_us": 71967.8,
+          "fetch_mebibytes_per_second": 502.76453458751854,
+          "fetch_p99_us": 7.51,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1176.5550089408987,
+          "append_p99_us": 72214.229,
+          "fetch_mebibytes_per_second": 464.3180838892768,
+          "fetch_p99_us": 7.25,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1180.5333590689604,
+          "append_p99_us": 71953.76000000001,
+          "fetch_mebibytes_per_second": 464.2950886246465,
+          "fetch_p99_us": 7.220000000000001,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1178.2618783985874,
+          "append_p99_us": 72078.9,
+          "fetch_mebibytes_per_second": 523.8922821586038,
+          "fetch_p99_us": 7.43,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1178.735826699312,
+          "append_p99_us": 72120.43999999999,
+          "fetch_mebibytes_per_second": 444.7575537622931,
+          "fetch_p99_us": 7.38,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1178.0448517261823,
+          "append_p99_us": 72120.91900000001,
+          "fetch_mebibytes_per_second": 370.39378291566084,
+          "fetch_p99_us": 13.39,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1178.249441666251,
+          "append_p99_us": 72098.09,
+          "fetch_mebibytes_per_second": 378.3155575463361,
+          "fetch_p99_us": 10.76,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1170.5368129377189,
+          "append_p99_us": 72633.988,
+          "fetch_mebibytes_per_second": 365.6125326126379,
+          "fetch_p99_us": 21.900000000000002,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1166.9648018617756,
+          "append_p99_us": 72896.947,
+          "fetch_mebibytes_per_second": 376.4470625082818,
+          "fetch_p99_us": 9.74,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1181.3291518219123,
+          "append_p99_us": 71900.69,
+          "fetch_mebibytes_per_second": 409.8199415104979,
+          "fetch_p99_us": 10.010000000000002,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "append_throughput_regression_percent": 0.0586200026739244,
+      "append_p99_regression_percent": 0.058295839697907144,
+      "fetch_throughput_regression_percent": 18.92474672641634,
+      "fetch_p99_regression_percent": 45.799457994579946,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 1024,
+      "concurrency": 32,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1142.3860989889931,
+          "append_p99_us": 82113.403,
+          "fetch_mebibytes_per_second": 499.89335608403536,
+          "fetch_p99_us": 6.38,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1150.1317535826424,
+          "append_p99_us": 81461.775,
+          "fetch_mebibytes_per_second": 485.27356488431076,
+          "fetch_p99_us": 7.23,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1153.2843574312221,
+          "append_p99_us": 81251.167,
+          "fetch_mebibytes_per_second": 508.9327883002459,
+          "fetch_p99_us": 6.24,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1160.4868585682389,
+          "append_p99_us": 80658.358,
+          "fetch_mebibytes_per_second": 515.4809230819985,
+          "fetch_p99_us": 7.6,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1157.0762322801609,
+          "append_p99_us": 80934.187,
+          "fetch_mebibytes_per_second": 476.5923267364483,
+          "fetch_p99_us": 16.03,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1157.3702907386505,
+          "append_p99_us": 80947.037,
+          "fetch_mebibytes_per_second": 406.9381323818577,
+          "fetch_p99_us": 10.84,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1151.308722006663,
+          "append_p99_us": 81365.796,
+          "fetch_mebibytes_per_second": 373.0318837811705,
+          "fetch_p99_us": 10.56,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1159.4806304593797,
+          "append_p99_us": 80727.248,
+          "fetch_mebibytes_per_second": 374.95650504541476,
+          "fetch_p99_us": 10.010000000000002,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1148.5847796388655,
+          "append_p99_us": 81589.905,
+          "fetch_mebibytes_per_second": 362.5444237767268,
+          "fetch_p99_us": 9.47,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        },
+        {
+          "append_operations_per_second": 1149.484908628163,
+          "append_p99_us": 81522.30500000001,
+          "fetch_mebibytes_per_second": 376.3866082648477,
+          "fetch_p99_us": 9.860000000000001,
+          "durable_record_appends": 288,
+          "fetched_bytes": 98304
+        }
+      ],
+      "append_throughput_regression_percent": 0.17130514359525653,
+      "append_p99_regression_percent": 0.1410798198135429,
+      "fetch_throughput_regression_percent": 24.99270084670177,
+      "fetch_p99_regression_percent": 38.45089903181191,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 1,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1165.310003050199,
+          "append_p99_us": 934.577,
+          "fetch_mebibytes_per_second": 3357.139180276136,
+          "fetch_p99_us": 11.84,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1158.6177931106897,
+          "append_p99_us": 1051.757,
+          "fetch_mebibytes_per_second": 3281.7084136440308,
+          "fetch_p99_us": 17.15,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1160.872628438494,
+          "append_p99_us": 976.927,
+          "fetch_mebibytes_per_second": 3460.5349064156007,
+          "fetch_p99_us": 12.51,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1158.1171143760444,
+          "append_p99_us": 1060.516,
+          "fetch_mebibytes_per_second": 3779.403761262623,
+          "fetch_p99_us": 11.209999999999999,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1161.219169812482,
+          "append_p99_us": 976.977,
+          "fetch_mebibytes_per_second": 3646.902078247931,
+          "fetch_p99_us": 11.049999999999999,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1156.6602303344266,
+          "append_p99_us": 1055.476,
+          "fetch_mebibytes_per_second": 3047.61595162824,
+          "fetch_p99_us": 14.09,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1156.3138833308199,
+          "append_p99_us": 1096.306,
+          "fetch_mebibytes_per_second": 2894.9816458163655,
+          "fetch_p99_us": 18.33,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1159.4076875975986,
+          "append_p99_us": 1046.666,
+          "fetch_mebibytes_per_second": 2999.586057124117,
+          "fetch_p99_us": 16.84,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1159.2459689425204,
+          "append_p99_us": 981.497,
+          "fetch_mebibytes_per_second": 2941.995614465204,
+          "fetch_p99_us": 22.109,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1157.6628234672723,
+          "append_p99_us": 1071.057,
+          "fetch_mebibytes_per_second": 3021.8905753276736,
+          "fetch_p99_us": 14.74,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "append_throughput_regression_percent": 0.2764993240937451,
+      "append_p99_regression_percent": 8.03488720819427,
+      "fetch_throughput_regression_percent": 13.320161817669154,
+      "fetch_p99_regression_percent": 42.22972972972973,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 8,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1142.0467383341443,
+          "append_p99_us": 73944.723,
+          "fetch_mebibytes_per_second": 3327.506499729363,
+          "fetch_p99_us": 13.68,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1148.2455860004366,
+          "append_p99_us": 74089.662,
+          "fetch_mebibytes_per_second": 3365.5075858540986,
+          "fetch_p99_us": 13.38,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1147.7103590794775,
+          "append_p99_us": 74117.763,
+          "fetch_mebibytes_per_second": 3334.748748913428,
+          "fetch_p99_us": 13.29,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1144.220440647158,
+          "append_p99_us": 74323.971,
+          "fetch_mebibytes_per_second": 3368.0769178952664,
+          "fetch_p99_us": 13.139999999999999,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1148.7458602968518,
+          "append_p99_us": 73945.19200000001,
+          "fetch_mebibytes_per_second": 3406.9383435011514,
+          "fetch_p99_us": 13.49,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1145.8222717222748,
+          "append_p99_us": 74186.482,
+          "fetch_mebibytes_per_second": 2899.234215602519,
+          "fetch_p99_us": 16.62,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1146.8716441684496,
+          "append_p99_us": 74135.152,
+          "fetch_mebibytes_per_second": 2811.631908648205,
+          "fetch_p99_us": 15.77,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1147.7845820679606,
+          "append_p99_us": 74051.413,
+          "fetch_mebibytes_per_second": 3416.0939015891668,
+          "fetch_p99_us": 14.709,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1144.6078887544145,
+          "append_p99_us": 74310.112,
+          "fetch_mebibytes_per_second": 2870.165206709298,
+          "fetch_p99_us": 15.739999999999998,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1148.9304988962608,
+          "append_p99_us": 73981.662,
+          "fetch_mebibytes_per_second": 3165.1712990707056,
+          "fetch_p99_us": 14.31,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "append_throughput_regression_percent": 0.07307722757687371,
+      "append_p99_regression_percent": 0.06139857946713975,
+      "fetch_throughput_regression_percent": 13.854473904959239,
+      "fetch_p99_regression_percent": 17.63826606875932,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 32,
+      "batches": 96,
+      "raw": [
+        {
+          "append_operations_per_second": 1122.4938876992337,
+          "append_p99_us": 83537.43800000001,
+          "fetch_mebibytes_per_second": 3319.9208530868623,
+          "fetch_p99_us": 16.41,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1136.6027830784708,
+          "append_p99_us": 82365.39199999999,
+          "fetch_mebibytes_per_second": 3528.847149162016,
+          "fetch_p99_us": 11.69,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1133.165288068794,
+          "append_p99_us": 82706.031,
+          "fetch_mebibytes_per_second": 3317.204348633754,
+          "fetch_p99_us": 18.19,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1124.6280995453317,
+          "append_p99_us": 83339.109,
+          "fetch_mebibytes_per_second": 3678.381904322834,
+          "fetch_p99_us": 13.27,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1134.0057688290967,
+          "append_p99_us": 82646.211,
+          "fetch_mebibytes_per_second": 3308.8551581743063,
+          "fetch_p99_us": 16.330000000000002,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 1127.435396982863,
+          "append_p99_us": 83065.4,
+          "fetch_mebibytes_per_second": 2880.0847896962086,
+          "fetch_p99_us": 19.58,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1117.126540146578,
+          "append_p99_us": 83919.807,
+          "fetch_mebibytes_per_second": 3590.3376832269,
+          "fetch_p99_us": 15.06,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1131.6663903121623,
+          "append_p99_us": 82761.25099999999,
+          "fetch_mebibytes_per_second": 3370.6501759479393,
+          "fetch_p99_us": 13.91,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1133.7371185320033,
+          "append_p99_us": 82658.241,
+          "fetch_mebibytes_per_second": 3751.4161596002486,
+          "fetch_p99_us": 15.67,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        },
+        {
+          "append_operations_per_second": 1119.2455911633695,
+          "append_p99_us": 83702.29699999999,
+          "fetch_mebibytes_per_second": 3277.1985632761503,
+          "fetch_p99_us": 13.84,
+          "durable_record_appends": 288,
+          "fetched_bytes": 1572864
+        }
+      ],
+      "append_throughput_regression_percent": 0.5056536011349475,
+      "append_p99_regression_percent": 0.43451365717210094,
+      "fetch_throughput_regression_percent": -1.528028079763072,
+      "fetch_p99_regression_percent": -7.77709736680956,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 1,
+      "batches": 16,
+      "raw": [
+        {
+          "append_operations_per_second": 414.4249943858364,
+          "append_p99_us": 2873.9590000000003,
+          "fetch_mebibytes_per_second": 4662.116052889376,
+          "fetch_p99_us": 742.837,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 413.57422998294265,
+          "append_p99_us": 2702.26,
+          "fetch_mebibytes_per_second": 5391.146188004767,
+          "fetch_p99_us": 481.358,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 414.4815716312233,
+          "append_p99_us": 2649.54,
+          "fetch_mebibytes_per_second": 4971.2923402638335,
+          "fetch_p99_us": 821.747,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 413.9282724393103,
+          "append_p99_us": 2791.9,
+          "fetch_mebibytes_per_second": 5548.158011540168,
+          "fetch_p99_us": 620.308,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 405.81586896286757,
+          "append_p99_us": 2758.91,
+          "fetch_mebibytes_per_second": 4973.441820677582,
+          "fetch_p99_us": 838.117,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 410.3451184536842,
+          "append_p99_us": 2855.289,
+          "fetch_mebibytes_per_second": 4991.268399843025,
+          "fetch_p99_us": 830.517,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 400.2726256853543,
+          "append_p99_us": 2777.7000000000003,
+          "fetch_mebibytes_per_second": 4969.67257312252,
+          "fetch_p99_us": 811.957,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 407.28668461714847,
+          "append_p99_us": 2775.75,
+          "fetch_mebibytes_per_second": 4917.827709438756,
+          "fetch_p99_us": 852.9269999999999,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 412.6973563897029,
+          "append_p99_us": 2632.691,
+          "fetch_mebibytes_per_second": 4848.575942941959,
+          "fetch_p99_us": 843.1270000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 411.6427067885208,
+          "append_p99_us": 2651.47,
+          "fetch_mebibytes_per_second": 4874.409320601782,
+          "fetch_p99_us": 847.6170000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "append_throughput_regression_percent": 0.8656461092909413,
+      "append_p99_regression_percent": 0.6103859857697477,
+      "fetch_throughput_regression_percent": 1.1182218118568246,
+      "fetch_p99_regression_percent": 13.500943006339222,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 8,
+      "batches": 16,
+      "raw": [
+        {
+          "append_operations_per_second": 397.9671341329571,
+          "append_p99_us": 37474.814,
+          "fetch_mebibytes_per_second": 4601.7647192477725,
+          "fetch_p99_us": 852.047,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 392.24884894575274,
+          "append_p99_us": 38153.742,
+          "fetch_mebibytes_per_second": 5417.08141196227,
+          "fetch_p99_us": 495.929,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 389.0973748281041,
+          "append_p99_us": 38043.822,
+          "fetch_mebibytes_per_second": 4983.790222301963,
+          "fetch_p99_us": 708.2570000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 384.09740710244114,
+          "append_p99_us": 39019.199,
+          "fetch_mebibytes_per_second": 4718.3763359271625,
+          "fetch_p99_us": 875.0360000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 392.7556996707136,
+          "append_p99_us": 37971.333000000006,
+          "fetch_mebibytes_per_second": 4722.288137494142,
+          "fetch_p99_us": 866.857,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 404.100335385599,
+          "append_p99_us": 36721.228,
+          "fetch_mebibytes_per_second": 4676.725719097731,
+          "fetch_p99_us": 879.777,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 393.66559578962836,
+          "append_p99_us": 37894.393,
+          "fetch_mebibytes_per_second": 4732.6384636909015,
+          "fetch_p99_us": 880.8670000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 383.60658229575546,
+          "append_p99_us": 39102.289,
+          "fetch_mebibytes_per_second": 4812.684310769464,
+          "fetch_p99_us": 835.227,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 395.0206267426891,
+          "append_p99_us": 37659.914000000004,
+          "fetch_mebibytes_per_second": 4940.8976005148415,
+          "fetch_p99_us": 727.427,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 394.6030729615656,
+          "append_p99_us": 37845.193,
+          "fetch_mebibytes_per_second": 4753.1228016807045,
+          "fetch_p99_us": 875.747,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "append_throughput_regression_percent": -0.6001863414361339,
+      "append_p99_regression_percent": -0.5221057968360824,
+      "fetch_throughput_regression_percent": -0.6529602448808866,
+      "fetch_p99_regression_percent": 2.7815366992665815,
+      "append_pass": true,
+      "fetch_pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 32,
+      "batches": 16,
+      "raw": [
+        {
+          "append_operations_per_second": 381.84946353372226,
+          "append_p99_us": 41392.371,
+          "fetch_mebibytes_per_second": 4844.568088587772,
+          "fetch_p99_us": 868.957,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 396.5188224758963,
+          "append_p99_us": 39833.596,
+          "fetch_mebibytes_per_second": 5804.86229778218,
+          "fetch_p99_us": 476.68899999999996,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 416.2337293909999,
+          "append_p99_us": 37892.763000000006,
+          "fetch_mebibytes_per_second": 5318.602577062396,
+          "fetch_p99_us": 714.807,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 413.40453882010723,
+          "append_p99_us": 38191.551999999996,
+          "fetch_mebibytes_per_second": 5556.115025471315,
+          "fetch_p99_us": 555.458,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 397.177714735745,
+          "append_p99_us": 39756.106999999996,
+          "fetch_mebibytes_per_second": 5138.434235588859,
+          "fetch_p99_us": 816.617,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "ordered": [
+        {
+          "append_operations_per_second": 382.51322617177493,
+          "append_p99_us": 41285.471,
+          "fetch_mebibytes_per_second": 5476.8449265589325,
+          "fetch_p99_us": 564.478,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 415.40475572499804,
+          "append_p99_us": 37966.252,
+          "fetch_mebibytes_per_second": 5018.430184853876,
+          "fetch_p99_us": 862.826,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 400.8468290109686,
+          "append_p99_us": 39376.728,
+          "fetch_mebibytes_per_second": 4978.068496978001,
+          "fetch_p99_us": 863.097,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 415.1894894988328,
+          "append_p99_us": 37999.433,
+          "fetch_mebibytes_per_second": 4984.36467107243,
+          "fetch_p99_us": 855.897,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        },
+        {
+          "append_operations_per_second": 397.7288192935268,
+          "append_p99_us": 39647.306,
+          "fetch_mebibytes_per_second": 5102.076608955802,
+          "fetch_p99_us": 866.7460000000001,
+          "durable_record_appends": 48,
+          "fetched_bytes": 16777216
+        }
+      ],
+      "append_throughput_regression_percent": -0.9237966127240473,
+      "append_p99_regression_percent": -0.9542659697540143,
+      "fetch_throughput_regression_percent": 5.643820681452634,
+      "fetch_p99_regression_percent": 20.707547631738358,
+      "append_pass": true,
+      "fetch_pass": true
+    }
+  ],
+  "spike_direct": {
+    "candidate": "DirectLeaderFollower",
+    "batches": 10000,
+    "replicas": 3,
+    "durable_record_appends": 30000,
+    "durable_record_bytes": 491520000,
+    "control_bytes": 400000,
+    "durable_barriers": 30000,
+    "record_copies_per_replica": 1
+  },
+  "spike_data_bearing_single_write": {
+    "candidate": "DataBearingConsensus",
+    "batches": 10000,
+    "replicas": 3,
+    "durable_record_appends": 30000,
+    "durable_record_bytes": 491520000,
+    "control_bytes": 960000,
+    "durable_barriers": 30000,
+    "record_copies_per_replica": 1
+  },
+  "spike_data_bearing_double_write_rejected": {
+    "candidate": "DataBearingConsensus",
+    "batches": 10000,
+    "replicas": 3,
+    "durable_record_appends": 60000,
+    "durable_record_bytes": 983040000,
+    "control_bytes": 960000,
+    "durable_barriers": 60000,
+    "record_copies_per_replica": 2
+  },
+  "all_pass": true
+}

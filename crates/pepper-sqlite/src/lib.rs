@@ -28,7 +28,10 @@ pub use format::{
     CachePolicyBounds, DatabaseDescriptor, PageReference, PageStoragePolicy, PageTableNode,
     SnapshotDescriptor, SqliteFormatLimits,
 };
-pub use page_table::{PageMutation, PageTable, PageTableUpdate, PageTableValidation};
+pub use page_table::{
+    PageMutation, PageTable, PageTableBulkRead, PageTableUpdate, PageTableValidation,
+    SqliteIndexAdapter,
+};
 pub use proof::{IncrementalDurabilityProof, IncrementalProofInput};
 pub use protocol::{LocalFrame, LocalMessage, LocalProtocolLimits};
 pub use snapshot::{
@@ -105,6 +108,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use pepper_dag::{DagCodecHandler, TraversalLimits};
+    use pepper_dataset::IndexAdapter;
     use pepper_types::{
         CODEC_SMALL_OBJECT, CODEC_SQLITE_DATABASE, CODEC_SQLITE_PAGE_TABLE, CODEC_SQLITE_SNAPSHOT,
         Codec,
@@ -450,6 +454,53 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn fixed_fanout_frontier_and_bulk_reads_scale_with_changed_keys() {
+        let store = MemoryStore::default();
+        let table = PageTable::default();
+        let mut builder = table.bulk_builder(&store, 4096).unwrap();
+        for number in 1..=65_536 {
+            builder
+                .push(page(number, (number % 251) as u8))
+                .await
+                .unwrap();
+        }
+        let root = builder.finish().await.unwrap().root;
+        let bulk = table
+            .get_many_with_stats(
+                &store,
+                &root,
+                &(0..256).map(|index| 65_536 - index).collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bulk.values.len(), 256);
+        assert!(bulk.values.iter().all(Option::is_some));
+        assert!(bulk.unique_nodes_read <= 1 + 256 * 4);
+
+        for retained_history in [1usize, 1_000] {
+            let retained = vec![root.clone(); retained_history];
+            for changed in [1usize, 16, 256] {
+                let mutations = (0..changed)
+                    .map(|index| {
+                        let number = 1 + (index as u32) * 257;
+                        PageMutation::Put(page(number, 252 + (index % 3) as u8))
+                    })
+                    .collect::<Vec<_>>();
+                let update = SqliteIndexAdapter::new(&store, 4096, SqliteFormatLimits::default())
+                    .apply(&root, mutations)
+                    .await
+                    .unwrap();
+                assert_eq!(update.frontier.changed_keys, changed);
+                assert!(
+                    update.frontier.new_index_nodes.len()
+                        <= 1 + changed * update.frontier.index_depth
+                );
+                assert_eq!(retained.len(), retained_history);
+            }
+        }
     }
 
     #[tokio::test]

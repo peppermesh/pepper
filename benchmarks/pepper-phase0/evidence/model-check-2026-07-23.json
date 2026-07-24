@@ -1,0 +1,19 @@
+{
+  "_license": "SPDX-License-Identifier: Apache-2.0",
+  "schema_version": 1,
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "partition_traces_checked": 36,
+  "producer_traces_checked": 8,
+  "group_traces_checked": 4,
+  "transaction_traces_checked": 10,
+  "invariants": [
+    "committed offsets form an immutable prefix",
+    "stale leaders cannot append to a promised quorum",
+    "producer retries reconstruct the original result",
+    "old group generations are fenced",
+    "read_committed visibility requires all commit markers"
+  ],
+  "result": "pass",
+  "classification": "exploratory"
+}

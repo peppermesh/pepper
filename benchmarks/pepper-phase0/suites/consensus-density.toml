@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "pepper-phase0-consensus-density"
+environment_label = "single-process, single-voter group-density baseline"
+
+[[cases]]
+name = "consensus-density-100"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 3600
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "100" }
+required_stdout = ['"groups_leader_ready": 100']
+
+[[cases]]
+name = "consensus-density-1000"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 7200
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "1000" }
+required_stdout = ['"groups_leader_ready": 1000']
+
+[[cases]]
+name = "consensus-density-10000"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 14400
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "10000" }
+required_stdout = ['"groups_leader_ready": 10000']

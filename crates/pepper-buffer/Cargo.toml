@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-buffer"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Bounded immutable buffer chains for Pepper data-plane products"
+
+[dependencies]
+bytes = { workspace = true }
+pepper-observability = { version = "0.3.0", path = "../pepper-observability" }
+thiserror = { workspace = true }
+tokio = { workspace = true }

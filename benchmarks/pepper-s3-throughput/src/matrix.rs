@@ -68,6 +68,11 @@ const METRIC_FAMILIES: &[&str] = &[
     "pepper_raft_proposal_execution_microseconds_total",
     "pepper_s3_put_phase_duration_microseconds_total",
     "pepper_s3_put_phase_observations_total",
+    "pepper_explicit_payload_allocations_total",
+    "pepper_explicit_payload_allocated_bytes_total",
+    "pepper_explicit_payload_copy_operations_total",
+    "pepper_explicit_payload_copy_bytes_total",
+    "pepper_shared_payload_references_total",
     "pepper_namespace_durability_receipt_sources_total",
     "pepper_namespace_durability_preverified_rejections_total",
     "pepper_storage_block_encoding_attempts_total",
@@ -1711,6 +1716,25 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
                 let count = metrics_delta.get(&format!("pepper_s3_put_phase_observations_total{{phase=\"{phase}\"}}")).copied().unwrap_or(0.0);
                 phase_averages.insert((*phase).to_string(), if count > 0.0 { json!(duration / count) } else { Value::Null });
             }
+            let client_observed_micros = report["results"]["latency_ms"]["total"]
+                .as_f64()
+                .unwrap_or(0.0)
+                * 1_000.0;
+            let owner_queue_micros = metrics_delta
+                .get("pepper_fast_path_owner_queue_microseconds_total")
+                .copied()
+                .unwrap_or(0.0);
+            let owner_execution_micros = metrics_delta
+                .get("pepper_fast_path_owner_execution_microseconds_total")
+                .copied()
+                .unwrap_or(0.0);
+            let attributed_boundary_micros =
+                (owner_queue_micros + owner_execution_micros).min(client_observed_micros);
+            let boundary_coverage_percent = if client_observed_micros > 0.0 {
+                100.0 * attributed_boundary_micros / client_observed_micros
+            } else {
+                0.0
+            };
             let qd = nearest_qd(cell.concurrency); let fio_rate = fio.get(&format!("durable_qd{qd}")).copied().unwrap_or(0.0);
             report["matrix"] = json!({"topology": cell.topology, "storage_engine": cell.storage_engine, "erasure_transfer_plan": cell.erasure_transfer_plan, "gateway_capacity_mbps": cell.gateway_capacity_mbps, "routing": cell.routing, "cell_id": cell_id});
             report["telemetry"] = json!({"block_devices": disk_before.keys().collect::<Vec<_>>(),
@@ -1726,7 +1750,16 @@ pub async fn run(args: MatrixArgs) -> Result<()> {
                 "quorum_unhealthy_samples": samples.iter().map(|sample| sample.quorum_unhealthy).sum::<usize>(),
                 "fault_event": fault_event,
                 "metrics_delta": metrics_delta, "put_phase_average_microseconds": phase_averages,
-                "raft_commit_latency_microseconds_avg": phase_averages.get("raft_namespace_publication")});
+                "raft_commit_latency_microseconds_avg": phase_averages.get("raft_namespace_publication"),
+                "wall_time_attribution": {
+                    "method": "sum of per-request client latency compared with the mutually exclusive owner queue and owner execution boundaries",
+                    "client_observed_microseconds": client_observed_micros,
+                    "owner_queue_microseconds": owner_queue_micros,
+                    "owner_execution_microseconds": owner_execution_micros,
+                    "attributed_boundary_microseconds": attributed_boundary_micros,
+                    "boundary_coverage_percent": boundary_coverage_percent,
+                    "passes_95_percent_gate": boundary_coverage_percent >= 95.0,
+                }});
             report["efficiency"] = json!({"fio_queue_depth": qd, "durability_fio_bytes_per_second": fio_rate,
                 "pepper_over_fio": if fio_rate > 0.0 { report["results"]["logical_mb_per_second"].as_f64().map(|rate| rate * 1e6 / fio_rate) } else { None }});
             fs::write(&output, serde_json::to_string_pretty(&report)? + "\n")?;

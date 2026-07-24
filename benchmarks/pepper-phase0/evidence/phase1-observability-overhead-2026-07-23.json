@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "classification": "phase1-release-mode-observability-ab-gate",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "command": "PEPPER_OBSERVABILITY_OVERHEAD_ITERATIONS=1000 PEPPER_OBSERVABILITY_OVERHEAD_TRIALS=7 cargo test --release -q -p pepper-observability tests::phase1_observability_overhead -- --ignored --exact --nocapture",
+  "configuration": {
+    "payload_bytes": 1048576,
+    "iterations_per_trial": 1000,
+    "trials": 7,
+    "trial_order": "alternating baseline-first and observability-first",
+    "aggregation": "median of trial throughput and trial p99"
+  },
+  "baseline": {
+    "median_throughput_operations_per_second": 8682.906045356116,
+    "median_p99_microseconds": 124.359
+  },
+  "observability_enabled": {
+    "median_throughput_operations_per_second": 8677.815490117595,
+    "median_p99_microseconds": 124.149
+  },
+  "throughput_overhead_percent": 0.05862732145125196,
+  "p99_overhead_percent": 0.0,
+  "passes_3_percent_gate": true,
+  "limitations": [
+    "The A/B cell isolates scoped operation identity, stage observation, local cost accumulation, and final metric aggregation around a 1 MiB BLAKE3 data-plane operation.",
+    "The cell is a shared-observability microbenchmark, not a substitute for Phase 13 end-to-end product qualification.",
+    "The worktree was dirty and the exact command and base revision are retained."
+  ]
+}

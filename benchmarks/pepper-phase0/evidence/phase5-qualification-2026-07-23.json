@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "classification": "phase5-generic-replicated-state-machine-host-qualification",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "phase4_agent_binary_sha256": "6fd235411d199ea1f3d4b01a7fcb796e32b87aff64f99ae5ae989d5fc0b0856d",
+  "phase5_agent_binary_sha256": "320df23255deccb86b5ead749929e6d6c932c9a315d94c7329a7fa72e94dc66a",
+  "load_generator_binary_sha256": "c2ab8237bbda5173af366daaba8e18aab336779ec240e811d9a6fe082c79eba4",
+  "cargo_lock_sha256": "294983a83db21ea150ec64c26c725fafa78caef4a66874e78a45b396905473de",
+  "pre_evidence_working_tree_diff_sha256": "915c61db8108b2bce16bb20c8182aa4502a5380f5c40c5e4b1d46bda0e94c6f0",
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "density_topology": "single process, single voter, release mode",
+    "s3_topology": "three local Pepper peers, replication factor 3, eight S3 owner workers per peer",
+    "s3_comparison_method": "the exact qualified Phase 4 agent and the Phase 5 agent ran sequentially on the same ports from independent byte copies of one quiesced Phase 4 state; both used the same frozen load-generator binary"
+  },
+  "predeclared_budget": {
+    "density_cells": [
+      100,
+      1000,
+      10000
+    ],
+    "all_groups_leader_ready": true,
+    "incremental_threads": 0,
+    "incremental_open_file_descriptors": 0,
+    "maximum_rss_regression_percent": 10.0,
+    "maximum_startup_regression_percent": 10.0,
+    "idle_registered_group_persistent_tasks": 0,
+    "idle_registered_group_persistent_timers": 0,
+    "independent_group_completion_milliseconds": 30,
+    "blocked_group_service_milliseconds": 100,
+    "s3_median_throughput_regression_percent": 5.0,
+    "s3_median_p99_regression_percent": 5.0,
+    "correctness_failure_tolerance": 0
+  },
+  "density": {
+    "phase0_baseline_source": "benchmarks/pepper-phase0/evidence/consensus-density-2026-07-23.json",
+    "cells": [
+      {
+        "groups": 100,
+        "phase0_leaders_ready": 100,
+        "phase5_leaders_ready": 100,
+        "phase0_incremental_rss_kib": 8260,
+        "phase5_incremental_rss_kib": 8004,
+        "rss_regression_percent": -3.099273607748,
+        "phase0_startup_milliseconds": 31,
+        "phase5_startup_milliseconds": 34,
+        "startup_regression_percent": 9.677419354839,
+        "phase5_readiness_milliseconds": 0,
+        "phase5_incremental_threads": 0,
+        "phase5_incremental_open_file_descriptors": 0,
+        "phase5_idle_proposal_runners": 0,
+        "passes": true
+      },
+      {
+        "groups": 1000,
+        "phase0_leaders_ready": 1000,
+        "phase5_leaders_ready": 1000,
+        "phase0_incremental_rss_kib": 60732,
+        "phase5_incremental_rss_kib": 51336,
+        "rss_regression_percent": -15.47125074096,
+        "phase0_startup_milliseconds": 564,
+        "phase5_startup_milliseconds": 550,
+        "startup_regression_percent": -2.482269503546,
+        "phase5_readiness_milliseconds": 27,
+        "phase5_incremental_threads": 0,
+        "phase5_incremental_open_file_descriptors": 0,
+        "phase5_idle_proposal_runners": 0,
+        "passes": true
+      },
+      {
+        "groups": 10000,
+        "phase0_leaders_ready": 10000,
+        "phase5_leaders_ready": 10000,
+        "phase0_incremental_rss_kib": 640436,
+        "phase5_incremental_rss_kib": 541772,
+        "rss_regression_percent": -15.405754829522,
+        "phase0_startup_milliseconds": 23690,
+        "phase5_startup_milliseconds": 23629,
+        "startup_regression_percent": -0.257492612917,
+        "phase5_readiness_milliseconds": 121,
+        "phase5_incremental_threads": 0,
+        "phase5_incremental_open_file_descriptors": 0,
+        "phase5_idle_proposal_runners": 0,
+        "passes": true
+      }
+    ],
+    "passes": true
+  },
+  "s3": {
+    "configuration": {
+      "operation": "put",
+      "payload_bytes": 4096,
+      "concurrency": 8,
+      "duration_seconds": 60,
+      "object_count": 1024,
+      "repetitions": 5
+    },
+    "phase4": {
+      "operations_per_second": [
+        8.384551710019412,
+        7.86100486212291,
+        7.437583017965351,
+        7.096123692201428,
+        6.792608370444477
+      ],
+      "p99_milliseconds": [
+        2119.348,
+        2337.714,
+        2557.65,
+        2395.681,
+        2551.782
+      ],
+      "median_operations_per_second": 7.437583017965351,
+      "median_p99_milliseconds": 2395.681,
+      "successes": 2286,
+      "failures": 0,
+      "retries": 0
+    },
+    "phase5": {
+      "operations_per_second": [
+        8.409598600958123,
+        7.827775414098411,
+        7.4520879067981385,
+        7.042272528317178,
+        6.51182043271856
+      ],
+      "p99_milliseconds": [
+        2123.827,
+        2191.516,
+        2194.926,
+        2770.611,
+        2838.954
+      ],
+      "median_operations_per_second": 7.4520879067981385,
+      "median_p99_milliseconds": 2194.926,
+      "successes": 2264,
+      "failures": 0,
+      "retries": 0
+    },
+    "throughput_regression_percent": -0.195021538553,
+    "p99_regression_percent": -8.379871944554,
+    "passes": true
+  },
+  "rsm_host": {
+    "product_neutral_crate": "crates/pepper-rsm",
+    "contracts": [
+      "ReplicatedStateMachine",
+      "DeterministicHost",
+      "GroupId",
+      "GroupRegistry",
+      "StorageScope",
+      "ProposalGuard",
+      "ReadLease",
+      "LinearizableReadGate",
+      "BatchProcessor",
+      "LazyBatcher"
+    ],
+    "namespace_adapter_uses_generic_apply_contract": true,
+    "namespace_registry_uses_typed_product_group_ids": true,
+    "namespace_linearizable_reads_use_generic_gate": true,
+    "sqlite_guard_uses_generic_proposal_guard": true,
+    "proposal_queue_limit_per_group": 256,
+    "persistent_idle_proposal_task_per_group_before": 1,
+    "persistent_idle_proposal_task_per_group_after": 0,
+    "post_s3_active_proposal_runners": 0,
+    "post_s3_namespace_groups_on_captured_node": 23,
+    "storage_scope_format": "length-delimited rsm/product/group prefix",
+    "legacy_namespace_redb_tables_preserved": true,
+    "passes": true
+  },
+  "correctness": {
+    "generic_deterministic_replay_byte_identical": "pass",
+    "generic_snapshot_digest_validation": "pass",
+    "namespace_three_replica_replay_byte_identical_after_failover_restart": "pass",
+    "namespace_snapshot_recovery": "pass",
+    "authenticated_quic_failover_and_quorum_loss": "pass",
+    "learner_catchup_and_promotion": "pass",
+    "overloaded_group_isolation": {
+      "blocked_group_service_milliseconds": 100,
+      "independent_group_budget_milliseconds": 30,
+      "result": "pass"
+    },
+    "test_kafka_metadata_machine": "pass",
+    "test_kafka_coordinator_machine": "pass",
+    "stable_metadata_and_coordinator_sharding": "pass"
+  },
+  "implementation_validation": [
+    {
+      "command": "cargo test -q -p pepper-rsm",
+      "result": "pass",
+      "tests": 6
+    },
+    {
+      "command": "cargo test -q -p pepper-kafka-model",
+      "result": "pass",
+      "tests": 8
+    },
+    {
+      "command": "cargo test -q -p pepper-consensus --lib",
+      "result": "pass",
+      "tests_passed": 9,
+      "tests_ignored": 4
+    },
+    {
+      "command": "cargo test -q -p pepper-consensus tests::authenticated_quic_discovers_routes_fails_over_and_stops_without_quorum -- --ignored --exact",
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -q -p pepper-consensus tests::learner_replacement_catches_up_during_writes_and_promotes_safely -- --ignored --exact",
+      "result": "pass"
+    },
+    {
+      "command": "cargo test -q -p pepper-agent --bin pepper-agent",
+      "result": "pass",
+      "tests": 47
+    },
+    {
+      "command": "cargo test -q --workspace",
+      "result": "pass",
+      "note": "A first workspace run had one bulk erasure RPC deadline failure. The exact test passed alone, and a complete workspace rerun passed."
+    }
+  ],
+  "raw_artifacts": {
+    "density": {
+      "groups-100.txt": "0258fc6869a9e389364b1f282d0de34b4b52b73691ec3a78dd0d9dbd16fbafab",
+      "groups-1000.txt": "02e0101f8f91bf5a4f587fd9f7f47e8a0205fc75916c8fef311b4cd424544450",
+      "groups-10000.txt": "3d1aceafa1dd91e3ffcaec6ad24df80b540a85b8869f7af24fdebc31d7727cd4"
+    },
+    "phase4_s3": {
+      "s3-1.json": "9851c293645fda201869e091bb66ab20894f3b85bff58383ea93dcedc6a093f1",
+      "s3-2.json": "eb61baa96d7c39715ffc3192b318af0e23999ceff4009a4e0bc46f87aacf7eff",
+      "s3-3.json": "51e07dc17ba4a0acfa50102f4a7174e260c82992b2c5e908d7f87f609380930a",
+      "s3-4.json": "5f86ad979dae8ee935149e9f604ddab005e0f61942fcee96a4504a717155afd5",
+      "s3-5.json": "69b80ab1859f7343c53c66243b659c6827d9f1f446441dd32bdcf8e914f93a37",
+      "metrics-before.prom": "3f8e75a353b29019dec2166e54800114a37930d36146abcb983fb643f8239b8e",
+      "metrics-after.prom": "9e3082f72cd1d6edcaa29ed75bb360a00b4a41ee63fe71b358f47c15e453c80c"
+    },
+    "phase5_s3": {
+      "s3-1.json": "dd005ae18e3f0cfe1d3ad64fb41179acb7ee45fdad4cbaf20c60307b05b607ef",
+      "s3-2.json": "ace7a23bfd492c3ea5e985b845e4fca9250e673cd310300fa070c728719a55c9",
+      "s3-3.json": "8ed206a2cd28894edbef4eae5edb57dc40201a8ebd5d0c946ae512fb2a94f710",
+      "s3-4.json": "c0a08dac67495113b55c878d9d8f6990055385ea50826c5c40a4f809f199ea53",
+      "s3-5.json": "96e75984629fff557bb045d6284e7ca4bd2338c1154f549fcb403add3ded4184",
+      "metrics-before.prom": "2a3d42412e794280b3aa0bbbaa0178014e91e4da5ab6e9c59093809c4006c3df",
+      "metrics-after.prom": "241f326e1c03a0afc804f4ddc81b66e042470eebc380b1f875d517f5e6ae6bf6"
+    }
+  },
+  "limitations": [
+    "OpenRaft remains the selected consensus implementation; the generic crate supplies host policy and product boundaries rather than replacing a mature Raft core.",
+    "Existing namespace redb table names and keys remain unchanged for on-disk compatibility. StorageScope is available for new product tables and records.",
+    "The registry is typed per handle implementation. Heterogeneous products use separate typed registries rather than runtime downcasting.",
+    "The demand-driven batcher creates one bounded runner task only while a group has queued proposals; active groups are not task-free.",
+    "The local density benchmark uses single-voter groups and does not estimate network connection memory for three-voter deployments."
+  ],
+  "gate": {
+    "phase5_complete": true,
+    "decision": "pass"
+  }
+}

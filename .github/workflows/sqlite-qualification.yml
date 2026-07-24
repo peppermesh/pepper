@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-18
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz immutable formats, URI, and local frames
@@ -30,7 +30,7 @@ jobs:
           # crash addresses remain available in the uploaded job log.
           ASAN_OPTIONS: symbolize=0
         run: >-
-          cargo +nightly fuzz run
+          cargo +nightly-2026-07-18 fuzz run
           --fuzz-dir crates/pepper-sqlite/fuzz sqlite_decoders
           -- -max_total_time=120
 
@@ -40,12 +40,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-18
           components: rust-src
       - name: Exercise SQLite and its C VFS under AddressSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
         run: >-
-          cargo +nightly test -Zbuild-std
+          cargo +nightly-2026-07-18 test -Zbuild-std
           --target x86_64-unknown-linux-gnu
           -p pepper-sqlite -p pepper-sqlite-vfs

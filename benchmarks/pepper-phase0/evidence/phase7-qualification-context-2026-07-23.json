@@ -1,0 +1,46 @@
+{
+  "schema": "pepper.phase7.qualification-context.v1",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_branch": "vinayakb/kafka",
+  "source_dirty": true,
+  "environment": {
+    "kernel": "Linux 7.0.0-27-generic x86_64 GNU/Linux",
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "filesystem": "xfs",
+    "filesystem_source": "/dev/mapper/vg--0-lv--1",
+    "topology": "three local replica directories on one qualified filesystem, replication factor 3, min.insync.replicas 2"
+  },
+  "qualification": {
+    "command": "cargo run --release -p pepper-ordered-log-benchmark -- --repetitions 5 --output benchmarks/pepper-phase0/evidence/phase7-qualification-2026-07-23.json",
+    "result": "pass",
+    "raw_evidence": "benchmarks/pepper-phase0/evidence/phase7-qualification-2026-07-23.json",
+    "raw_evidence_sha256": "a6a6a8e93fbadbdb5c03d7ded770c3cfca8fc5d2b6f99b58457ec79f64fc78bc",
+    "benchmark_binary": "target/release/pepper-ordered-log-benchmark",
+    "benchmark_binary_sha256": "700b912beb29b4f14328a43d72f02450ccd0cde26d920d89887062f385f26db4",
+    "cargo_lock_sha256": "6717a71f6fc7597f1224b85cedf961eabfd63acbd351e88e7338114c3d958ee3",
+    "rollback_source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758"
+  },
+  "implementation_validation": {
+    "focused": "cargo test -p pepper-extent -p pepper-ordered-log",
+    "focused_result": "6 extent tests and 8 ordered-log tests passed",
+    "workspace": "cargo fmt --all -- --check && cargo test --workspace",
+    "workspace_result": "47 agent unit tests passed; multinode completed 19 passed, 3 ignored, with one startup-health timeout",
+    "isolated_retry": "cargo test -p pepper-agent --test multinode repair_replicates_to_new_node_after_replica_loss -- --exact --nocapture",
+    "isolated_retry_result": "passed in 32.52 seconds",
+    "classification": "The initial failure was an agent startup health timeout after 20 seconds during the long multinode suite. The exact test passed in isolation and Phase 7 does not change agent startup or repair routing."
+  },
+  "source_file_sha256": {
+    "crates/pepper-extent/src/lib.rs": "362056e3ec07bc67e45e0222ea77551fd50197b5584ba4aa5f649e90de8a696b",
+    "crates/pepper-ordered-log/src/lib.rs": "25eb93ebeafdb72389ee2256b6540ce0c102fd456e5d5167cac0e5bd5b9921f4",
+    "crates/pepper-ordered-log/Cargo.toml": "8d116e1417edc1df3c0a4273aaed9049aacb8af5ac93e1f99c29a20c4b9540ab",
+    "benchmarks/pepper-ordered-log-benchmark/src/main.rs": "1685c61ef5e90b1db8791550c0f5df30f5cf7f3eee67cb966c2538225e3ee72d",
+    "benchmarks/pepper-ordered-log-benchmark/Cargo.toml": "618677df9456bc8fda106607f3cb02d4075ee5d09c64bc21fc5b8984dc064467",
+    "Cargo.toml": "a86e21051d92813768fa7acb301004b5a84cf6bac3092eb91fec82f16a4eeeba",
+    "Cargo.lock": "6717a71f6fc7597f1224b85cedf961eabfd63acbd351e88e7338114c3d958ee3"
+  },
+  "documentation_sha256": {
+    "design/KAFKA_PHASE7_ORDERED_LOG_ENGINE.md": "196848bf3f70e0ec8ba28defe996f71c6a1f266a8330540cc466219f33dc4a73",
+    "design/SHARED_DATA_PLANE_AND_KAFKA_IMPLEMENTATION_PLAN.md": "3a7e846d5bea7bc888d574ee15ff17923a58c372c6a9d7324059f54585e7f434"
+  }
+}

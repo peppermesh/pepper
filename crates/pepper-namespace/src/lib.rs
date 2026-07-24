@@ -592,6 +592,27 @@ impl NamespaceState {
         Ok(Some(record.response.clone()))
     }
 
+    /// Reconstruct the exact applied result after a caller loses an ambiguous
+    /// commit response. The command fingerprint prevents an idempotency key
+    /// from being reused for a different transition.
+    pub fn idempotent_apply_result_for(
+        &self,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<ApplyResult>, NamespaceError> {
+        let Some(record) = self.idempotency.get(&envelope.request_id) else {
+            return Ok(None);
+        };
+        let fingerprint = idempotency_fingerprint(&self.namespace_id, envelope)?;
+        if record.command_fingerprint != fingerprint {
+            return Err(NamespaceError::IdempotencyConflict);
+        }
+        Ok(Some(ApplyResult {
+            response: record.response.clone(),
+            pin_intents: record.pin_intents.clone(),
+            replayed: true,
+        }))
+    }
+
     /// Read-only status lookup for a request whose original envelope may no
     /// longer be available after a client loses the commit response.
     pub fn idempotent_response(&self, request_id: &str) -> Option<&CommandResponse> {

@@ -2,8 +2,12 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use pepper_buffer::BufferChain;
 use pepper_crypto::{NodeIdentity, derive_node_id, verify_signature};
 use pepper_metadata::MetadataStore;
+use pepper_observability::{
+    CostMetric as OperationCostMetric, OperationStage, add_current_cost, observe_current_stage,
+};
 use pepper_types::{CODEC_RAW, Cid, Codec, ProviderRecord, PutBlockResponse};
 use prost::Message;
 use quinn::{
@@ -674,6 +678,20 @@ struct StreamContext {
     lane: TransportLane,
 }
 
+enum StreamedReplicaPayload {
+    Contiguous(Arc<[u8]>),
+    Chain(BufferChain),
+}
+
+impl StreamedReplicaPayload {
+    fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(payload) => payload.len(),
+            Self::Chain(payload) => payload.encoded_len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RateLimitBucket {
     window_start_unix_seconds: i64,
@@ -1011,6 +1029,15 @@ impl NetworkHandle {
             "unauthenticated"
         };
         let method = normalize_rpc_method(method);
+        if direction == "outbound" {
+            add_current_cost(
+                OperationCostMetric::PeerBytes,
+                request_bytes.saturating_add(response_bytes) as u64,
+            );
+            if method == "/block/put_replica_stream" || is_raft_method(method) {
+                observe_current_stage(OperationStage::Replication);
+            }
+        }
         let metrics = if is_bulk_method(method) {
             &self.bulk_rpc_metrics
         } else {
@@ -1765,7 +1792,39 @@ impl NetworkHandle {
             peer,
             RpcClass::Bulk,
             self.bulk_request_timeout,
-            self.block_put_replica_stream_inner(peer, codec, cid, logical_size, payload),
+            self.block_put_replica_stream_inner(
+                peer,
+                codec,
+                cid,
+                logical_size,
+                StreamedReplicaPayload::Contiguous(payload),
+            ),
+        )
+        .await
+    }
+
+    /// Scatter/gather variant used by shared data-plane products. Cloning the
+    /// chain only clones immutable `Bytes` references and the QUIC writer
+    /// consumes each segment without coalescing the payload.
+    pub async fn block_put_replica_buffer_chain(
+        &self,
+        peer: SocketAddr,
+        codec: Codec,
+        cid: &Cid,
+        logical_size: u64,
+        payload: BufferChain,
+    ) -> Result<proto::BlockPutReplicaResponse, NetworkError> {
+        self.with_peer_timeout(
+            peer,
+            RpcClass::Bulk,
+            self.bulk_request_timeout,
+            self.block_put_replica_stream_inner(
+                peer,
+                codec,
+                cid,
+                logical_size,
+                StreamedReplicaPayload::Chain(payload),
+            ),
         )
         .await
     }
@@ -1776,7 +1835,7 @@ impl NetworkHandle {
         codec: Codec,
         cid: &Cid,
         logical_size: u64,
-        payload: Arc<[u8]>,
+        payload: StreamedReplicaPayload,
     ) -> Result<proto::BlockPutReplicaResponse, NetworkError> {
         let queue_started = std::time::Instant::now();
         let _replica_stream_permit = self
@@ -1810,7 +1869,16 @@ impl NetworkHandle {
         if let Some(limiter) = &self.bulk_send_bandwidth {
             limiter.reserve(payload.len()).await;
         }
-        send.write_all(payload.as_ref()).await?;
+        match &payload {
+            StreamedReplicaPayload::Contiguous(payload) => {
+                send.write_all(payload.as_ref()).await?;
+            }
+            StreamedReplicaPayload::Chain(payload) => {
+                for segment in payload.segments() {
+                    send.write_all(segment.bytes()).await?;
+                }
+            }
+        }
         self.transport_counters
             .bulk_bytes_sent_total
             .fetch_add(payload.len() as u64, Ordering::Relaxed);

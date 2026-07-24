@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![recursion_limit = "256"]
 
 mod api_error;
 mod bucket_api;
@@ -53,13 +54,13 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,background_thread:true\0";
 
 use ::time::OffsetDateTime;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -72,14 +73,27 @@ use pepper_bucket::{
     BucketObjectCodecHandler, BucketPartition, BucketPartitionMap, BucketPartitionMapState,
     DEFAULT_BUCKET_PARTITIONS, MAX_BUCKET_PARTITIONS,
 };
+use pepper_buffer::{BufferChain, OwnedBuffer};
 use pepper_compute::validate_job_spec;
-use pepper_config::{LoadedConfig, SmallObjectPackConfig, default_config_path, load_from_path};
+use pepper_config::{
+    KafkaConfig, LoadedConfig, SmallObjectPackConfig, default_config_path, load_from_path,
+};
 use pepper_consensus::{ConsensusConfig, ConsensusDataStore, NamespaceGroupManager};
 use pepper_crypto::{NodeIdentity, verify_signature};
 use pepper_dag::{
     BlockResolver as DagBlockResolver, DagCodecHandler, DagCodecRegistry, DagError, TraversalLimits,
 };
 use pepper_filesystem::{FilesystemInodeCodecHandler, FilesystemRootCodecHandler};
+use pepper_kafka::{
+    KafkaCluster,
+    operations::QuotaConfig,
+    security::{
+        AclEffect, AclOperation, AclRule, KafkaSecurity, PrincipalQuotaConfig, ResourcePattern,
+        ResourceType, ScramCredential,
+    },
+    server::{KafkaServer, KafkaServerConfig, KafkaTlsConfig},
+};
+use pepper_kafka_protocol::ProtocolLimits;
 use pepper_merkle::MerkleNodeCodecHandler;
 use pepper_metadata::MetadataStore;
 use pepper_namespace::{
@@ -90,6 +104,11 @@ use pepper_network::{
     ErasureChunkReceiver, NetworkBlockService, NetworkComputeService, NetworkConfig,
     NetworkErasureService, NetworkError, NetworkHandle, NetworkNamespaceAliasService,
     NetworkPinService, PeerStatus, proto,
+};
+use pepper_observability::{
+    CostMetric as OperationCostMetric, CostTimer as OperationCostTimer, FaultBoundary, OperationId,
+    OperationScope, OperationStage, WorkKey, WorkloadClass, add_current_cost, apply_current_fault,
+    current_operation, observe_current_stage, scope_operation,
 };
 use pepper_placement::{
     AuthoritativePlacementError, PlacementException, PlacementMap, PlacementMapNodeState,
@@ -111,6 +130,7 @@ use pepper_types::{
 };
 use redb::{ReadableTable, TableDefinition};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -353,6 +373,157 @@ struct ObjectPutQuery {
 struct GcQuery {
     #[serde(default)]
     dry_run: bool,
+}
+
+fn kafka_listener_security(
+    config: &KafkaConfig,
+    data_path: &FsPath,
+) -> Result<(Option<KafkaTlsConfig>, Option<Arc<KafkaSecurity>>)> {
+    let tls = match (
+        &config.tls_certificate_chain_path,
+        &config.tls_private_key_path,
+    ) {
+        (None, None) => None,
+        (Some(certificate_path), Some(private_key_path)) => {
+            let certificates = CertificateDer::pem_file_iter(certificate_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open Kafka TLS certificate chain {}",
+                        certificate_path.display()
+                    )
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to parse Kafka TLS certificate chain")?;
+            if certificates.is_empty() {
+                bail!("Kafka TLS certificate chain is empty");
+            }
+            let private_key =
+                PrivateKeyDer::from_pem_file(private_key_path).with_context(|| {
+                    format!(
+                        "failed to read a supported Kafka TLS private key from {}",
+                        private_key_path.display()
+                    )
+                })?;
+            let certificate_bytes = certificates
+                .into_iter()
+                .map(|certificate| certificate.as_ref().to_vec())
+                .collect();
+            if let Some(client_ca_path) = &config.tls_client_ca_path {
+                let client_ca =
+                    CertificateDer::pem_file_iter(client_ca_path).with_context(|| {
+                        format!(
+                            "failed to open Kafka TLS client CA {}",
+                            client_ca_path.display()
+                        )
+                    })?;
+                let mut roots = rustls::RootCertStore::empty();
+                for certificate in client_ca {
+                    roots
+                        .add(certificate.context("failed to parse Kafka TLS client CA")?)
+                        .context("failed to add Kafka TLS client CA")?;
+                }
+                if roots.is_empty() {
+                    bail!("Kafka TLS client CA contains no certificates");
+                }
+                Some(KafkaTlsConfig::from_der_with_client_roots(
+                    certificate_bytes,
+                    private_key.secret_der().to_vec(),
+                    roots,
+                )?)
+            } else {
+                Some(KafkaTlsConfig::from_der(
+                    certificate_bytes,
+                    private_key.secret_der().to_vec(),
+                )?)
+            }
+        }
+        _ => bail!("Kafka TLS certificate chain and private key must be configured together"),
+    };
+
+    let security_requested = config.security_metadata_path.is_some()
+        || config.tls_client_ca_path.is_some()
+        || !config.scram_credentials.is_empty()
+        || !config.acls.is_empty();
+    let security = if security_requested {
+        let path = config
+            .security_metadata_path
+            .clone()
+            .unwrap_or_else(|| data_path.join("kafka").join("security.json"));
+        let security = Arc::new(KafkaSecurity::open(
+            path,
+            PrincipalQuotaConfig {
+                maximum_principals: config.maximum_principals,
+                requests_per_second: config.principal_requests_per_second,
+                ingress_bytes_per_second: config.principal_ingress_bytes_per_second,
+                egress_bytes_per_second: config.principal_egress_bytes_per_second,
+            },
+            config.maximum_audit_events,
+        )?);
+        for credential in &config.scram_credentials {
+            let mut password = std::fs::read(&credential.password_path).with_context(|| {
+                format!(
+                    "failed to read Kafka SCRAM password {}",
+                    credential.password_path.display()
+                )
+            })?;
+            while password
+                .last()
+                .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+            {
+                password.pop();
+            }
+            security.upsert_credential(
+                credential.username.clone(),
+                ScramCredential::from_password(&password, credential.iterations)?,
+            )?;
+            password.fill(0);
+        }
+        if !config.acls.is_empty() {
+            security.replace_acls(
+                config
+                    .acls
+                    .iter()
+                    .map(|acl| {
+                        Ok(AclRule {
+                            principal: acl.principal.clone(),
+                            resource_type: match acl.resource_type.as_str() {
+                                "cluster" => ResourceType::Cluster,
+                                "topic" => ResourceType::Topic,
+                                "group" => ResourceType::Group,
+                                "transactional-id" => ResourceType::TransactionalId,
+                                _ => bail!("invalid Kafka ACL resource type"),
+                            },
+                            resource: acl.resource.clone(),
+                            pattern: match acl.pattern.as_str() {
+                                "literal" => ResourcePattern::Literal,
+                                "prefix" => ResourcePattern::Prefix,
+                                _ => bail!("invalid Kafka ACL resource pattern"),
+                            },
+                            operation: match acl.operation.as_str() {
+                                "all" => AclOperation::All,
+                                "read" => AclOperation::Read,
+                                "write" => AclOperation::Write,
+                                "create" => AclOperation::Create,
+                                "delete" => AclOperation::Delete,
+                                "describe" => AclOperation::Describe,
+                                "alter" => AclOperation::Alter,
+                                _ => bail!("invalid Kafka ACL operation"),
+                            },
+                            effect: match acl.effect.as_str() {
+                                "allow" => AclEffect::Allow,
+                                "deny" => AclEffect::Deny,
+                                _ => bail!("invalid Kafka ACL effect"),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?;
+        }
+        Some(security)
+    } else {
+        None
+    };
+    Ok((tls, security))
 }
 
 fn main() -> Result<()> {
@@ -1239,6 +1410,86 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     if state.sqlite_enabled {
         spawn_sqlite_protocol_server(state.clone()).await?;
     }
+    let kafka_task = if loaded.config.kafka.enabled {
+        let listener = tokio::net::TcpListener::bind(&loaded.config.kafka.bind_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind Kafka listener at {}",
+                    loaded.config.kafka.bind_addr
+                )
+            })?;
+        let bound = listener.local_addr()?;
+        let advertised: SocketAddr = loaded
+            .config
+            .kafka
+            .advertise_addr
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .context("kafka.advertise_addr should have been validated")?
+            .unwrap_or(bound);
+        let (kafka_tls, kafka_security) =
+            kafka_listener_security(&loaded.config.kafka, &loaded.config.data.path)
+                .context("failed to configure Kafka listener security")?;
+        let kafka_secure = kafka_tls.is_some();
+        let cluster = KafkaCluster::open(
+            loaded.config.data.path.join("kafka"),
+            loaded.config.kafka.cluster_id.clone(),
+            loaded.config.kafka.broker_id,
+            vec![(
+                loaded.config.kafka.broker_id,
+                advertised.ip().to_string(),
+                advertised.port(),
+            )],
+            ProtocolLimits {
+                maximum_frame_bytes: loaded.config.kafka.maximum_frame_bytes,
+                ..ProtocolLimits::default()
+            },
+        )
+        .await
+        .context("failed to open Kafka broker state")?;
+        let broker = Arc::new(
+            KafkaServer::new(
+                loaded.config.kafka.broker_id,
+                cluster,
+                KafkaServerConfig {
+                    maximum_connections: loaded.config.kafka.maximum_connections,
+                    request_timeout: Duration::from_secs(
+                        loaded.config.kafka.request_timeout_seconds,
+                    ),
+                    write_timeout: Duration::from_secs(loaded.config.kafka.write_timeout_seconds),
+                    maximum_inflight_response_bytes: loaded
+                        .config
+                        .kafka
+                        .maximum_inflight_response_bytes,
+                    quota: QuotaConfig {
+                        broker_bytes_per_second: loaded.config.kafka.broker_bytes_per_second,
+                        partition_bytes_per_second: loaded.config.kafka.partition_bytes_per_second,
+                        burst_bytes: loaded.config.kafka.quota_burst_bytes,
+                    },
+                    enforce_response_budget: true,
+                    tls: kafka_tls,
+                    security: kafka_security,
+                },
+            )
+            .context("invalid Kafka server configuration")?,
+        );
+        info!(
+            broker_id = loaded.config.kafka.broker_id,
+            bind_addr = %bound,
+            advertise_addr = %advertised,
+            secure = kafka_secure,
+            "Kafka broker listener started"
+        );
+        Some(tokio::spawn(async move {
+            if let Err(error) = broker.serve(listener).await {
+                warn!(%error, "Kafka broker listener stopped");
+            }
+        }))
+    } else {
+        None
+    };
 
     let shutdown_state = state.clone();
     let app = http::router(state);
@@ -1272,6 +1523,9 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         .context("HTTP server failed")?;
 
     shutdown_state.network.shutdown();
+    if let Some(task) = kafka_task {
+        task.abort();
+    }
     if let Ok(mut tasks) = shutdown_state.compute_tasks.lock() {
         for (_, handle) in tasks.drain() {
             handle.abort();
@@ -1969,6 +2223,12 @@ async fn put_replicated_block_with_placement_map(
     } else {
         None
     };
+    observe_current_stage(OperationStage::Storage);
+    add_current_cost(OperationCostMetric::StorageOperations, 1);
+    add_current_cost(OperationCostMetric::StorageBytes, payload.len() as u64);
+    apply_current_fault(FaultBoundary::StorageBefore)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let local_put_started = time::Instant::now();
     let local_put = if placement_map.is_some() {
         let encoded = tokio::task::block_in_place(|| state.block_store.encode(codec, &payload))?;
@@ -1979,6 +2239,8 @@ async fn put_replicated_block_with_placement_map(
             already_existed: false,
             storage_location: "authoritative-placement-pending".to_string(),
         };
+        metrics::observe_payload_allocation(encoded.bytes().len());
+        metrics::observe_payload_copy(encoded.bytes().len());
         let wire = encoded.bytes().to_vec();
         Ok((put, wire, Some(encoded)))
     } else if replication_factor > 1 {
@@ -1999,6 +2261,9 @@ async fn put_replicated_block_with_placement_map(
         local_put_started.elapsed(),
     );
     let (local_put, payload, pending_local_encoded) = local_put?;
+    apply_current_fault(FaultBoundary::StorageAfter)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let local_descriptor = state.network.local_descriptor();
 
     let (placement, selected) = if let Some(map) = placement_map {
@@ -2044,12 +2309,27 @@ async fn put_replicated_block_with_placement_map(
         .into_iter()
         .collect::<Vec<_>>();
 
-    let payload: Arc<[u8]> = Arc::from(payload);
+    let payload = BufferChain::from_buffer(OwnedBuffer::from_vec(payload));
+    let remote_replica_count = selected
+        .iter()
+        .filter(|(_, is_local, _)| !*is_local)
+        .count() as u64;
+    if remote_replica_count > 0 {
+        observe_current_stage(OperationStage::Replication);
+        add_current_cost(
+            OperationCostMetric::PeerBytes,
+            local_put.size.saturating_mul(remote_replica_count),
+        );
+        apply_current_fault(FaultBoundary::ReplicationBefore)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
     let writes = selected
         .into_iter()
         .filter(|(_, is_local, _)| !*is_local)
         .map(|(node_id, _, address)| {
             let network = fast_path::io_network(&state.network);
+            metrics::observe_shared_payload_reference();
             let payload = payload.clone();
             let cid = local_put.cid.clone();
             async move {
@@ -2064,7 +2344,13 @@ async fn put_replicated_block_with_placement_map(
                             })?,
                     };
                     network
-                        .block_put_replica_stream(address, codec, &cid, local_put.size, payload)
+                        .block_put_replica_buffer_chain(
+                            address,
+                            codec,
+                            &cid,
+                            local_put.size,
+                            payload,
+                        )
                         .await
                         .map_err(|error| error.to_string())
                 }
@@ -2104,6 +2390,11 @@ async fn put_replicated_block_with_placement_map(
         &metrics::S3_REPLICA_TRANSFER_MICROS,
         replica_transfer_started.elapsed(),
     );
+    if remote_replica_count > 0 {
+        apply_current_fault(FaultBoundary::ReplicationAfter)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
 
     replica_nodes.sort();
     replica_nodes.dedup();
@@ -2118,6 +2409,7 @@ async fn put_replicated_block_with_placement_map(
             ),
         ));
     }
+    observe_current_stage(OperationStage::Durability);
     let status = "durable".to_string();
     let placement = match placement {
         Some(placement) => Some(placement),
@@ -3063,10 +3355,10 @@ async fn store_erasure_shard_legacy(
             .iter()
             .find_map(|address| address.parse().ok())
     {
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
         if let Ok(ack) = state
             .network
-            .block_put_replica_stream(
+            .block_put_replica_buffer_chain(
                 address,
                 CODEC_RAW,
                 &cid,
@@ -3095,7 +3387,7 @@ async fn store_erasure_shard_legacy(
         let encoded = state.block_store.validate_encoded_replica(
             cid.clone(),
             logical_size,
-            encoded_payload.as_ref().to_vec(),
+            encoded_payload.segments()[0].bytes().to_vec(),
         )?;
         state.block_store.put_encoded(&encoded)?;
     } else {
@@ -3154,12 +3446,12 @@ async fn copy_erasure_shard_to_node(
     let size = encoded.logical_size_bytes();
     let ack = state
         .network
-        .block_put_replica_stream(
+        .block_put_replica_buffer_chain(
             address,
             CODEC_RAW,
             cid,
             size,
-            Arc::from(encoded.into_bytes()),
+            BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes())),
         )
         .await?;
     let record = validate_replica_ack(state, &node.node_id, cid, CODEC_RAW, size, &ack)?;
@@ -3230,10 +3522,10 @@ async fn store_erasure_shard(
                     format!("erasure placement node {target_id} has no routable address"),
                 )
             })?;
-        let encoded_payload: Arc<[u8]> = Arc::from(encoded.into_bytes());
+        let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
         metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let ack = fast_path::io_network(&state.network)
-            .block_put_replica_stream(
+            .block_put_replica_buffer_chain(
                 address,
                 CODEC_RAW,
                 &cid,
@@ -4895,7 +5187,12 @@ async fn read_body_limited(
         let chunk = chunk.map_err(|error| ApiError::bad_request(error.to_string()))?;
         let new_len = (bytes.len() as u64).saturating_add(chunk.len() as u64);
         enforce_size_limit(limit, new_len, name)?;
+        let previous_capacity = bytes.capacity();
+        metrics::observe_payload_copy(chunk.len());
         bytes.extend_from_slice(&chunk);
+        if bytes.capacity() != previous_capacity {
+            metrics::observe_payload_allocation(bytes.capacity());
+        }
     }
     Ok(bytes)
 }
@@ -5053,6 +5350,7 @@ async fn put_erasure_object_stream_receipts_with_compression(
     let candidates = placement_candidates(state, state.network.peers().await);
     let pipeline_depth = object_chunk_pipeline_depth(1).clamp(1, 4);
     let mut body_stream = body.into_data_stream();
+    metrics::observe_payload_allocation(stripe_size);
     let mut pending = Vec::with_capacity(stripe_size);
     let mut transfers = stream::FuturesOrdered::new();
     let mut stripes = Vec::new();
@@ -5087,9 +5385,11 @@ async fn put_erasure_object_stream_receipts_with_compression(
         let mut remaining = data.as_ref();
         while !remaining.is_empty() {
             let take = (stripe_size - pending.len()).min(remaining.len());
+            metrics::observe_payload_copy(take);
             pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             if pending.len() == stripe_size {
+                metrics::observe_payload_allocation(stripe_size);
                 let payload = std::mem::replace(&mut pending, Vec::with_capacity(stripe_size));
                 transfers.push_back(encode_and_store_erasure_stripe(
                     state,
@@ -5153,6 +5453,7 @@ async fn put_object_stream_receipts(
     body: Body,
 ) -> Result<ObjectWriteReceipts, ApiError> {
     let mut body_stream = body.into_data_stream();
+    metrics::observe_payload_allocation(OBJECT_CHUNK_SIZE);
     let mut pending = Vec::with_capacity(OBJECT_CHUNK_SIZE);
     let mut transfers = stream::FuturesOrdered::new();
     let mut chunks = Vec::new();
@@ -5179,9 +5480,11 @@ async fn put_object_stream_receipts(
         let mut remaining = data.as_ref();
         while !remaining.is_empty() {
             let take = (OBJECT_CHUNK_SIZE - pending.len()).min(remaining.len());
+            metrics::observe_payload_copy(take);
             pending.extend_from_slice(&remaining[..take]);
             remaining = &remaining[take..];
             if pending.len() == OBJECT_CHUNK_SIZE {
+                metrics::observe_payload_allocation(OBJECT_CHUNK_SIZE);
                 let payload =
                     std::mem::replace(&mut pending, Vec::with_capacity(OBJECT_CHUNK_SIZE));
                 transfers.push_back(put_object_chunk(state, payload, next_chunk_offset));
@@ -5566,6 +5869,47 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn kafka_listener_loads_tls_scram_acl_and_private_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate_path = directory.path().join("kafka.pem");
+        let key_path = directory.path().join("kafka.key");
+        let password_path = directory.path().join("password");
+        std::fs::write(&certificate_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+        std::fs::write(&password_path, b"agent-qualification\n").unwrap();
+        let mut config = KafkaConfig {
+            tls_certificate_chain_path: Some(certificate_path),
+            tls_private_key_path: Some(key_path),
+            ..KafkaConfig::default()
+        };
+        config
+            .scram_credentials
+            .push(pepper_config::KafkaScramCredentialConfig {
+                username: "agent-test".into(),
+                password_path,
+                iterations: 4_096,
+            });
+        config.acls.push(pepper_config::KafkaAclConfig {
+            principal: "agent-test".into(),
+            resource_type: "topic".into(),
+            resource: "agent-test.".into(),
+            pattern: "prefix".into(),
+            operation: "all".into(),
+            effect: "allow".into(),
+        });
+        let (tls, security) = kafka_listener_security(&config, directory.path()).unwrap();
+        assert!(tls.is_some());
+        let security = security.unwrap();
+        assert_eq!(security.snapshot().unwrap().credentials, 1);
+        assert_eq!(security.snapshot().unwrap().acl_rules, 1);
+        let metadata =
+            std::fs::read_to_string(directory.path().join("kafka/security.json")).unwrap();
+        assert!(!metadata.contains("agent-qualification"));
+    }
 
     #[test]
     fn hierarchical_coordinator_minimizes_cross_domain_bytes() {

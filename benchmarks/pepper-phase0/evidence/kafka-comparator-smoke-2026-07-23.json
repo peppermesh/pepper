@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "classification": "exploratory-smoke-not-qualification-evidence",
+  "date": "2026-07-23",
+  "source_revision": "7b7a237995acbe0470952025d1daf13c9cce2758",
+  "source_dirty": true,
+  "kafka": {
+    "version": "4.3.1",
+    "image": "apache/kafka:4.3.1",
+    "image_digest": "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837",
+    "nodes": 3,
+    "combined_kraft_broker_controllers": true,
+    "replication_factor": 3,
+    "minimum_in_sync_replicas": 2,
+    "unclean_leader_election": false,
+    "log_flush_interval_messages": 9223372036854775807,
+    "filesystem": "xfs",
+    "data_mount": "/home"
+  },
+  "workload": {
+    "topics": 5,
+    "partitions_per_topic": 12,
+    "records_per_topic": 200000,
+    "warmup_records_per_topic": 100000,
+    "record_bytes": 1024,
+    "acks": "all",
+    "compression": "none",
+    "idempotence": false
+  },
+  "steady_state_produce": [
+    {
+      "records_per_second": 333333.333333,
+      "mib_per_second": 325.52,
+      "p50_millis": 4,
+      "p95_millis": 7,
+      "p99_millis": 8
+    },
+    {
+      "records_per_second": 364963.50365,
+      "mib_per_second": 356.41,
+      "p50_millis": 2,
+      "p95_millis": 4,
+      "p99_millis": 5
+    },
+    {
+      "records_per_second": 322580.645161,
+      "mib_per_second": 315.02,
+      "p50_millis": 4,
+      "p95_millis": 9,
+      "p99_millis": 11
+    },
+    {
+      "records_per_second": 353356.890459,
+      "mib_per_second": 345.08,
+      "p50_millis": 2,
+      "p95_millis": 4,
+      "p99_millis": 6
+    },
+    {
+      "records_per_second": 359712.230216,
+      "mib_per_second": 351.28,
+      "p50_millis": 2,
+      "p95_millis": 11,
+      "p99_millis": 16
+    }
+  ],
+  "end_to_end_consume": [
+    {
+      "mib_per_second": 55.0331,
+      "records_per_second": 56353.9025,
+      "rebalance_millis": 3283,
+      "fetch_millis": 266
+    },
+    {
+      "mib_per_second": 56.1727,
+      "records_per_second": 57520.8513,
+      "rebalance_millis": 3203,
+      "fetch_millis": 274
+    },
+    {
+      "mib_per_second": 56.514,
+      "records_per_second": 57870.3704,
+      "rebalance_millis": 3202,
+      "fetch_millis": 254
+    },
+    {
+      "mib_per_second": 56.4161,
+      "records_per_second": 57770.0751,
+      "rebalance_millis": 3196,
+      "fetch_millis": 266
+    },
+    {
+      "mib_per_second": 56.4813,
+      "records_per_second": 57836.8999,
+      "rebalance_millis": 3201,
+      "fetch_millis": 257
+    }
+  ],
+  "runner_artifact": {
+    "local_path": "target/phase0-kafka-xfs-smoke",
+    "run_sha256": "e03bf1da62fc7a28b7a52f3e374136857206cb34d7f902ec181e8b5b470d4e81",
+    "manifest_sha256": "153f083d4b8b3375cf4a855cd54d844468693aa7b81e90b99fbea3a15a9bc810",
+    "success": true
+  },
+  "limitations": [
+    "The source worktree was dirty.",
+    "The trial was intentionally short and used only 100000 steady-state records per topic.",
+    "All three Kafka containers ran on one development host.",
+    "Kafka used its normal replicated durability profile and did not fsync every message.",
+    "The consumer tool's end-to-end rate includes approximately 3.2 seconds of group rebalance time."
+  ]
+}

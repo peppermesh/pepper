@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-kafka-protocol"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Bounded Kafka client-protocol framing and record validation for Pepper"
+
+[dependencies]
+bytes = { workspace = true }
+crc32c = { workspace = true }
+kafka-protocol = { workspace = true }
+pepper-buffer = { path = "../pepper-buffer", version = "0.3.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.7"

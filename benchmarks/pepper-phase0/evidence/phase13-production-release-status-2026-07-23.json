@@ -1,0 +1,21 @@
+{
+  "schema": "pepper.phase13.production-release-status.v1",
+  "date_utc": "2026-07-23",
+  "engineering_implementation": "complete",
+  "release_candidate": true,
+  "production_certified": false,
+  "ga_blocker": {
+    "gate": "72-hour mixed secure-client production-topology soak",
+    "status": "pending",
+    "reason": "The checked-in accelerated qualification passed, but no 72-hour production deployment run was executed in this implementation workspace."
+  },
+  "completed_gates": [
+    "protocol vectors, truncation, preflight, and malformed corpus",
+    "TLS 1.3, mTLS, SCRAM-SHA-256, ACL, quota, audit, and verifier persistence",
+    "pinned secure Java, librdkafka, franz-go, and kafka-python-ng flows",
+    "accelerated 1,000,000-operation and 10,000-rebalance-event qualification",
+    "markerless upgrade and future-format rejection",
+    "retained functional and performance qualification"
+  ],
+  "promotion_rule": "Do not mark production_certified or GA until the pending gate is run on the intended topology and all raw artifacts satisfy the Phase 13 runbook."
+}

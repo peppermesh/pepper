@@ -721,9 +721,25 @@ pub(super) async fn s3_dispatch(
         let mut affinity = bucket.as_deref().unwrap_or_default().as_bytes().to_vec();
         affinity.push(0);
         affinity.extend_from_slice(key.as_deref().unwrap_or_default().as_bytes());
+        let admitted_bytes = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let admission = pepper_keyed_runtime::Admission {
+            class: pepper_keyed_runtime::WorkClass::Foreground,
+            bytes: admitted_bytes,
+            requests: 1,
+            tenant: pepper_keyed_runtime::ScopeId::from_bytes(
+                bucket.as_deref().unwrap_or_default().as_bytes(),
+            ),
+            product: pepper_keyed_runtime::ScopeId::from_bytes(b"s3"),
+            operation: pepper_keyed_runtime::ScopeId::from_bytes(method.as_str().as_bytes()),
+            deadline: std::time::Instant::now() + Duration::from_secs(1),
+        };
         let resource = uri.path().to_string();
         return runtime
-            .execute(&affinity, &resource, async move {
+            .execute_admitted(&affinity, &resource, admission, async move {
                 s3_dispatch_inner(state, uri, method, headers, body, bucket, key).await
             })
             .await;
@@ -7456,9 +7472,13 @@ pub(super) async fn admin_placement_exception_put(
             .or_else(|_| state.block_store.encode(block.codec, &block.payload))
     })?;
     let local_node_id = state.network.local_descriptor().node_id;
+    let encoded_logical_size = encoded.logical_size_bytes();
+    if exception.node_ids.contains(&local_node_id) {
+        tokio::task::block_in_place(|| state.block_store.put_encoded(&encoded))?;
+    }
+    let encoded_payload = BufferChain::from_buffer(OwnedBuffer::from_vec(encoded.into_bytes()));
     for node_id in &exception.node_ids {
         if node_id == &local_node_id {
-            tokio::task::block_in_place(|| state.block_store.put_encoded(&encoded))?;
             continue;
         }
         let address = state.network.peer_address(node_id).await.ok_or_else(|| {
@@ -7471,12 +7491,12 @@ pub(super) async fn admin_placement_exception_put(
         metrics::PLACEMENT_DIRECT_TARGET_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         let ack = state
             .network
-            .block_put_replica_stream(
+            .block_put_replica_buffer_chain(
                 address,
                 block.codec,
                 &exception.block_cid,
-                encoded.logical_size_bytes(),
-                Arc::from(encoded.bytes()),
+                encoded_logical_size,
+                encoded_payload.clone(),
             )
             .await
             .map_err(|error| {
@@ -7487,11 +7507,10 @@ pub(super) async fn admin_placement_exception_put(
             node_id,
             &exception.block_cid,
             block.codec,
-            encoded.logical_size_bytes(),
+            encoded_logical_size,
             &ack,
         )?;
-        metrics::PLACEMENT_DIRECT_TARGET_BYTES
-            .fetch_add(encoded.logical_size_bytes(), Ordering::Relaxed);
+        metrics::PLACEMENT_DIRECT_TARGET_BYTES.fetch_add(encoded_logical_size, Ordering::Relaxed);
     }
     let catalog = ensure_s3_bucket_catalog(&state, "/v1/admin/placement/exceptions")
         .await

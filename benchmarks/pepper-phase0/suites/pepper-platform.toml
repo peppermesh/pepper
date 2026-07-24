@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "pepper-phase0-platform"
+environment_label = "three Pepper peers on qualification hardware"
+required_environment = [
+  "PEPPER_API",
+  "PEPPER_API_NODE2",
+  "PEPPER_API_NODE3",
+  "PEPPER_SQLITE_SOCKET",
+  "PEPPER_PHASE0_FILESYSTEM_DIRECTORY",
+  "PEPPER_PHASE0_ARTIFACT_DIRECTORY",
+  "PEPPER_S3_ENDPOINTS",
+]
+
+[[metrics]]
+name = "node1"
+url = "${PEPPER_API}/metrics"
+required = true
+
+[[metrics]]
+name = "node2"
+url = "${PEPPER_API_NODE2}/metrics"
+required = true
+
+[[metrics]]
+name = "node3"
+url = "${PEPPER_API_NODE3}/metrics"
+required = true
+
+[[cases]]
+name = "native-storage"
+product = "storage"
+command = ["cargo", "test", "--release", "-q", "-p", "pepper-storage", "tests::native_group_commit_uses_one_barrier_per_device", "--", "--exact"]
+repetitions = 5
+timeout_seconds = 300
+required_stdout = ["1 passed"]
+
+[[cases]]
+name = "s3-put-baseline"
+product = "s3"
+command = [
+  "cargo", "run", "--release", "-q", "-p", "pepper-s3-throughput", "--",
+  "loadgen",
+  "--backend", "s3",
+  "--operation", "put",
+  "--size", "4096",
+  "--concurrency", "8",
+  "--duration", "60",
+  "--object-count", "1024",
+  "--endpoints", "${PEPPER_S3_ENDPOINTS}",
+  "--access-key", "pepper-dev",
+  "--secret-key", "pepper-dev-secret-key-change-me",
+  "--output", "${PEPPER_PHASE0_ARTIFACT_DIRECTORY}/s3-${PEPPER_PHASE0_REPETITION}.json",
+  "--quiet",
+]
+repetitions = 5
+timeout_seconds = 600
+
+[[cases]]
+name = "sqlite-filesystem-pepper"
+product = "sqlite"
+command = [
+  "cargo", "run", "--release", "-q", "-p", "pepper-sqlite-benchmark", "--",
+  "--api", "${PEPPER_API}",
+  "--socket", "${PEPPER_SQLITE_SOCKET}",
+  "--filesystem-directory", "${PEPPER_PHASE0_FILESYSTEM_DIRECTORY}",
+  "--environment-label", "Phase 0 same-storage-class three-peer comparison",
+  "--output", "${PEPPER_PHASE0_ARTIFACT_DIRECTORY}/sqlite-${PEPPER_PHASE0_REPETITION}.json",
+]
+repetitions = 5
+timeout_seconds = 7200
+
+[[cases]]
+name = "filesystem-benchmark"
+product = "filesystem"
+command = [
+  "cargo", "run", "--release", "-q", "-p", "pepper-filesystem-benchmark", "--",
+  "--api", "${PEPPER_API}",
+  "--scratch-directory", "${PEPPER_PHASE0_FILESYSTEM_DIRECTORY}",
+  "--files", "1000",
+  "--file-bytes", "4096",
+  "--mutation-percent", "10",
+  "--iterations", "10",
+  "--environment-label", "Phase 0 three-peer filesystem benchmark",
+  "--output", "${PEPPER_PHASE0_ARTIFACT_DIRECTORY}/filesystem.json",
+]
+repetitions = 1
+timeout_seconds = 7200
+
+[[cases]]
+name = "network-failover"
+product = "network"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::authenticated_quic_discovers_routes_fails_over_and_stops_without_quorum",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 5
+timeout_seconds = 1800
+required_stdout = ["1 passed"]
+
+[[cases]]
+name = "consensus-density-100"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 3600
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "100" }
+required_stdout = ['"groups_leader_ready": 100']
+
+[[cases]]
+name = "consensus-density-1000"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 7200
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "1000" }
+required_stdout = ['"groups_leader_ready": 1000']
+
+[[cases]]
+name = "consensus-density-10000"
+product = "consensus"
+command = [
+  "cargo", "test", "--release", "-q", "-p", "pepper-consensus",
+  "tests::phase0_consensus_group_density_benchmark",
+  "--", "--ignored", "--exact", "--nocapture", "--test-threads=1",
+]
+repetitions = 1
+timeout_seconds = 14400
+environment = { PEPPER_CONSENSUS_DENSITY_GROUPS = "10000" }
+required_stdout = ['"groups_leader_ready": 10000']

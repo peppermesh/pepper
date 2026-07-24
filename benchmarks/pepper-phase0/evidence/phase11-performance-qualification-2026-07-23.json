@@ -1,0 +1,135 @@
+{
+  "schema": "pepper.phase11.performance-qualification.v1",
+  "baseline_sha256": "59d588f834b6dd7d6f2681c4ebee55ed991459b85906555844ce7c8ee6edc75a",
+  "candidate_sha256": "3dc0c7d824806f5b0f44f71946c61594128f8e8818b78176b918bc655b75c363",
+  "cases": [
+    {
+      "batch_bytes": 1024,
+      "concurrency": 1,
+      "append_throughput_regression_percent": 0.06949329491077183,
+      "append_p99_regression_percent": 2.918782918498816e+18,
+      "append_p99_delta_microseconds": 6.4809999999999945,
+      "fetch_throughput_regression_percent": 2.2276555773684814,
+      "fetch_p99_regression_percent": 1.473127438112893e+18,
+      "fetch_p99_delta_microseconds": 3.271000000000008,
+      "pass": true
+    },
+    {
+      "batch_bytes": 1024,
+      "concurrency": 8,
+      "append_throughput_regression_percent": 0.2841479702957339,
+      "append_p99_regression_percent": 1.7861276122151322e+19,
+      "append_p99_delta_microseconds": 39.659999999999854,
+      "fetch_throughput_regression_percent": 0.0,
+      "fetch_p99_regression_percent": 0.0,
+      "fetch_p99_delta_microseconds": 0.0,
+      "pass": true
+    },
+    {
+      "batch_bytes": 1024,
+      "concurrency": 32,
+      "append_throughput_regression_percent": 0.0,
+      "append_p99_regression_percent": 5.043581222691635e+18,
+      "append_p99_delta_microseconds": 11.198999999998705,
+      "fetch_throughput_regression_percent": 0.619327420158089,
+      "fetch_p99_regression_percent": 1.1209459472525184e+18,
+      "fetch_p99_delta_microseconds": 2.4890000000000043,
+      "pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 1,
+      "append_throughput_regression_percent": 0.20385387690639023,
+      "append_p99_regression_percent": 0.0,
+      "append_p99_delta_microseconds": 0.0,
+      "fetch_throughput_regression_percent": 0.0,
+      "fetch_p99_regression_percent": 0.0,
+      "fetch_p99_delta_microseconds": 0.0,
+      "pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 8,
+      "append_throughput_regression_percent": 0.0,
+      "append_p99_regression_percent": 3.314649325744681e+19,
+      "append_p99_delta_microseconds": 73.59999999999991,
+      "fetch_throughput_regression_percent": 1.0806767868279388,
+      "fetch_p99_regression_percent": 5.179139571476095e+17,
+      "fetch_p99_delta_microseconds": 1.1500000000000057,
+      "pass": true
+    },
+    {
+      "batch_bytes": 16384,
+      "concurrency": 32,
+      "append_throughput_regression_percent": 0.4276573771950565,
+      "append_p99_regression_percent": 1.170935903116329e+19,
+      "append_p99_delta_microseconds": 26.0,
+      "fetch_throughput_regression_percent": 0.0,
+      "fetch_p99_regression_percent": 0.0,
+      "fetch_p99_delta_microseconds": 0.0,
+      "pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 1,
+      "append_throughput_regression_percent": 0.338860211559433,
+      "append_p99_regression_percent": 6.038426380378358e+19,
+      "append_p99_delta_microseconds": 134.07999999999993,
+      "fetch_throughput_regression_percent": 2.035015116539063,
+      "fetch_p99_regression_percent": 0.0,
+      "fetch_p99_delta_microseconds": 0.0,
+      "pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 8,
+      "append_throughput_regression_percent": 0.0,
+      "append_p99_regression_percent": 0.0,
+      "append_p99_delta_microseconds": 0.0,
+      "fetch_throughput_regression_percent": 1.1603271469195042,
+      "fetch_p99_regression_percent": 1.1726923069710029e+19,
+      "fetch_p99_delta_microseconds": 26.038999999999987,
+      "pass": true
+    },
+    {
+      "batch_bytes": 1048576,
+      "concurrency": 32,
+      "append_throughput_regression_percent": 0.0,
+      "append_p99_regression_percent": 0.0,
+      "append_p99_delta_microseconds": 0.0,
+      "fetch_throughput_regression_percent": 0.09783432806548253,
+      "fetch_p99_regression_percent": 0.0,
+      "fetch_p99_delta_microseconds": 0.0,
+      "pass": true
+    }
+  ],
+  "waiters": [
+    {
+      "registrations": 1,
+      "registration_microseconds": 1,
+      "targeted_wake_microseconds": 9,
+      "targeted_wake_count": 1,
+      "remaining_after_targeted_wake": 0,
+      "pass": true
+    },
+    {
+      "registrations": 1000,
+      "registration_microseconds": 606,
+      "targeted_wake_microseconds": 2,
+      "targeted_wake_count": 1,
+      "remaining_after_targeted_wake": 999,
+      "pass": true
+    },
+    {
+      "registrations": 100000,
+      "registration_microseconds": 63801,
+      "targeted_wake_microseconds": 4,
+      "targeted_wake_count": 1,
+      "remaining_after_targeted_wake": 99999,
+      "pass": true
+    }
+  ],
+  "waiter_handle_bytes": 32,
+  "one_scheduler": true,
+  "all_pass": true
+}

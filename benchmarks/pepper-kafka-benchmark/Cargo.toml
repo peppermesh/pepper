@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "pepper-kafka-benchmark"
+version = { workspace = true }
+publish = false
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = "Apache-2.0"
+repository = { workspace = true }
+homepage = { workspace = true }
+description = "Retained Phase 8 Kafka protocol qualification"
+
+[dependencies]
+bytes = { workspace = true }
+kafka-protocol = { workspace = true }
+pepper-kafka = { path = "../../crates/pepper-kafka", version = "0.3.0" }
+pepper-kafka-protocol = { path = "../../crates/pepper-kafka-protocol", version = "0.3.0" }
+pepper-ordered-log = { path = "../../crates/pepper-ordered-log", version = "0.3.0" }
+rcgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3.23"
+tokio = { workspace = true }
