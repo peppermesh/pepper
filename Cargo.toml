@@ -6,6 +6,7 @@ members = [
     "benchmarks/pepper-kafka-benchmark",
     "benchmarks/pepper-kafka-operations-benchmark",
     "benchmarks/pepper-ordered-log-benchmark",
+    "benchmarks/pepper-parity",
     "benchmarks/pepper-phase0",
     "benchmarks/pepper-s3-throughput",
     "benchmarks/pepper-sqlite-benchmark",

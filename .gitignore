@@ -10,3 +10,4 @@
 
 # Documentation is maintained outside this repository.
 /docs/
+.claude/worktrees/

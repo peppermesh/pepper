@@ -1821,6 +1821,98 @@ mod tests {
         assert_eq!(clean_reopen.progress(0).unwrap().log_end_offset, 3);
     }
 
+    // Durability contract (WRITE_PATH_OPTIMIZATION.md correctness suite): for
+    // any number of appended records and any persisted watermark, reopening
+    // from that watermark must preserve *exactly* the committed prefix, in
+    // order, and never lose a committed (acknowledged) record. `OrderedLog::open`
+    // truncates the log to the persisted watermark, so this is the invariant the
+    // produce path relies on and the two-phase-append refactor must not break.
+    #[test]
+    fn recovery_preserves_exactly_the_committed_prefix() {
+        for &appended in &[0u64, 1, 2, 5, 8] {
+            for watermark in 0..=appended {
+                let directory = TempDir::new().unwrap();
+                {
+                    let log = log_at(&directory, RecoveryState::default(), 1000);
+                    log.promise_epoch(1, 1).unwrap();
+                    log.activate_leader(1, 1).unwrap();
+                    for index in 0..appended {
+                        log.append(1, index, 1, payload(format!("r{index}").as_bytes()))
+                            .unwrap();
+                    }
+                    if watermark > 0 {
+                        log.commit(1, watermark).unwrap();
+                    }
+                }
+                // Reopen from the persisted watermark, exactly as a checkpoint
+                // would drive recovery after a crash.
+                let recovered = log_at(
+                    &directory,
+                    RecoveryState {
+                        promised_epoch: 1,
+                        high_watermark: watermark,
+                        log_start_offset: 0,
+                    },
+                    1000,
+                );
+                let fetched = recovered.fetch(0, u64::MAX, true).unwrap();
+                assert_eq!(
+                    fetched.batches.len(),
+                    watermark as usize,
+                    "committed record count (appended={appended}, watermark={watermark})"
+                );
+                for index in 0..watermark {
+                    assert_eq!(
+                        fetched.batches[index as usize].bytes.bytes(),
+                        format!("r{index}").as_bytes(),
+                        "record {index} content/order (appended={appended}, watermark={watermark})"
+                    );
+                }
+                assert_eq!(
+                    recovered.progress(0).unwrap().high_watermark,
+                    watermark,
+                    "recovered watermark (appended={appended}, watermark={watermark})"
+                );
+            }
+        }
+    }
+
+    // A checkpoint that claims a watermark beyond what the log actually holds is
+    // a corrupt/rolled-back recovery point and must be rejected, not silently
+    // accepted (which would expose or acknowledge records that were never
+    // durably appended).
+    #[test]
+    fn recovery_watermark_beyond_the_log_is_rejected() {
+        let directory = TempDir::new().unwrap();
+        {
+            let log = log_at(&directory, RecoveryState::default(), 1000);
+            log.promise_epoch(1, 1).unwrap();
+            log.activate_leader(1, 1).unwrap();
+            log.append(1, 0, 1, payload(b"only")).unwrap();
+            log.commit(1, 1).unwrap();
+        }
+        let store =
+            Arc::new(FileExtentStore::open(directory.path(), FileExtentConfig::default()).unwrap());
+        let result = OrderedLog::open(
+            store,
+            OrderedLogConfig {
+                partition_key: [7; 16],
+                sparse_index_stride: 16,
+                maximum_segment_batches: 1000,
+                ..OrderedLogConfig::default()
+            },
+            RecoveryState {
+                promised_epoch: 1,
+                high_watermark: 5,
+                log_start_offset: 0,
+            },
+        );
+        assert!(
+            matches!(result, Err(OrderedLogError::InvalidRecoveryPoint { .. })),
+            "watermark beyond log end must be rejected"
+        );
+    }
+
     #[test]
     fn authenticated_truncation_preserves_committed_prefix() {
         let directory = TempDir::new().unwrap();

@@ -266,6 +266,7 @@ impl KafkaServer {
     /// snapshot instead of becoming an unbounded metric label.
     pub fn prometheus_metrics(&self) -> String {
         let (waiters, quotas, responses) = self.operations_snapshot();
+        let produce_stats = crate::process_produce_stats();
         format!(
             concat!(
                 "pepper_kafka_connections_active {}\n",
@@ -281,7 +282,9 @@ impl KafkaServer {
                 "pepper_kafka_response_bytes_inflight {}\n",
                 "pepper_kafka_response_bytes_high_water {}\n",
                 "pepper_kafka_response_budget_rejections_total {}\n",
-                "pepper_kafka_protocol_payload_copies_total {}\n"
+                "pepper_kafka_protocol_payload_copies_total {}\n",
+                "pepper_kafka_produce_operations_total {}\n",
+                "pepper_kafka_produce_checkpoint_fsyncs_total {}\n"
             ),
             self.metrics.active_connections.load(Ordering::Relaxed),
             self.metrics.rejected_connections.load(Ordering::Relaxed),
@@ -297,6 +300,8 @@ impl KafkaServer {
             responses.high_water_bytes,
             responses.rejections,
             self.metrics.protocol_payload_copies.load(Ordering::Relaxed),
+            produce_stats.produce_operations,
+            produce_stats.produce_checkpoint_fsyncs,
         )
     }
 

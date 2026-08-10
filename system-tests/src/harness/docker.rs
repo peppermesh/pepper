@@ -39,6 +39,7 @@ use std::{
 
 const CONTAINER_P2P_PORT: u16 = 7000;
 const CONTAINER_API_PORT: u16 = 8080;
+const CONTAINER_KAFKA_PORT: u16 = 9092;
 const TEST_UID: u64 = 65_532;
 const TEST_GID: u64 = 65_532;
 const MAX_EXEC_OUTPUT: usize = 64 * 1024 * 1024;
@@ -760,6 +761,7 @@ impl ClusterBackend for DockerBackend {
                     address,
                     p2p_port: CONTAINER_P2P_PORT,
                     api_port: CONTAINER_API_PORT,
+                    kafka_port: CONTAINER_KAFKA_PORT,
                     config_path: run
                         .artifacts
                         .root

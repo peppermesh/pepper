@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kafka parity: Pepper vs Apache Kafka at the fsync-quorum profile — the
+# headline "same guarantees" comparison. Apache Kafka runs with acks=all,
+# min.insync.replicas=2, AND flush.messages=1 so acknowledgment implies media
+# durability, matching Pepper's ordered-log semantics. The durability audit
+# SIGKILLs every broker after acknowledged writes and requires full read-back.
+#
+# Both sides are driven by the identical pinned Apache Kafka perf tools
+# (topologies/kafka-driver.sh). Workload `concurrency` is the partition
+# count. Warmup uses the producer tool's --warmup-records, so
+# workload.warmup_seconds stays zero. This checked-in file is the exploratory
+# template; qualification runs raise the per-cell volume in kafka-driver.sh
+# and pin hosts per PERFORMANCE_PARITY_HARNESS.md.
+#
+# Prerequisites: PEPPER_BENCH_ROOT on the data filesystem under test.
+
+version = 1
+api = "kafka"
+title = "Kafka parity: Pepper vs Apache Kafka, fsync-quorum"
+
+[[profiles]]
+name = "kafka-fsync-quorum"
+fault_tolerance = "survives loss of all brokers after acknowledgment"
+
+[profiles.claims]
+durability = "synced to media before acknowledgment; quorum replicated"
+consistency = "read-committed fetch of acknowledged records"
+replication = "3 replicas, 2 in-sync required"
+
+[[targets]]
+name = "pepper"
+role = "subject"
+profile = "kafka-fsync-quorum"
+endpoint = "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095"
+parser = "kafka-perf-stdout"
+
+[targets.parser_overrides]
+consume = "kafka-consumer-perf-stdout"
+
+[targets.lifecycle]
+prepare = [
+    ["bash", "benchmarks/pepper-parity/topologies/prepare-pepper-kafka.sh"],
+]
+up = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "-f", "benchmarks/pepper-parity/topologies/pepper-kafka.yaml",
+    "--profile", "single",
+    "up", "-d", "--wait",
+]
+down = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "-f", "benchmarks/pepper-parity/topologies/pepper-kafka.yaml",
+    "--profile", "single",
+    "down", "-v",
+]
+ready_url = "http://127.0.0.1:29080/readyz"
+
+[targets.audit]
+steps = [
+    [
+        "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+        "audit-produce", "pepper-parity-kafka-client",
+        "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095", "1", "none",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "-f", "benchmarks/pepper-parity/topologies/pepper-kafka.yaml",
+        "--profile", "single",
+        "kill", "single", "single2", "single3",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "-f", "benchmarks/pepper-parity/topologies/pepper-kafka.yaml",
+        "--profile", "single",
+        "up", "-d", "--wait",
+    ],
+    [
+        "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+        "audit-verify", "pepper-parity-kafka-client",
+        "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095",
+    ],
+]
+
+[targets.measure]
+command = [
+    "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+    "measure", "pepper-parity-kafka-client",
+    "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095",
+    "{operation}", "{payload_size_bytes}", "{concurrency}", "{repetition}",
+    "1", "none",
+]
+
+[[targets]]
+name = "kafka"
+role = "competitor"
+profile = "kafka-fsync-quorum"
+endpoint = "broker-1:9092,broker-2:9092,broker-3:9092"
+parser = "kafka-perf-stdout"
+
+[targets.parser_overrides]
+consume = "kafka-consumer-perf-stdout"
+
+[targets.lifecycle]
+up = [
+    "bash", "-c",
+    "KAFKA_DATA_ROOT=\"$PEPPER_BENCH_ROOT/kafka\" KAFKA_LOG_FLUSH_INTERVAL_MESSAGES=1 docker compose -f benchmarks/pepper-phase0/kafka/compose.yaml up -d --wait",
+]
+down = [
+    "bash", "-c",
+    "KAFKA_DATA_ROOT=\"$PEPPER_BENCH_ROOT/kafka\" docker compose -f benchmarks/pepper-phase0/kafka/compose.yaml down -v",
+]
+
+[targets.audit]
+steps = [
+    [
+        "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+        "audit-produce", "pepper-phase0-kafka-1",
+        "broker-1:9092,broker-2:9092,broker-3:9092", "3", "min.insync.replicas=2",
+    ],
+    [
+        "bash", "-c",
+        "KAFKA_DATA_ROOT=\"$PEPPER_BENCH_ROOT/kafka\" docker compose -f benchmarks/pepper-phase0/kafka/compose.yaml kill broker-1 broker-2 broker-3",
+    ],
+    [
+        "bash", "-c",
+        "KAFKA_DATA_ROOT=\"$PEPPER_BENCH_ROOT/kafka\" KAFKA_LOG_FLUSH_INTERVAL_MESSAGES=1 docker compose -f benchmarks/pepper-phase0/kafka/compose.yaml up -d --wait",
+    ],
+    [
+        "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+        "audit-verify", "pepper-phase0-kafka-1",
+        "broker-1:9092,broker-2:9092,broker-3:9092",
+    ],
+]
+
+[targets.measure]
+command = [
+    "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
+    "measure", "pepper-phase0-kafka-1",
+    "broker-1:9092,broker-2:9092,broker-3:9092",
+    "{operation}", "{payload_size_bytes}", "{concurrency}", "{repetition}",
+    "3", "min.insync.replicas=2",
+]
+
+[workload]
+operations = ["produce", "consume"]
+payload_sizes_bytes = [128, 1024, 65536]
+concurrency = [1, 12]
+# The perf tools are records-based; duration_seconds is recorded for
+# provenance and the per-cell volume lives in kafka-driver.sh.
+duration_seconds = 60
+warmup_seconds = 0
+repetitions = 3
+
+[gates]
+throughput_ratio_minimum = 1.0
+p99_ratio_maximum = 1.0
+tolerance_percent = 5.0
+required = true

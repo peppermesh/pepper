@@ -126,6 +126,61 @@ pub(super) async fn bucket_create(
     .await
 }
 
+/// Return a recent namespace head to use as an unconditional write's
+/// transaction base, avoiding the per-write linearizable read that otherwise
+/// serializes concurrent PUTs before the proposal batcher. Populated lazily and
+/// refreshed on each commit; the state machine rebases a stale base onto the
+/// current root and enforces per-key preconditions at apply time, so a cached
+/// base stays correct (WRITE_PATH_OPTIMIZATION.md §5).
+async fn cached_namespace_base(
+    state: &AppState,
+    namespace_id: &NamespaceId,
+) -> Result<NamespaceState, ApiError> {
+    if let Some(cached) = state.namespace_head_cache.lock().await.get(namespace_id) {
+        return Ok(cached.clone());
+    }
+    let base = namespace_manager(state)?
+        .linearizable_namespace_state(namespace_id)
+        .await
+        .map_err(consensus_error)?;
+    state
+        .namespace_head_cache
+        .lock()
+        .await
+        .insert(namespace_id.clone(), base.clone());
+    Ok(base)
+}
+
+/// Advance the cached head after a successful commit so the next write bases on
+/// the just-committed root. Monotonic — never moves the cache backward.
+async fn refresh_cached_namespace_head(
+    state: &AppState,
+    namespace_id: &NamespaceId,
+    response: &serde_json::Value,
+) {
+    let revision = response
+        .get("namespace_revision")
+        .and_then(serde_json::Value::as_u64);
+    let root = response
+        .get("root_cid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| text.parse::<Cid>().ok());
+    let (Some(revision), Some(root)) = (revision, root) else {
+        return;
+    };
+    let mut cache = state.namespace_head_cache.lock().await;
+    if let Some(cached) = cache.get_mut(namespace_id)
+        && revision > cached.current_revision
+    {
+        cached.current_revision = revision;
+        cached.current_root_cid = root;
+    }
+}
+
+async fn invalidate_cached_namespace_head(state: &AppState, namespace_id: &NamespaceId) {
+    state.namespace_head_cache.lock().await.remove(namespace_id);
+}
+
 pub(super) async fn bucket_put(
     State(state): State<AppState>,
     Json(request): Json<BucketPutRequest>,
@@ -134,10 +189,7 @@ pub(super) async fn bucket_put(
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let key =
         hex::decode(&request.key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let base = namespace_manager(&state)?
-        .linearizable_namespace_state(&namespace_id)
-        .await
-        .map_err(consensus_error)?;
+    let base = cached_namespace_base(&state, &namespace_id).await?;
     let namespace_store = super::s3_api::direct_namespace_store(&state, &base).await;
     let current = pepper_merkle::get(
         &namespace_store,
@@ -155,7 +207,16 @@ pub(super) async fn bucket_put(
         }
         None => None,
     };
-    let precondition = precondition(current.clone(), request.if_generation, request.if_cid)?;
+    // Unconditional writes commit as last-writer-wins with no base dependency,
+    // so concurrent disjoint PUTs coalesce at the proposal batcher instead of
+    // serializing on a linearizable base read. Conditional writes
+    // (If-None-Match / If-Match) keep their precondition, checked at apply
+    // against the current per-key state.
+    let precondition = if request.if_generation.is_none() && request.if_cid.is_none() {
+        KeyPrecondition::Any
+    } else {
+        precondition(current.clone(), request.if_generation, request.if_cid)?
+    };
     let previous = current.as_ref().map(|value| value.cid.clone());
     let previous_placement = current
         .as_ref()
@@ -334,17 +395,28 @@ pub(super) async fn bucket_put(
         }
     }
     preverified_durability.push(descriptor_receipt);
-    let mut response = apply_command(
+    let mut response = match apply_command(
         &state,
-        namespace_id,
+        namespace_id.clone(),
         command,
         vec![request.content_cid],
         preverified_durability,
         request.logical_size,
         true,
     )
-    .await?
-    .0;
+    .await
+    {
+        Ok(result) => {
+            refresh_cached_namespace_head(&state, &namespace_id, &result.0).await;
+            result.0
+        }
+        Err(error) => {
+            // A stale cached base fails safe (StaleSnapshot -> retriable
+            // Conflict); drop the cached head so the caller's retry refreshes it.
+            invalidate_cached_namespace_head(&state, &namespace_id).await;
+            return Err(error);
+        }
+    };
     response["object_descriptor_cid"] = serde_json::json!(descriptor_cid);
     response["object"] = serde_json::to_value(descriptor).map_err(ApiError::serde)?;
     Ok(Json(response))
