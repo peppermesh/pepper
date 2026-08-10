@@ -87,10 +87,17 @@ measure)
     if [ "$records" -lt "$MINIMUM_RECORDS" ]; then
         records=$MINIMUM_RECORDS
     fi
+    # The perf tool requires --warmup-records strictly below --num-records;
+    # large payloads floor `records` to MINIMUM_RECORDS, so cap the warmup at
+    # half the cell instead of the full minimum.
+    warmup=$MINIMUM_RECORDS
+    if [ "$warmup" -ge "$records" ]; then
+        warmup=$((records / 2))
+    fi
     create_topic "$topic" "$partitions" "$rf" "$extra"
     case "$operation" in
     produce)
-        produce "$topic" "$size" "$records" "$MINIMUM_RECORDS"
+        produce "$topic" "$size" "$records" "$warmup"
         ;;
     consume)
         # Fill the topic first; the fill's producer summary does not match

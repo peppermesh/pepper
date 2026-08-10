@@ -994,8 +994,119 @@ async fn every_acknowledged_record_survives_reopen() {
         .join("0")
         .join("recovery.ckpt");
     let checkpoint = std::fs::read(checkpoint_path).unwrap();
-    assert_eq!(checkpoint.len(), 24, "checkpoint must be a fixed 24 bytes");
-    assert_eq!(&checkpoint[..8], b"PEPKPT01");
+    assert_eq!(checkpoint.len(), 32, "checkpoint must be a fixed 32 bytes");
+    assert_eq!(&checkpoint[..8], b"PEPKPT02");
+}
+
+/// K-overlap crash-window recovery: the checkpoint is written concurrently
+/// with the append barrier using the predicted post-append watermark, so a
+/// crash mid-append leaves the checkpoint watermark beyond the durable log
+/// end. Recovery must clamp that benign overhang (the overhang was never
+/// acknowledged) but still fail when the log lost data below the checkpoint's
+/// safe floor (acknowledged records).
+#[tokio::test]
+async fn overlapped_checkpoint_crash_window_clamps_and_real_loss_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = vec![(0, "127.0.0.1".to_string(), 19092)];
+    let cluster = KafkaCluster::open(
+        directory.path(),
+        "overlap-clamp",
+        0,
+        brokers.clone(),
+        ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    cluster
+        .create_topic("overlap".into(), 1, 1, Default::default(), false)
+        .await
+        .unwrap();
+    let acknowledged = 3u64;
+    for _ in 0..acknowledged {
+        cluster
+            .produce(
+                0,
+                "overlap",
+                0,
+                1,
+                record_batch(b"record"),
+                pepper_ordered_log::Acknowledgments::All,
+            )
+            .await
+            .unwrap();
+    }
+    let topic_id = cluster.controller_state().await.topics["overlap"].topic_id;
+    drop(cluster);
+    let checkpoint_path = directory
+        .path()
+        .join("broker-0")
+        .join(hex::encode(topic_id))
+        .join("0")
+        .join("recovery.ckpt");
+    let encode = |high_watermark: u64, log_start: u64, floor: u64| {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(b"PEPKPT02");
+        bytes.extend_from_slice(&high_watermark.to_be_bytes());
+        bytes.extend_from_slice(&log_start.to_be_bytes());
+        bytes.extend_from_slice(&floor.to_be_bytes());
+        bytes
+    };
+
+    // Crash window: watermark overhangs the log end but the floor proves the
+    // log kept everything acknowledgeable. Recovery clamps and serves every
+    // acknowledged record.
+    std::fs::write(&checkpoint_path, encode(acknowledged + 5, 0, acknowledged)).unwrap();
+    let reopened = KafkaCluster::open(
+        directory.path(),
+        "overlap-clamp",
+        0,
+        brokers.clone(),
+        ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    let fetched = reopened
+        .fetch(0, "overlap", 0, 0, 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.high_watermark, acknowledged,
+        "clamped watermark must equal the durable log end"
+    );
+    assert_eq!(fetched.batches.len(), acknowledged as usize);
+    // The partition must accept new produces after the clamp.
+    reopened
+        .produce(
+            0,
+            "overlap",
+            0,
+            1,
+            record_batch(b"after-clamp"),
+            pepper_ordered_log::Acknowledgments::All,
+        )
+        .await
+        .unwrap();
+    drop(reopened);
+
+    // Real loss: the checkpoint's floor exceeds the durable log end, meaning
+    // acknowledged records disappeared. Recovery must fail loudly.
+    std::fs::write(
+        &checkpoint_path,
+        encode(acknowledged + 9, 0, acknowledged + 7),
+    )
+    .unwrap();
+    let result = KafkaCluster::open(
+        directory.path(),
+        "overlap-clamp",
+        0,
+        brokers,
+        ProtocolLimits::default(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a floor beyond the durable log end is acknowledged-data loss and must fail recovery"
+    );
 }
 
 // Concurrency guard for the K2 checkpoint coalescing and the future two-phase

@@ -23,6 +23,7 @@ kafka-protocol = { workspace = true }
 pepper-buffer = { path = "../pepper-buffer", version = "0.3.0" }
 pepper-extent = { path = "../pepper-extent", version = "0.3.0" }
 pepper-kafka-protocol = { path = "../pepper-kafka-protocol", version = "0.3.0" }
+pepper-observability = { path = "../pepper-observability", version = "0.3.0" }
 pepper-ordered-log = { path = "../pepper-ordered-log", version = "0.3.0" }
 pepper-rsm = { path = "../pepper-rsm", version = "0.3.0" }
 pepper-storage = { path = "../pepper-storage", version = "0.3.0" }

@@ -64,8 +64,14 @@ pub const ADVERTISED_APIS: &[ApiVersion] = &[
     },
     ApiVersion {
         api_key: 3,
+        // Maximum 4: AdminClient-based tooling (kafka-get-offsets.sh and every
+        // Admin.listOffsets/describeTopics caller) encodes
+        // `allowAutoTopicCreation = false`, which the Java client refuses to
+        // build below Metadata v4. Pepper never auto-creates topics from
+        // metadata requests, which is exactly the v4 `false` semantics; the
+        // flag is accepted and ignored.
         minimum: 1,
-        maximum: 1,
+        maximum: 4,
     },
     ApiVersion {
         api_key: 8,
@@ -338,6 +344,10 @@ fn preflight_request_body(
             let topics = scan.array(true)?;
             for _ in 0..topics {
                 scan.string()?;
+            }
+            // v4+: allow_auto_topic_creation flag.
+            if version >= 4 {
+                scan.skip(1)?;
             }
         }
         ApiKey::OffsetCommit => {
@@ -1762,6 +1772,29 @@ mod tests {
             actual.push(vector);
         }
         assert_eq!(actual, expected);
+    }
+
+    /// Metadata v4 is the floor for AdminClient tooling (`allowAutoTopicCreation`
+    /// is only expressible from v4); both flag values must decode and pass the
+    /// bounded preflight.
+    #[test]
+    fn metadata_v4_auto_create_flag_decodes_and_preflights() {
+        for allow in [false, true] {
+            let request = encoded_request(
+                ApiKey::Metadata,
+                4,
+                RequestKind::Metadata(
+                    MetadataRequest::default().with_allow_auto_topic_creation(allow),
+                ),
+            );
+            let decoded = decode_request(request, ProtocolLimits::default()).unwrap();
+            match decoded.body {
+                RequestKind::Metadata(body) => {
+                    assert_eq!(body.allow_auto_topic_creation, allow);
+                }
+                other => panic!("unexpected request kind: {other:?}"),
+            }
+        }
     }
 
     #[test]
