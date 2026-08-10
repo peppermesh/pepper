@@ -510,18 +510,19 @@ pub(super) async fn namespace_create(
         "00",
         unix_seconds(),
     );
-    // S3 data partitions keep three Raft replicas for ordered metadata while
-    // applying the deployment's configured durability to referenced object
-    // blocks. This is what makes the benchmark's RF=1 topology distinct from
-    // RF=3 without weakening namespace consensus itself.
-    if request
-        .request_id
-        .as_deref()
-        .is_some_and(|request_id| request_id.starts_with("s3p-"))
-    {
-        descriptor.durability.replicas = u16::try_from(state.replication_factor)
-            .map_err(|_| ApiError::internal("replication factor exceeds namespace bounds"))?;
-    }
+    // Namespace consensus always keeps its 1 or 3 Raft voters
+    // (initial_replica_set), but the durability policy for referenced value
+    // blocks follows the deployment's configured data replication factor.
+    // This applies to every namespace kind: value blocks are placed at
+    // `state.replication_factor` (see the SQLite database put and the object
+    // write paths), so the publication durability barrier must require exactly
+    // that many copies, not the voter count. This override was previously
+    // wired only for S3 bucket partitions (`s3p-` request IDs), which made
+    // RF=1 SQLite / filesystem / KV publications fail the barrier with
+    // "durability requirement was not met": the barrier demanded three copies
+    // of a value block that placement policy only stored once.
+    descriptor.durability.replicas = u16::try_from(state.replication_factor)
+        .map_err(|_| ApiError::internal("replication factor exceeds namespace bounds"))?;
     if let Some(request_id) = &request.request_id {
         descriptor
             .placement_constraints
@@ -764,10 +765,28 @@ async fn apply_command_internal(
         Arc<dyn pepper_publication::GuardedNamespaceProposer>,
     )>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let current = namespace_manager(state)?
-        .linearizable_namespace_state(&namespace_id)
+    // Idempotent-replay pre-check. This is an optimization: the namespace state
+    // machine independently dedups by request_id at apply time (its `idempotency`
+    // map), so a missed replay here is re-proposed and still returns the original
+    // result. When a recent cached head is available (populated by the S3 PUT
+    // path), use it so concurrent writers do not each serialize behind a
+    // linearizable read; otherwise fall back to the linearizable read. Conditional
+    // preconditions are unaffected — they are enforced against current committed
+    // state inside the state machine, not here.
+    let current = if let Some(cached) = state
+        .namespace_head_cache
+        .lock()
         .await
-        .map_err(consensus_error)?;
+        .get(&namespace_id)
+        .cloned()
+    {
+        cached
+    } else {
+        namespace_manager(state)?
+            .linearizable_namespace_state(&namespace_id)
+            .await
+            .map_err(consensus_error)?
+    };
     if let Some(response) = current
         .idempotent_response_for(&command)
         .map_err(namespace_error)?
@@ -808,6 +827,10 @@ async fn apply_command_internal(
         staged_bytes: publication.staged_bytes,
         staging_ttl_seconds: state._publication_limits.max_staging_ttl_seconds,
         retain_uploaded_on_conflict: publication.retain_uploaded_on_conflict,
+        // `durability.replicas` is immutable per namespace; thread the value we
+        // already read for the idempotency pre-check so the publication does not
+        // issue a second serializing linearizable read.
+        required_replicas: Some(current.descriptor.durability.replicas as usize),
     };
     let published = match guarded {
         Some((guard, _)) => {
@@ -1540,6 +1563,11 @@ pub(super) fn namespace_error(error: pepper_namespace::NamespaceError) -> ApiErr
         pepper_namespace::NamespaceError::GenerationConflict(_)
     ) {
         ApiError::new(StatusCode::CONFLICT, ErrorCode::GenerationConflict, text)
+    } else if matches!(error, pepper_namespace::NamespaceError::StaleSnapshot) {
+        // A stale transaction base (e.g. a cached namespace head that has
+        // fallen out of retained history) is retriable: the caller refreshes
+        // the base and re-proposes. Fail-safe — it never applies incorrectly.
+        ApiError::new(StatusCode::CONFLICT, ErrorCode::Conflict, text)
     } else if text.contains("cursor") {
         ApiError::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidCursor, text)
     } else {

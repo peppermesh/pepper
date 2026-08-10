@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Three-node rqlite cluster for the `sql-replicated-3x` guarantee profile:
+# Raft-replicated SQLite with strong-consistency writes and linearizable
+# reads — the closest same-guarantee competitor to Pepper's replicated
+# SQLite service.
+#
+# Pin the image digest before publishing qualification results, and bind
+# PEPPER_BENCH_ROOT to the same filesystem used by the Pepper topology.
+# rqlite v8 joins clusters through the Raft address.
+
+x-rqlite: &rqlite
+  image: rqlite/rqlite:8.36.3
+  stop_grace_period: 30s
+  networks:
+    parity-rqlite:
+
+services:
+  rqlite-1:
+    <<: *rqlite
+    container_name: pepper-parity-rqlite-1
+    command:
+      [
+        "-node-id", "1",
+        "-http-addr", "0.0.0.0:4001",
+        "-raft-addr", "0.0.0.0:4002",
+        "-http-adv-addr", "rqlite-1:4001",
+        "-raft-adv-addr", "rqlite-1:4002",
+      ]
+    ports:
+      - "127.0.0.1:24001:4001"
+    volumes:
+      - ${PEPPER_BENCH_ROOT:?set PEPPER_BENCH_ROOT}/rqlite-1:/rqlite/file
+
+  rqlite-2:
+    <<: *rqlite
+    container_name: pepper-parity-rqlite-2
+    depends_on:
+      - rqlite-1
+    command:
+      [
+        "-node-id", "2",
+        "-http-addr", "0.0.0.0:4001",
+        "-raft-addr", "0.0.0.0:4002",
+        "-http-adv-addr", "rqlite-2:4001",
+        "-raft-adv-addr", "rqlite-2:4002",
+        "-join", "rqlite-1:4002",
+      ]
+    volumes:
+      - ${PEPPER_BENCH_ROOT}/rqlite-2:/rqlite/file
+
+  rqlite-3:
+    <<: *rqlite
+    container_name: pepper-parity-rqlite-3
+    depends_on:
+      - rqlite-1
+    command:
+      [
+        "-node-id", "3",
+        "-http-addr", "0.0.0.0:4001",
+        "-raft-addr", "0.0.0.0:4002",
+        "-http-adv-addr", "rqlite-3:4001",
+        "-raft-adv-addr", "rqlite-3:4002",
+        "-join", "rqlite-1:4002",
+      ]
+    volumes:
+      - ${PEPPER_BENCH_ROOT}/rqlite-3:/rqlite/file
+
+networks:
+  parity-rqlite: {}

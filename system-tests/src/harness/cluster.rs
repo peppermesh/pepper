@@ -63,6 +63,8 @@ pub struct ClusterSpec {
     pub net_admin: bool,
     #[serde(default)]
     pub sqlite_enabled: bool,
+    #[serde(default)]
+    pub kafka_enabled: bool,
 }
 
 impl ClusterSpec {
@@ -103,6 +105,7 @@ impl ClusterSpec {
             namespace_voter_count: (node_count >= 3).then_some(3),
             net_admin: false,
             sqlite_enabled: false,
+            kafka_enabled: false,
         }
     }
 
@@ -147,6 +150,8 @@ pub struct NodeRuntime {
     pub address: String,
     pub p2p_port: u16,
     pub api_port: u16,
+    #[serde(default)]
+    pub kafka_port: u16,
     pub config_path: PathBuf,
     pub data_path: PathBuf,
     pub log_path: PathBuf,

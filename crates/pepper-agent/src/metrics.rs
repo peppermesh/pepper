@@ -346,6 +346,7 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
     let storage_encoding = pepper_storage::process_encoding_stats();
     let native_storage = pepper_storage::process_native_stats();
     let consensus_io = pepper_consensus::process_io_stats();
+    let kafka_produce = pepper_kafka::process_produce_stats();
     let normal_block_batches = block_batch_stats(false);
     let replica_block_batches = block_batch_stats(true);
     let publication_phases = pepper_publication::process_phase_stats();
@@ -642,6 +643,16 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         native_storage.torn_tails,
         native_storage.compactions,
         native_storage.compacted_bytes,
+    ));
+    body.push_str(&format!(
+        "# HELP pepper_kafka_produce_operations_total Kafka produce operations that appended to the log.\n\
+         # TYPE pepper_kafka_produce_operations_total counter\n\
+         pepper_kafka_produce_operations_total {}\n\
+         # HELP pepper_kafka_produce_checkpoint_fsyncs_total fsyncs issued by per-partition checkpoint writes on the produce path.\n\
+         # TYPE pepper_kafka_produce_checkpoint_fsyncs_total counter\n\
+         pepper_kafka_produce_checkpoint_fsyncs_total {}\n",
+        kafka_produce.produce_operations,
+        kafka_produce.produce_checkpoint_fsyncs,
     ));
     let cache = reconstructed_cache::process_stats();
     body.push_str(&format!(

@@ -94,7 +94,7 @@ pub struct ProcessBackend {
     children: Mutex<BTreeMap<NodeId, ManagedChild>>,
     work_directory: Mutex<Option<tempfile::TempDir>>,
     events: Mutex<Option<Arc<crate::harness::events::EventRecorder>>>,
-    port_overrides: Option<BTreeMap<NodeId, (u16, u16)>>,
+    port_overrides: Option<BTreeMap<NodeId, (u16, u16, u16)>>,
     restorations: Mutex<BTreeMap<String, ProcessRestoration>>,
     artifact_root: Mutex<Option<PathBuf>>,
 }
@@ -155,7 +155,17 @@ impl ProcessBackend {
                     .as_u64()
                     .context("topology API port missing")?,
             )?;
-            if port_overrides.insert(id.clone(), (p2p, api)).is_some() {
+            // Older topology files predate the Kafka listener; fall back to the
+            // deterministic offset (kafka = api + 1) when it is absent.
+            let kafka = node["kafka_port"]
+                .as_u64()
+                .map(u16::try_from)
+                .transpose()?
+                .unwrap_or(api.saturating_add(1));
+            if port_overrides
+                .insert(id.clone(), (p2p, api, kafka))
+                .is_some()
+            {
                 bail!("duplicate topology node {id}");
             }
         }
@@ -277,13 +287,13 @@ impl ClusterBackend for ProcessBackend {
                 &node.id,
                 &data_path.join("identity.ed25519"),
             )?;
-            let (p2p_port, api_port) = match &self.port_overrides {
+            let (p2p_port, api_port, kafka_port) = match &self.port_overrides {
                 Some(overrides) => *overrides
                     .get(&node.id)
                     .with_context(|| format!("reproduction topology is missing {}", node.id))?,
                 None => deterministic_ports(self.seed, index)?,
             };
-            ensure_ports_available(p2p_port, api_port)?;
+            ensure_ports_available(p2p_port, api_port, kafka_port)?;
             runtimes.insert(
                 node.id.clone(),
                 NodeRuntime {
@@ -292,6 +302,7 @@ impl ClusterBackend for ProcessBackend {
                     address: "127.0.0.1".to_string(),
                     p2p_port,
                     api_port,
+                    kafka_port,
                     config_path,
                     data_path,
                     log_path,
@@ -916,22 +927,28 @@ fn configure_process_group(command: &mut Command) -> bool {
     }
 }
 
-fn deterministic_ports(seed: u64, index: usize) -> Result<(u16, u16)> {
-    let base = 20_000 + ((seed % 6_000) as u16 * 6);
+fn deterministic_ports(seed: u64, index: usize) -> Result<(u16, u16, u16)> {
+    // Three consecutive ports per node (P2P, API, Kafka); seeds are spaced far
+    // enough apart to hold a small cluster without colliding with a neighbour.
+    let base = 20_000 + ((seed % 3_600) as u16 * 12);
     let offset = u16::try_from(index)?
-        .checked_mul(2)
+        .checked_mul(3)
         .context("node port offset overflow")?;
     let p2p_port = base.checked_add(offset).context("P2P port overflow")?;
     let api_port = p2p_port.checked_add(1).context("API port overflow")?;
-    Ok((p2p_port, api_port))
+    let kafka_port = p2p_port.checked_add(2).context("Kafka port overflow")?;
+    Ok((p2p_port, api_port, kafka_port))
 }
 
-fn ensure_ports_available(p2p_port: u16, api_port: u16) -> Result<()> {
+fn ensure_ports_available(p2p_port: u16, api_port: u16, kafka_port: u16) -> Result<()> {
     UdpSocket::bind(("127.0.0.1", p2p_port)).with_context(|| {
         format!("deterministic P2P port {p2p_port} is occupied; choose another seed")
     })?;
     TcpListener::bind(("127.0.0.1", api_port)).with_context(|| {
         format!("deterministic API port {api_port} is occupied; choose another seed")
+    })?;
+    TcpListener::bind(("127.0.0.1", kafka_port)).with_context(|| {
+        format!("deterministic Kafka port {kafka_port} is occupied; choose another seed")
     })?;
     Ok(())
 }
@@ -949,6 +966,7 @@ fn topology_json(
             "address":runtime.address,
             "p2p_port":runtime.p2p_port,
             "api_port":runtime.api_port,
+            "kafka_port":runtime.kafka_port,
             "failure_domain":node.failure_domain,
             "placement_labels":{},
             "bootstrap_nodes":node.bootstrap_nodes,
@@ -978,7 +996,8 @@ mod tests {
         let first = deterministic_ports(4_242, 0).unwrap();
         let second = deterministic_ports(4_242, 1).unwrap();
         assert_eq!(first.1, first.0 + 1);
-        assert_eq!(second.0, first.0 + 2);
+        assert_eq!(first.2, first.0 + 2);
+        assert_eq!(second.0, first.0 + 3);
         assert_eq!(first, deterministic_ports(4_242, 0).unwrap());
     }
 

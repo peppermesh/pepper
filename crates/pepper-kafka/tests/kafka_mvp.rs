@@ -927,6 +927,144 @@ async fn controller_and_partition_state_survive_reopen() {
     assert_eq!(fetched.batches.len(), 1);
 }
 
+// K1 (WRITE_PATH_OPTIMIZATION.md §4): the committed watermark is persisted with
+// a single fdatasync to a fixed-size in-place checkpoint. Each acks=all produce
+// fdatasyncs the watermark before returning, so every acknowledged record must
+// survive a restart. This is the correctness gate for the checkpoint-fsync
+// change — a stale or lost watermark would truncate acknowledged records on
+// recovery.
+#[tokio::test]
+async fn every_acknowledged_record_survives_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = vec![(0, "127.0.0.1".to_string(), 19092)];
+    let cluster = KafkaCluster::open(
+        directory.path(),
+        "restart-multi",
+        0,
+        brokers.clone(),
+        ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    cluster
+        .create_topic("durable".into(), 1, 1, Default::default(), false)
+        .await
+        .unwrap();
+    let acknowledged = 5u64;
+    for _ in 0..acknowledged {
+        cluster
+            .produce(
+                0,
+                "durable",
+                0,
+                1,
+                record_batch(b"record"),
+                pepper_ordered_log::Acknowledgments::All,
+            )
+            .await
+            .unwrap();
+    }
+    drop(cluster);
+
+    let reopened = KafkaCluster::open(
+        directory.path(),
+        "restart-multi",
+        0,
+        brokers,
+        ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    let fetched = reopened
+        .fetch(0, "durable", 0, 0, 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.high_watermark, acknowledged,
+        "recovered watermark must cover every acknowledged record"
+    );
+    assert_eq!(fetched.batches.len(), acknowledged as usize);
+
+    // The checkpoint must be the fixed-size binary format written in place.
+    let topic_id = reopened.controller_state().await.topics["durable"].topic_id;
+    let checkpoint_path = directory
+        .path()
+        .join("broker-0")
+        .join(hex::encode(topic_id))
+        .join("0")
+        .join("recovery.ckpt");
+    let checkpoint = std::fs::read(checkpoint_path).unwrap();
+    assert_eq!(checkpoint.len(), 24, "checkpoint must be a fixed 24 bytes");
+    assert_eq!(&checkpoint[..8], b"PEPKPT01");
+}
+
+// Concurrency guard for the K2 checkpoint coalescing and the future two-phase
+// append: many acks=all produces issued concurrently to one partition must all
+// be durable — every acknowledged record survives a restart, with contiguous
+// offsets and no gaps. A coalescing bug that acknowledges before the covering
+// watermark is durable, or that reorders/loses an offset, fails here.
+#[tokio::test]
+async fn concurrent_acknowledged_produces_all_survive_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let brokers = vec![(0, "127.0.0.1".to_string(), 19092)];
+    let cluster = std::sync::Arc::new(
+        KafkaCluster::open(
+            directory.path(),
+            "concurrent",
+            0,
+            brokers.clone(),
+            ProtocolLimits::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    cluster
+        .create_topic("durable".into(), 1, 1, Default::default(), false)
+        .await
+        .unwrap();
+    let total = 50u64;
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..total {
+        let cluster = cluster.clone();
+        set.spawn(async move {
+            cluster
+                .produce(
+                    0,
+                    "durable",
+                    0,
+                    1,
+                    record_batch(b"record"),
+                    pepper_ordered_log::Acknowledgments::All,
+                )
+                .await
+                .map(|_| ())
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        joined.unwrap().unwrap();
+    }
+    drop(cluster);
+
+    let reopened = KafkaCluster::open(
+        directory.path(),
+        "concurrent",
+        0,
+        brokers,
+        ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    let fetched = reopened
+        .fetch(0, "durable", 0, 0, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.high_watermark, total,
+        "every concurrently acknowledged record must survive"
+    );
+    assert_eq!(fetched.batches.len(), total as usize);
+}
+
 #[tokio::test]
 async fn tcp_connection_matrix_pipeline_and_timeout_are_bounded() {
     let (_directory, _cluster, addresses, tasks) = start_cluster().await;

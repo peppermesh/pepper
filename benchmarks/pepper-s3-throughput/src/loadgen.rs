@@ -128,6 +128,10 @@ pub struct LoadgenArgs {
     pub quiet: bool,
     #[arg(long, value_enum, default_value = "incompressible")]
     pub payload_profile: PayloadProfile,
+    /// Exit non-zero when any request permanently fails. Guarantee audits
+    /// use this to turn a verification pass into a pass/fail exit code.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_errors: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1389,6 +1393,13 @@ pub async fn run(args: LoadgenArgs) -> Result<()> {
     }
     if !args.quiet {
         print!("{encoded}");
+    }
+    if args.fail_on_errors && report.results.failures > 0 {
+        bail!(
+            "{} of {} requests permanently failed",
+            report.results.failures,
+            report.results.attempts
+        );
     }
     Ok(())
 }

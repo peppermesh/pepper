@@ -2320,6 +2320,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-parity"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "pepper-phase0"
 version = "0.3.0"
 dependencies = [

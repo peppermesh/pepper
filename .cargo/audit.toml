@@ -1,0 +1,14 @@
+# cargo-audit configuration (read by the `audit` CI job: `cargo audit`).
+# Advisory-database IDs listed here are acknowledged and excluded from the
+# vulnerability gate. Keep an inline reason for each entry.
+
+[advisories]
+ignore = [
+    # rkyv 0.7.46 is pulled in transitively only through rust_decimal's optional
+    # `rkyv` feature; it is not in pepper's active dependency tree
+    # (`cargo tree -i rkyv` resolves to nothing). The out-of-bounds read requires
+    # deserializing an untrusted rkyv archive containing Rc/Arc, which pepper
+    # never does. No fixed 0.7.x release is available. Re-evaluate when
+    # rust_decimal drops the rkyv 0.7 dependency.
+    "RUSTSEC-2026-0235",
+]
