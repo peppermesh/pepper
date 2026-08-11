@@ -240,6 +240,12 @@ pub struct PublicationRequest {
     pub staged_bytes: u64,
     pub staging_ttl_seconds: i64,
     pub retain_uploaded_on_conflict: bool,
+    /// Durability replica count for this namespace, threaded from a state the
+    /// caller already holds. `durability.replicas` is immutable per namespace, so
+    /// supplying it here avoids a per-publication linearizable read that would
+    /// otherwise serialize concurrent writers. `None` falls back to resolving it
+    /// via namespace routing.
+    pub required_replicas: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -841,14 +847,18 @@ where
         // serves. Resolve the authoritative state through namespace routing
         // instead of requiring a local group merely to read its durability
         // policy.
-        let required = self
-            .manager
-            .linearizable_namespace_state(&request.namespace_id)
-            .await
-            .map_err(|error| PublicationError::Namespace(error.to_string()))?
-            .descriptor
-            .durability
-            .replicas as usize;
+        let required = match request.required_replicas {
+            Some(required) => required,
+            None => {
+                self.manager
+                    .linearizable_namespace_state(&request.namespace_id)
+                    .await
+                    .map_err(|error| PublicationError::Namespace(error.to_string()))?
+                    .descriptor
+                    .durability
+                    .replicas as usize
+            }
+        };
 
         let mut durable_cids = request.uploaded_roots.clone();
         durable_cids.extend(
@@ -1890,6 +1900,7 @@ mod tests {
                     staged_bytes: 5,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: true,
+                    required_replicas: None,
                 },
                 10,
             )
@@ -1922,6 +1933,7 @@ mod tests {
                     staged_bytes: 5,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: true,
+                    required_replicas: None,
                 },
                 guard: PublicationGuard::None,
             })
@@ -1955,6 +1967,7 @@ mod tests {
                     staged_bytes: 21,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: false,
+                    required_replicas: None,
                 },
                 11,
             )
@@ -1994,6 +2007,7 @@ mod tests {
                         staged_bytes: 0,
                         staging_ttl_seconds: 60,
                         retain_uploaded_on_conflict: false,
+                        required_replicas: None,
                     },
                     12,
                 )
@@ -2017,6 +2031,7 @@ mod tests {
                         staged_bytes: 0,
                         staging_ttl_seconds: 60,
                         retain_uploaded_on_conflict: false,
+                        required_replicas: None,
                     },
                     12,
                 )
@@ -2062,6 +2077,7 @@ mod tests {
                     staged_bytes: 11,
                     staging_ttl_seconds: 60,
                     retain_uploaded_on_conflict: true,
+                    required_replicas: None,
                 },
                 12,
             )
@@ -2100,6 +2116,7 @@ mod tests {
                         staged_bytes: 5,
                         staging_ttl_seconds: 60,
                         retain_uploaded_on_conflict: true,
+                        required_replicas: None,
                     },
                     20,
                 )
@@ -2141,6 +2158,7 @@ mod tests {
                 staged_bytes: 5,
                 staging_ttl_seconds: 60,
                 retain_uploaded_on_conflict: true,
+                required_replicas: None,
             };
             let injected = PublicationCoordinator::new(
                 managers[leader_index].clone(),

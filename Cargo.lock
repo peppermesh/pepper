@@ -2122,6 +2122,7 @@ dependencies = [
  "pepper-extent",
  "pepper-kafka-protocol",
  "pepper-metadata",
+ "pepper-observability",
  "pepper-ordered-log",
  "pepper-rsm",
  "pepper-storage",
@@ -2317,6 +2318,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "pepper-parity"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

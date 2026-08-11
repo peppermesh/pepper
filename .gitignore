@@ -10,3 +10,5 @@
 
 # Documentation is maintained outside this repository.
 /docs/
+.claude/worktrees/
+benchmarks/pepper-parity/results/

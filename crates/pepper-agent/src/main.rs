@@ -230,6 +230,14 @@ struct AppState {
     s3_write_queue_timeout: Duration,
     s3_write_service_micros: Arc<AtomicU64>,
     s3_list_cache: Arc<S3ListCache>,
+    // Per-namespace cached recent head (revision + root) used as the
+    // transaction base for unconditional writes, so concurrent PUTs skip the
+    // per-write linearizable read that serializes them and instead coalesce at
+    // the proposal batcher. The state machine rebases stale bases onto the
+    // current root and enforces per-key preconditions at apply, so a cached
+    // base stays correct; it is refreshed on each commit and invalidated on a
+    // stale-base error (WRITE_PATH_OPTIMIZATION.md §5).
+    namespace_head_cache: Arc<tokio::sync::Mutex<HashMap<NamespaceId, NamespaceState>>>,
     repair_interval: Duration,
     repair_semaphore: Arc<Semaphore>,
     repair_diagnostics: Arc<Mutex<VecDeque<RepairDiagnosticRecord>>>,
@@ -1228,6 +1236,7 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         ),
         s3_write_service_micros: Arc::new(AtomicU64::new(S3_WRITE_INITIAL_SERVICE_MICROS)),
         s3_list_cache: Arc::new(S3ListCache::default()),
+        namespace_head_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         repair_interval: Duration::from_secs(loaded.config.replication.repair_interval_seconds),
         repair_semaphore: Arc::new(Semaphore::new(1)),
         repair_diagnostics: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
@@ -2251,9 +2260,16 @@ async fn put_replicated_block_with_placement_map(
             .map(|(put, wire)| (put, wire, None))
             .map_err(ApiError::internal)
     } else {
-        tokio::task::block_in_place(|| state.block_store.put(codec, &payload))
-            .map(|put| (put, payload, None))
-            .map_err(ApiError::from)
+        // Remote replicas receive the encoded wire envelope, never raw
+        // logical bytes: the streamed replica receiver validates the block
+        // envelope before granting durability credit.
+        tokio::task::block_in_place(|| {
+            state.block_store.put(codec, &payload).and_then(|put| {
+                let wire = state.block_store.get_encoded(&put.cid)?.into_bytes();
+                Ok((put, wire, None))
+            })
+        })
+        .map_err(ApiError::from)
     };
     metrics::observe_phase(
         &metrics::S3_BLOCK_HASH_STORAGE_PHASES,

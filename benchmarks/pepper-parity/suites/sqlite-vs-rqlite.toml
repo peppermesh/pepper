@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# SQLite parity: Pepper's replicated SQLite service vs rqlite at the
+# sql-replicated-3x profile. Both are three-node Raft-replicated SQLite
+# services with durable, strongly consistent writes and linearizable reads.
+# The comparison is at the service level: identical SQL statement streams,
+# seed data, and measurement points (pepper-sqlite-benchmark drives both);
+# the transport differs by necessity (Pepper VFS Unix socket vs rqlite
+# HTTP), which is each service's native access path.
+#
+# Cells map to benchmark workload names; payload_size_bytes is the row
+# payload and concurrency is fixed at 1 (single-session SQL). Warmup is
+# inside the benchmark (unmeasured seed + warm pass), so warmup_seconds
+# stays zero. The local-SQLite ceiling is intentionally not gated; run
+# pepper-sqlite-benchmark --target both separately for that comparison.
+#
+# The durability audit writes acknowledged rows, SIGKILLs every node,
+# restarts, and requires an exact row count.
+#
+# Prerequisites: PEPPER_BENCH_ROOT (short path; the Pepper VFS socket lives
+# under it and Unix socket paths are limited to ~108 bytes).
+
+version = 1
+api = "sqlite"
+title = "SQLite parity: Pepper vs rqlite, replicated-3x"
+
+[[profiles]]
+name = "sql-replicated-3x"
+fault_tolerance = "survives loss of all nodes after acknowledgment; serves with quorum"
+
+[profiles.claims]
+durability = "quorum replicated and durable at commit acknowledgment"
+consistency = "linearizable reads through the service's consistency mechanism"
+replication = "3 Raft voters"
+
+[[targets]]
+name = "pepper"
+role = "subject"
+profile = "sql-replicated-3x"
+endpoint = "http://127.0.0.1:29080"
+parser = "sqlite-benchmark-json"
+
+[targets.lifecycle]
+prepare = [
+    ["bash", "benchmarks/pepper-parity/topologies/prepare-pepper-sqlite.sh"],
+]
+up = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "--profile", "single",
+    "up", "-d", "--wait",
+]
+down = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "--profile", "single",
+    "down", "-v",
+]
+ready_url = "http://127.0.0.1:29080/readyz"
+
+[targets.audit]
+steps = [
+    [
+        "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+        "audit-produce", "pepper_vfs",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "--profile", "single",
+        "kill",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "--profile", "single",
+        "up", "-d", "--wait",
+    ],
+    [
+        "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+        "audit-verify", "pepper_vfs",
+    ],
+]
+
+[targets.measure]
+command = [
+    "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+    "measure", "pepper_vfs", "{operation}", "{repetition}", "{output}",
+]
+
+[[targets]]
+name = "rqlite"
+role = "competitor"
+profile = "sql-replicated-3x"
+endpoint = "http://127.0.0.1:24001"
+parser = "sqlite-benchmark-json"
+
+[targets.lifecycle]
+up = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-parity/topologies/rqlite-3.yaml",
+    "up", "-d", "--wait",
+]
+down = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-parity/topologies/rqlite-3.yaml",
+    "down", "-v",
+]
+ready_url = "http://127.0.0.1:24001/readyz"
+
+[targets.audit]
+steps = [
+    [
+        "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+        "audit-produce", "rqlite",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-parity/topologies/rqlite-3.yaml",
+        "kill",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-parity/topologies/rqlite-3.yaml",
+        "up", "-d", "--wait",
+    ],
+    [
+        "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+        "audit-verify", "rqlite",
+    ],
+]
+
+[targets.measure]
+command = [
+    "bash", "benchmarks/pepper-parity/topologies/sqlite-driver.sh",
+    "measure", "rqlite", "{operation}", "{repetition}", "{output}",
+]
+
+[workload]
+operations = [
+    "point_read_connection_cache",
+    "sequential_scan_connection_cache",
+    "point_read_reopen",
+    "insert_autocommit_1",
+    "insert_transaction_100",
+]
+payload_sizes_bytes = [256]
+concurrency = [1]
+# The benchmark is sample-count based; duration_seconds is recorded for
+# provenance and the volumes live in sqlite-driver.sh / benchmark defaults.
+duration_seconds = 60
+warmup_seconds = 0
+repetitions = 3
+
+[gates]
+throughput_ratio_minimum = 1.0
+p99_ratio_maximum = 1.0
+tolerance_percent = 5.0
+required = true

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Single-node MinIO for the `s3-single-durable` guarantee profile.
+#
+# The image digest must be pinned before publishing any qualification result.
+# MINIO_DRIVE_SYNC requests synchronous drive writes so acknowledgment implies
+# durability; verify the knob against the pinned release (see design doc,
+# "Risks and open questions") and record the effective behavior in the run
+# artifact. Bind PEPPER_BENCH_ROOT to the same XFS filesystem used by the
+# Pepper topology so both systems see the same device.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: pepper-benchmark
+      MINIO_ROOT_PASSWORD: pepper-benchmark-secret-v1
+      MINIO_DRIVE_SYNC: "on"
+    ports:
+      - "127.0.0.1:29090:9000"
+    volumes:
+      - ${PEPPER_BENCH_ROOT:?set PEPPER_BENCH_ROOT}/minio-single:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 60

@@ -266,6 +266,7 @@ impl KafkaServer {
     /// snapshot instead of becoming an unbounded metric label.
     pub fn prometheus_metrics(&self) -> String {
         let (waiters, quotas, responses) = self.operations_snapshot();
+        let produce_stats = crate::process_produce_stats();
         format!(
             concat!(
                 "pepper_kafka_connections_active {}\n",
@@ -281,7 +282,9 @@ impl KafkaServer {
                 "pepper_kafka_response_bytes_inflight {}\n",
                 "pepper_kafka_response_bytes_high_water {}\n",
                 "pepper_kafka_response_budget_rejections_total {}\n",
-                "pepper_kafka_protocol_payload_copies_total {}\n"
+                "pepper_kafka_protocol_payload_copies_total {}\n",
+                "pepper_kafka_produce_operations_total {}\n",
+                "pepper_kafka_produce_checkpoint_fsyncs_total {}\n"
             ),
             self.metrics.active_connections.load(Ordering::Relaxed),
             self.metrics.rejected_connections.load(Ordering::Relaxed),
@@ -297,6 +300,8 @@ impl KafkaServer {
             responses.high_water_bytes,
             responses.rejections,
             self.metrics.protocol_payload_copies.load(Ordering::Relaxed),
+            produce_stats.produce_operations,
+            produce_stats.produce_checkpoint_fsyncs,
         )
     }
 
@@ -551,7 +556,20 @@ impl KafkaServer {
             RequestKind::Metadata(request) => ResponseKind::Metadata(self.metadata(request).await),
             RequestKind::Produce(request) => {
                 let no_response = request.acks == 0;
-                let response = self.produce(request).await;
+                // Attribute produce-path costs (extent append durability
+                // barriers in particular) to the kafka_produce workload instead
+                // of the scheduler's background fallback, so
+                // `pepper_operation_cost_total{workload="kafka_produce"}`
+                // reflects the true device cost of the produce path.
+                let scope = pepper_observability::OperationScope::begin(
+                    pepper_observability::WorkloadClass::KafkaProduce,
+                    pepper_observability::WorkKey::combine(&[b"kafka", b"produce"]),
+                    None,
+                );
+                let response =
+                    pepper_observability::scope_operation(scope.clone(), self.produce(request))
+                        .await;
+                scope.finish(true);
                 if no_response {
                     return Ok(None);
                 }

@@ -87,12 +87,18 @@ impl RemoteBackend {
                 u16::try_from(node["p2p_port"].as_u64().context("WAN P2P port missing")?)?;
             let api_port =
                 u16::try_from(node["api_port"].as_u64().context("WAN API port missing")?)?;
+            let kafka_port = node["kafka_port"]
+                .as_u64()
+                .map(u16::try_from)
+                .transpose()?
+                .unwrap_or(0);
             let runtime = NodeRuntime {
                 id: id.clone(),
                 node_identity: public_id.to_string(),
                 address,
                 p2p_port,
                 api_port,
+                kafka_port,
                 config_path: PathBuf::new(),
                 data_path: PathBuf::new(),
                 log_path: PathBuf::new(),
@@ -144,6 +150,9 @@ impl RemoteBackend {
                 .or(Some(3)),
             net_admin: false,
             sqlite_enabled: topology["policies"]["sqlite_enabled"]
+                .as_bool()
+                .unwrap_or(false),
+            kafka_enabled: topology["policies"]["kafka_enabled"]
                 .as_bool()
                 .unwrap_or(false),
         };

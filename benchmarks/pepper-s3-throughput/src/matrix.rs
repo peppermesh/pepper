@@ -334,6 +334,67 @@ pub(crate) fn run_command(command: &mut Command) -> Result<Output> {
     Ok(output)
 }
 
+/// Standalone topology bootstrap for external orchestrators such as
+/// `pepper-parity`: prepares the benchmark root and generates the runtime
+/// node configs without running the matrix.
+#[derive(Debug, clap::Args)]
+pub struct PrepareTopologyArgs {
+    /// Benchmark root on the data filesystem under test.
+    #[arg(long)]
+    pub root: PathBuf,
+    /// Storage engine for the generated node configs.
+    #[arg(long, default_value = "files")]
+    pub storage_engine: String,
+    /// Skip the dedicated-data-mount check for exploratory local runs.
+    /// Results from such runs are not publishable.
+    #[arg(long, default_value_t = false)]
+    pub allow_shared_filesystem: bool,
+    /// Override `replication.default_factor` in every generated node config.
+    /// The checked-in configs use 1; replicated-durability profiles
+    /// (e.g. the SQLite replicated-3x parity suite) request 3.
+    #[arg(long)]
+    pub replication_factor: Option<u32>,
+}
+
+pub fn prepare_topology(args: PrepareTopologyArgs) -> Result<()> {
+    fs::create_dir_all(&args.root)
+        .with_context(|| format!("failed to create benchmark root {}", args.root.display()))?;
+    let root = args
+        .root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve benchmark root {}", args.root.display()))?;
+    ensure!(root.is_dir(), "benchmark root is not a directory");
+    if !args.allow_shared_filesystem {
+        ensure!(
+            fs::metadata(&root)?.dev() != fs::metadata("/")?.dev(),
+            "benchmark root {} is on the OS root filesystem; select a dedicated data mount or pass --allow-shared-filesystem for an exploratory run",
+            root.display()
+        );
+    }
+    prepare_runtime_configs(&root, &args.storage_engine, "adaptive", 0)?;
+    if let Some(factor) = args.replication_factor {
+        override_replication_factor(&root.join(".runtime-config"), factor)?;
+    }
+    // Containers run as the unprivileged pepper user; every bind-mounted
+    // service data directory must exist and be writable before compose up
+    // (same preparation the matrix runner performs).
+    for name in [
+        "single", "single2", "single3", "node1", "node2", "node3", "ec1", "ec2", "ec3", "ec4",
+        "ec5", "ec6", "ec7", "ec8", "ec9", "control", "raw", "fio",
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+    }
+    println!("prepared runtime configs under {}", root.display());
+    println!("export PEPPER_BENCH_ROOT={}", root.display());
+    println!(
+        "export PEPPER_BENCH_CONFIG_DIR={}",
+        root.join(".runtime-config").display()
+    );
+    Ok(())
+}
+
 pub(crate) fn prepare_benchmark_root(root: &Path) -> Result<PathBuf> {
     fs::create_dir_all(root)
         .with_context(|| format!("failed to create benchmark root {}", root.display()))?;
@@ -348,6 +409,30 @@ pub(crate) fn prepare_benchmark_root(root: &Path) -> Result<PathBuf> {
     );
     prepare_runtime_configs(&root, "files", "adaptive", 0)?;
     Ok(root)
+}
+
+fn override_replication_factor(config_dir: &Path, factor: u32) -> Result<()> {
+    for entry in fs::read_dir(config_dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "toml") {
+            continue;
+        }
+        let mut config = toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?;
+        let replication = config
+            .as_table_mut()
+            .context("node config is not a TOML table")?
+            .entry("replication")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .context("replication config is not a TOML table")?;
+        replication.insert(
+            "default_factor".to_string(),
+            toml::Value::Integer(factor.into()),
+        );
+        fs::write(&path, toml::to_string_pretty(&config)?)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
 }
 
 fn prepare_runtime_configs(

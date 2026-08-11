@@ -37,10 +37,63 @@ use tiering::{ColdSegmentKey, ColdSegmentRecord, ColdTier};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use transactions::{AppendDecision, TransactionCoordinator, TransactionPartition};
 
+// Write-path instrumentation (WRITE_PATH_OPTIMIZATION.md §6). Every durable
+// produce currently pays the ordered-log append plus a per-partition
+// `recovery.json` checkpoint whose `persist_atomic` issues two fsyncs
+// (temp file + parent directory). `fsyncs_per_produce` is
+// `produce_checkpoint_fsyncs / produce_operations`; K1 moves the checkpoint
+// off the hot path and should drive it toward zero.
+static PRODUCE_OPERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRODUCE_CHECKPOINT_FSYNCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// fsyncs issued by the transaction coordinator's producer-state persists on
+/// the produce path (`prepare_append` / `complete_append` / `cancel_append`).
+/// The 2026-08-10 profile found these were the dominant, uninstrumented produce
+/// cost: 4 of the 6 device fsyncs per idempotent produce. T1 moved
+/// producer-state snapshots off the produce path (async `flush_dirty` +
+/// recovery from the durable log), so this counter should now stay at zero —
+/// it remains as the regression guard for that invariant.
+pub(crate) static PRODUCE_TRANSACTION_FSYNCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KafkaProduceStats {
+    /// Produce operations that appended to the log (idempotent duplicates
+    /// excluded).
+    pub produce_operations: u64,
+    /// fsyncs issued by per-partition checkpoint writes on the produce path.
+    pub produce_checkpoint_fsyncs: u64,
+    /// fsyncs issued by producer-state (idempotence/transaction) persists on
+    /// the produce path.
+    pub produce_transaction_fsyncs: u64,
+}
+
+pub fn process_produce_stats() -> KafkaProduceStats {
+    use std::sync::atomic::Ordering;
+    KafkaProduceStats {
+        produce_operations: PRODUCE_OPERATIONS.load(Ordering::Relaxed),
+        produce_checkpoint_fsyncs: PRODUCE_CHECKPOINT_FSYNCS.load(Ordering::Relaxed),
+        produce_transaction_fsyncs: PRODUCE_TRANSACTION_FSYNCS.load(Ordering::Relaxed),
+    }
+}
+
 struct PartitionRuntime {
     descriptor: RwLock<controller::PartitionRecord>,
     replication: Mutex<ReplicatedPartition>,
     replicas: BTreeMap<i32, Arc<OrderedLog>>,
+    // K2 checkpoint coalescing (WRITE_PATH_OPTIMIZATION.md §4). A produce
+    // releases the replication lock after its record is durable in the log and
+    // its high-watermark is advanced in memory, then makes that watermark
+    // durable here. `checkpoint_lock` single-flights the fsync so concurrent
+    // producers coalesce: one checkpoint write persists the latest watermark
+    // and satisfies every waiter whose target it covers. `checkpoint_persisted`
+    // is the last watermark made durable, so waiters already covered skip the
+    // fsync entirely.
+    checkpoint_lock: Mutex<()>,
+    checkpoint_persisted: std::sync::atomic::AtomicU64,
+    /// Per-replica `recovery.ckpt` paths, precomputed at open so checkpoint
+    /// writes never re-derive them from a controller-state scan.
+    checkpoint_paths: BTreeMap<i32, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +162,17 @@ struct KafkaFormatMarker {
 struct PartitionCheckpoint {
     high_watermark: u64,
     log_start_offset: u64,
+    /// Offset up to which the log was already durable when this checkpoint was
+    /// written. K-overlap writes the checkpoint concurrently with the append
+    /// barrier using the *predicted* post-append watermark, so a crash inside
+    /// that window can leave `high_watermark` beyond the durable log end.
+    /// Recovery uses this floor to tell that benign window apart from real log
+    /// loss: a log ending at or past the floor only lost unacknowledged
+    /// records (an acknowledgment requires the append barrier to have
+    /// completed), so the watermark clamps to the log end; a log ending below
+    /// the floor lost acknowledged data and must fail recovery.
+    #[serde(default)]
+    safe_floor: u64,
 }
 
 impl KafkaCluster {
@@ -197,6 +261,11 @@ impl KafkaCluster {
                     return;
                 };
                 let _ = transactions.expire(now_millis()).await;
+                // T1: periodic producer-state snapshot. Correctness never
+                // depends on this cadence (recovery rebuilds sequences from
+                // the durable log; retention flushes synchronously before
+                // reclaiming log ranges) — it only bounds snapshot staleness.
+                let _ = transactions.flush_dirty().await;
             }
         });
         let state = cluster.controller.state().await;
@@ -332,6 +401,8 @@ impl KafkaCluster {
         descriptor: &controller::PartitionRecord,
     ) -> Result<Arc<PartitionRuntime>, KafkaError> {
         let mut replicas = BTreeMap::new();
+        let mut checkpoint_paths = BTreeMap::new();
+        let mut leader_checkpoint_high_watermark = 0u64;
         for broker_id in &descriptor.replicas {
             let directory = self
                 .root
@@ -339,6 +410,9 @@ impl KafkaCluster {
                 .join(hex_id(topic.topic_id))
                 .join(descriptor.partition_id.to_string());
             let checkpoint = read_checkpoint(&directory)?;
+            if *broker_id == descriptor.leader_id {
+                leader_checkpoint_high_watermark = checkpoint.high_watermark;
+            }
             let store = Arc::new(FileExtentStore::open(
                 &directory,
                 FileExtentConfig::default(),
@@ -346,24 +420,54 @@ impl KafkaCluster {
             let mut partition_material = Vec::from(topic.topic_id);
             partition_material.extend_from_slice(&descriptor.partition_id.to_le_bytes());
             let digest = blake3::hash(&partition_material);
-            let log = Arc::new(OrderedLog::open(
-                store,
-                OrderedLogConfig {
-                    partition_key: digest.as_bytes()[..16].try_into().expect("fixed"),
-                    maximum_segment_bytes: topic
-                        .configs
-                        .get("segment.bytes")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(OrderedLogConfig::default().maximum_segment_bytes),
-                    ..OrderedLogConfig::default()
-                },
+            let config = OrderedLogConfig {
+                partition_key: digest.as_bytes()[..16].try_into().expect("fixed"),
+                maximum_segment_bytes: topic
+                    .configs
+                    .get("segment.bytes")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(OrderedLogConfig::default().maximum_segment_bytes),
+                ..OrderedLogConfig::default()
+            };
+            let promised_epoch = descriptor.leader_epoch.saturating_sub(1);
+            let log = match OrderedLog::open(
+                store.clone(),
+                config,
                 RecoveryState {
-                    promised_epoch: descriptor.leader_epoch.saturating_sub(1),
+                    promised_epoch,
                     high_watermark: checkpoint.high_watermark,
                     log_start_offset: checkpoint.log_start_offset,
                 },
-            )?);
-            replicas.insert(*broker_id as u32, log);
+            ) {
+                Ok(log) => log,
+                // K-overlap crash window: the checkpoint was written
+                // concurrently with an append barrier that never completed, so
+                // its predicted watermark overhangs the durable log end. The
+                // floor proves the log retains everything that could have been
+                // acknowledged (an ack requires the append barrier), so the
+                // overhang is unacknowledged by construction and the watermark
+                // clamps to the log end. A log ending below the floor lost
+                // acknowledged data — that error still propagates.
+                Err(pepper_ordered_log::OrderedLogError::InvalidRecoveryPoint {
+                    log_end, ..
+                }) if checkpoint.high_watermark > log_end && checkpoint.safe_floor <= log_end => {
+                    if *broker_id == descriptor.leader_id {
+                        leader_checkpoint_high_watermark = log_end;
+                    }
+                    OrderedLog::open(
+                        store,
+                        config,
+                        RecoveryState {
+                            promised_epoch,
+                            high_watermark: log_end,
+                            log_start_offset: checkpoint.log_start_offset.min(log_end),
+                        },
+                    )?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            replicas.insert(*broker_id as u32, Arc::new(log));
+            checkpoint_paths.insert(*broker_id, directory.join("recovery.ckpt"));
         }
         let leader = descriptor.leader_id as u32;
         let replication = ReplicatedPartition::new(
@@ -380,6 +484,13 @@ impl KafkaCluster {
                 .into_iter()
                 .map(|(node, log)| (node as i32, log))
                 .collect(),
+            checkpoint_lock: Mutex::new(()),
+            // The recovered watermark is already durable in the on-disk
+            // checkpoint, so a produce that does not advance it need not rewrite.
+            checkpoint_persisted: std::sync::atomic::AtomicU64::new(
+                leader_checkpoint_high_watermark,
+            ),
+            checkpoint_paths,
         }))
     }
 
@@ -503,6 +614,51 @@ impl KafkaCluster {
                 AppendDecision::NonIdempotent => unreachable!("producer identity is present"),
             }
         }
+        // K-overlap: for a single-replica partition the post-append watermark
+        // is known before the append runs (`base_offset + offset_span`, since
+        // commit eligibility cannot depend on followers), so the checkpoint
+        // fdatasync runs on the blocking pool concurrently with the append's
+        // durability barrier instead of serially after it. The checkpoint may
+        // then claim a watermark beyond the durable log end if the process
+        // dies mid-append; `safe_floor = base_offset` (durable by the previous
+        // append under this lock) lets recovery clamp that benign overhang
+        // while still failing on real log loss (see `open_partition`). The ack
+        // still waits for BOTH the append and the checkpoint fsync.
+        let single_replica =
+            descriptor.replicas.len() == 1 && descriptor.minimum_in_sync_replicas <= 1;
+        let overlapped_checkpoint = if single_replica {
+            let predicted_end = base_offset.saturating_add(summary.offset_span);
+            let log_start_offset = leader.progress(0)?.log_start_offset;
+            let runtime = runtime.clone();
+            let path = runtime
+                .checkpoint_paths
+                .get(&descriptor.leader_id)
+                .ok_or(KafkaError::UnknownPartition)?
+                .clone();
+            Some(tokio::task::spawn_blocking(
+                move || -> Result<(), KafkaError> {
+                    use std::sync::atomic::Ordering;
+                    let _guard = runtime.checkpoint_lock.blocking_lock();
+                    if runtime.checkpoint_persisted.load(Ordering::Acquire) >= predicted_end {
+                        return Ok(());
+                    }
+                    checkpoint_write(
+                        &path,
+                        &PartitionCheckpoint {
+                            high_watermark: predicted_end,
+                            log_start_offset,
+                            safe_floor: base_offset,
+                        },
+                    )?;
+                    runtime
+                        .checkpoint_persisted
+                        .fetch_max(predicted_end, Ordering::AcqRel);
+                    Ok(())
+                },
+            ))
+        } else {
+            None
+        };
         let appended = match replication.append(
             descriptor.leader_id as u32,
             descriptor.leader_epoch,
@@ -531,12 +687,55 @@ impl KafkaCluster {
                 )
                 .await?;
         }
-        self.persist_partition(&runtime).await?;
+        PRODUCE_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // K2: the record is durable in the log and the watermark is advanced in
+        // memory. Release the replication lock before the checkpoint fsync so
+        // concurrent producers proceed and coalesce their checkpoints, then make
+        // this produce's watermark durable before acknowledging.
+        let target_high_watermark = appended.result.high_watermark;
         drop(replication);
+        match overlapped_checkpoint {
+            Some(handle) => {
+                handle
+                    .await
+                    .map_err(|error| KafkaError::ControllerState(error.to_string()))??;
+            }
+            None => {
+                self.checkpoint_durable(&runtime, target_high_watermark)
+                    .await?;
+            }
+        }
         self.apply_retention(topic, partition, timestamp_ms).await?;
         self.fetch_waiters
             .notify(&PartitionKey::new(topic, partition));
         Ok(appended)
+    }
+
+    /// Make the partition's high-watermark durable at least up to `target`,
+    /// coalescing concurrent callers. Single-flights the checkpoint fsync: the
+    /// caller that wins the lock persists the current (latest) watermark, which
+    /// covers every concurrent produce whose target it reaches; callers already
+    /// covered return without an fsync. A produce is acknowledged only after its
+    /// watermark is durable here, so recovery (which truncates to the persisted
+    /// watermark) never discards an acknowledged record.
+    async fn checkpoint_durable(
+        &self,
+        runtime: &Arc<PartitionRuntime>,
+        target: u64,
+    ) -> Result<(), KafkaError> {
+        use std::sync::atomic::Ordering;
+        if runtime.checkpoint_persisted.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
+        let _guard = runtime.checkpoint_lock.lock().await;
+        if runtime.checkpoint_persisted.load(Ordering::Acquire) >= target {
+            return Ok(());
+        }
+        let persisted = self.persist_partition(runtime).await?;
+        runtime
+            .checkpoint_persisted
+            .store(persisted, Ordering::Release);
+        Ok(())
     }
 
     pub async fn fetch(
@@ -700,6 +899,15 @@ impl KafkaCluster {
         let Some(log_start) = candidates.last().map(|manifest| manifest.end_offset) else {
             return Ok(None);
         };
+        // T1 correctness barrier: producer sequence state is recovered from
+        // the log, so before this retention pass reclaims log ranges the
+        // transaction snapshots must capture every sequence whose log evidence
+        // is about to be deleted. Retention is rare; this synchronous flush is
+        // off the produce hot path.
+        self.transactions
+            .flush_dirty()
+            .await
+            .map_err(KafkaError::from)?;
         for log in runtime.replicas.values() {
             log.advance_log_start(descriptor.assignment_epoch, log_start)?;
         }
@@ -748,6 +956,12 @@ impl KafkaCluster {
             .get("delete.retention.ms")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(24 * 60 * 60 * 1_000);
+        // T1 correctness barrier: compaction drops sealed-segment batches, so
+        // producer-state snapshots must capture every sequence those batches
+        // evidence before they are removed (see the matching flush in
+        // `apply_retention`). Concurrent produces append to the active
+        // segment, which compaction never touches.
+        self.transactions.flush_dirty().await?;
         let runtime = self.partition(topic, partition).await?;
         let descriptor = runtime.descriptor.read().await.clone();
         let leader = runtime
@@ -879,7 +1093,8 @@ impl KafkaCluster {
         } else {
             replication.set_online(broker_id as u32, false)?;
         }
-        self.persist_partition(&runtime).await
+        self.persist_partition(&runtime).await?;
+        Ok(())
     }
 
     pub async fn rolling_restart_replica(
@@ -1027,48 +1242,119 @@ impl KafkaCluster {
         persist_atomic(&self.root.join("controller.json"), &encoded)
     }
 
-    async fn persist_partition(&self, runtime: &Arc<PartitionRuntime>) -> Result<(), KafkaError> {
+    /// Persist every replica's checkpoint and return the leader replica's
+    /// persisted high-watermark (the value the checkpoint coordinator uses to
+    /// satisfy waiters).
+    async fn persist_partition(&self, runtime: &Arc<PartitionRuntime>) -> Result<u64, KafkaError> {
         let descriptor = runtime.descriptor.read().await.clone();
-        let state = self.controller.state().await;
-        let topic = state
-            .topics
-            .values()
-            .find(|topic| {
-                topic.partitions.iter().any(|partition| {
-                    partition.partition_id == descriptor.partition_id
-                        && partition.assignment_epoch == descriptor.assignment_epoch
-                })
-            })
-            .ok_or(KafkaError::UnknownPartition)?;
+        let mut leader_high_watermark = 0u64;
         for (broker_id, log) in &runtime.replicas {
             let progress = log.progress(0)?;
+            if *broker_id == descriptor.leader_id {
+                leader_high_watermark = progress.high_watermark;
+            }
+            // Post-append checkpoint: the watermark is already durable in the
+            // log, so it is its own floor.
             let checkpoint = PartitionCheckpoint {
                 high_watermark: progress.high_watermark,
                 log_start_offset: progress.log_start_offset,
+                safe_floor: progress.high_watermark,
             };
-            let encoded = serde_json::to_vec(&checkpoint)
-                .map_err(|error| KafkaError::ControllerState(error.to_string()))?;
-            let directory = self
-                .root
-                .join(format!("broker-{broker_id}"))
-                .join(hex_id(topic.topic_id))
-                .join(descriptor.partition_id.to_string());
-            persist_atomic(&directory.join("recovery.json"), &encoded)?;
+            let path = runtime
+                .checkpoint_paths
+                .get(broker_id)
+                .ok_or(KafkaError::UnknownPartition)?;
+            checkpoint_write(path, &checkpoint)?;
         }
-        Ok(())
+        Ok(leader_high_watermark)
     }
 }
 
-fn read_checkpoint(directory: &Path) -> Result<PartitionCheckpoint, KafkaError> {
-    let path = directory.join("recovery.json");
-    if !path.exists() {
+const CHECKPOINT_MAGIC_V1: &[u8; 8] = b"PEPKPT01";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"PEPKPT02";
+const CHECKPOINT_BYTES_V1: usize = 24;
+const CHECKPOINT_BYTES: usize = 32;
+
+fn checkpoint_encode(checkpoint: &PartitionCheckpoint) -> [u8; CHECKPOINT_BYTES] {
+    let mut buffer = [0u8; CHECKPOINT_BYTES];
+    buffer[..8].copy_from_slice(CHECKPOINT_MAGIC);
+    buffer[8..16].copy_from_slice(&checkpoint.high_watermark.to_be_bytes());
+    buffer[16..24].copy_from_slice(&checkpoint.log_start_offset.to_be_bytes());
+    buffer[24..32].copy_from_slice(&checkpoint.safe_floor.to_be_bytes());
+    buffer
+}
+
+fn checkpoint_decode(bytes: &[u8]) -> Result<PartitionCheckpoint, KafkaError> {
+    if bytes.len() >= CHECKPOINT_BYTES && &bytes[..8] == CHECKPOINT_MAGIC {
         return Ok(PartitionCheckpoint {
-            high_watermark: 0,
-            log_start_offset: 0,
+            high_watermark: u64::from_be_bytes(bytes[8..16].try_into().expect("fixed")),
+            log_start_offset: u64::from_be_bytes(bytes[16..24].try_into().expect("fixed")),
+            safe_floor: u64::from_be_bytes(bytes[24..32].try_into().expect("fixed")),
         });
     }
-    serde_json::from_slice(&std::fs::read(path)?)
-        .map_err(|error| KafkaError::ControllerState(error.to_string()))
+    // V1 checkpoints were always written after the append barrier, so their
+    // watermark never exceeds the durable log end: the floor equals it.
+    if bytes.len() == CHECKPOINT_BYTES_V1 && &bytes[..8] == CHECKPOINT_MAGIC_V1 {
+        let high_watermark = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed"));
+        return Ok(PartitionCheckpoint {
+            high_watermark,
+            log_start_offset: u64::from_be_bytes(bytes[16..24].try_into().expect("fixed")),
+            safe_floor: high_watermark,
+        });
+    }
+    Err(KafkaError::ControllerState(
+        "invalid partition checkpoint".into(),
+    ))
+}
+
+/// Persist the committed watermark with a single `fdatasync`.
+///
+/// The checkpoint is a fixed-size 24-byte record written in place, so the write
+/// is atomic at the sector level and needs neither a temp file + rename nor a
+/// parent-directory fsync on the hot path (the directory entry only has to be
+/// made durable once, on first creation). This is durability-critical: recovery
+/// truncates the log to this watermark (`OrderedLog::open`), so it must be
+/// synced before the produce is acknowledged. Collapsing the previous
+/// temp-write + rename + dir-fsync (two fsyncs) to one fdatasync removes one of
+/// the roughly three serialized fsyncs per produce without weakening durability.
+fn checkpoint_write(path: &Path, checkpoint: &PartitionCheckpoint) -> Result<(), KafkaError> {
+    use std::io::Write;
+    let existed = path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.write_all(&checkpoint_encode(checkpoint))?;
+    file.sync_data()?;
+    let mut fsyncs = 1u64;
+    if !existed {
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+            fsyncs += 1;
+        }
+    }
+    PRODUCE_CHECKPOINT_FSYNCS.fetch_add(fsyncs, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+fn read_checkpoint(directory: &Path) -> Result<PartitionCheckpoint, KafkaError> {
+    let binary_path = directory.join("recovery.ckpt");
+    if binary_path.exists() {
+        return checkpoint_decode(&std::fs::read(binary_path)?);
+    }
+    // Legacy JSON checkpoint (pre-binary format); migrated forward on the next
+    // checkpoint write. A partition that has never checkpointed starts at zero.
+    let legacy_path = directory.join("recovery.json");
+    if legacy_path.exists() {
+        return serde_json::from_slice(&std::fs::read(legacy_path)?)
+            .map_err(|error| KafkaError::ControllerState(error.to_string()));
+    }
+    Ok(PartitionCheckpoint {
+        high_watermark: 0,
+        log_start_offset: 0,
+        safe_floor: 0,
+    })
 }
 
 fn persist_atomic(path: &Path, encoded: &[u8]) -> Result<(), KafkaError> {
