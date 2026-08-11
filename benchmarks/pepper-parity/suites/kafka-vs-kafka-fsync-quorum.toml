@@ -32,7 +32,11 @@ replication = "3 replicas, 2 in-sync required"
 name = "pepper"
 role = "subject"
 profile = "kafka-fsync-quorum"
-endpoint = "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095"
+# Single bootstrap by design: each Pepper node is an independent single-broker
+# Kafka front-end (durability comes from Pepper beneath, not Kafka replicas).
+# A multi-address bootstrap would randomly hit a broker that does not host the
+# benchmark topics.
+endpoint = "172.30.43.10:9095"
 parser = "kafka-perf-stdout"
 
 [targets.parser_overrides]
@@ -63,7 +67,7 @@ steps = [
     [
         "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
         "audit-produce", "pepper-parity-kafka-client",
-        "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095", "1", "none",
+        "172.30.43.10:9095", "1", "none",
     ],
     [
         "docker", "compose",
@@ -82,7 +86,7 @@ steps = [
     [
         "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
         "audit-verify", "pepper-parity-kafka-client",
-        "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095",
+        "172.30.43.10:9095",
     ],
 ]
 
@@ -90,7 +94,7 @@ steps = [
 command = [
     "bash", "benchmarks/pepper-parity/topologies/kafka-driver.sh",
     "measure", "pepper-parity-kafka-client",
-    "172.30.43.10:9095,172.30.43.14:9095,172.30.43.15:9095",
+    "172.30.43.10:9095",
     "{operation}", "{payload_size_bytes}", "{concurrency}", "{repetition}",
     "1", "none",
 ]

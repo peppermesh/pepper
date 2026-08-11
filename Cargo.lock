@@ -2122,6 +2122,7 @@ dependencies = [
  "pepper-extent",
  "pepper-kafka-protocol",
  "pepper-metadata",
+ "pepper-observability",
  "pepper-ordered-log",
  "pepper-rsm",
  "pepper-storage",

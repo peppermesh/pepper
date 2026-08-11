@@ -44,6 +44,7 @@ help:
 	@echo "  make fmt clippy test system-tests multinode audit licenses dco smoke"
 	@echo "  make fmt-fix      # apply rustfmt to the root and system-tests workspaces"
 	@echo "  make tools        # install pinned cargo-audit ($(CARGO_AUDIT_VERSION)) + cargo-deny ($(CARGO_DENY_VERSION))"
+	@echo "  make kafka-bench  # Docker-based Kafka parity: Pepper vs Apache Kafka, matched guarantee"
 	@echo "  make docker-image # build the pinned CI image ($(CI_IMAGE))"
 	@echo "  make docker-ci    # run 'make ci' inside the CI image (hermetic toolchain)"
 	@echo "  make docker-shell # interactive shell in the CI image"
@@ -152,6 +153,23 @@ smoke:
 		$(CARGO) run --manifest-path $(SYSTEM_MANIFEST) --locked -- \
 			run --scenario "$$s" --seed "$(SYSTEM_TEST_SEED)" --backend process --no-build; \
 	done
+
+# ---- Kafka parity benchmark (Docker-based) --------------------------------
+# Pepper vs Apache Kafka 4.3.1 at a matched durability guarantee. Both systems
+# and the perf client run in pinned containers; includes the SIGKILL
+# durability audit on each side. Reports land in benchmarks/pepper-parity/results.
+
+.PHONY: kafka-bench
+kafka-bench:
+	bash benchmarks/pepper-parity/run-kafka-parity.sh fsync-quorum
+
+.PHONY: kafka-bench-full
+kafka-bench-full:
+	SCALE=full bash benchmarks/pepper-parity/run-kafka-parity.sh fsync-quorum
+
+.PHONY: kafka-bench-replicated
+kafka-bench-replicated:
+	bash benchmarks/pepper-parity/run-kafka-parity.sh replicated-ack
 
 # ---- Docker ---------------------------------------------------------------
 

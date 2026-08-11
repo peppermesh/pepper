@@ -650,9 +650,13 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          pepper_kafka_produce_operations_total {}\n\
          # HELP pepper_kafka_produce_checkpoint_fsyncs_total fsyncs issued by per-partition checkpoint writes on the produce path.\n\
          # TYPE pepper_kafka_produce_checkpoint_fsyncs_total counter\n\
-         pepper_kafka_produce_checkpoint_fsyncs_total {}\n",
+         pepper_kafka_produce_checkpoint_fsyncs_total {}\n\
+         # HELP pepper_kafka_produce_transaction_fsyncs_total fsyncs issued by producer-state (idempotence/transaction) persists on the produce path.\n\
+         # TYPE pepper_kafka_produce_transaction_fsyncs_total counter\n\
+         pepper_kafka_produce_transaction_fsyncs_total {}\n",
         kafka_produce.produce_operations,
         kafka_produce.produce_checkpoint_fsyncs,
+        kafka_produce.produce_transaction_fsyncs,
     ));
     let cache = reconstructed_cache::process_stats();
     body.push_str(&format!(
