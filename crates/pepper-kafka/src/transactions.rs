@@ -301,6 +301,18 @@ pub struct TransactionCoordinator {
     root: PathBuf,
     metadata: Mutex<CoordinatorMetadata>,
     shards: Vec<Mutex<TransactionState>>,
+    /// Shards whose in-memory state has advanced past the on-disk snapshot.
+    /// Produce-path sequence updates (`prepare_append` / `complete_append` /
+    /// `cancel_append`) only mark their shard dirty instead of fsyncing a
+    /// snapshot per produce: the record batches themselves are durable in the
+    /// partition log before an ack, and startup recovery
+    /// (`recover_partition`, fed by the full log scan in
+    /// `recover_transaction_state`) rebuilds sequence state from those batch
+    /// headers — the same recovery contract Apache Kafka uses. Snapshots are
+    /// written by `flush_dirty`: periodically in the background, and
+    /// synchronously before retention reclaims log ranges whose batches a
+    /// snapshot has not captured yet.
+    dirty: Vec<std::sync::atomic::AtomicBool>,
 }
 
 impl TransactionCoordinator {
@@ -358,6 +370,9 @@ impl TransactionCoordinator {
             root,
             metadata: Mutex::new(metadata),
             shards,
+            dirty: (0..TRANSACTION_SHARDS)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
         };
         if imported_legacy {
             let metadata = coordinator.metadata.get_mut().clone();
@@ -488,7 +503,10 @@ impl TransactionCoordinator {
             return Err(TransactionError::OutOfOrderSequence);
         }
         sequence.pending = Some((identity.base_sequence, identity.record_count));
-        self.persist_shard(shard, &state)?;
+        // T1: no per-produce snapshot fsync. The `pending` marker is
+        // memory-only by design — recovery clears every pending marker and
+        // rebuilds completed sequences from the durable log.
+        self.mark_dirty(shard);
         Ok(AppendDecision::Append)
     }
 
@@ -529,7 +547,12 @@ impl TransactionCoordinator {
         if identity.transactional {
             sequence.first_transaction_offset.get_or_insert(base_offset);
         }
-        self.persist_shard(shard, &state)
+        // T1: the batch this sequence update describes is already durable in
+        // the partition log (append completes before `complete_append` runs),
+        // so recovery reproduces this exact state from the log scan. Snapshot
+        // asynchronously instead of fsyncing on the produce path.
+        self.mark_dirty(shard);
+        Ok(())
     }
 
     pub async fn cancel_append(
@@ -553,7 +576,7 @@ impl TransactionCoordinator {
             && sequence.pending == Some((identity.base_sequence, identity.record_count))
         {
             sequence.pending = None;
-            self.persist_shard(shard, &state)?;
+            self.mark_dirty(shard);
         }
         Ok(())
     }
@@ -864,6 +887,32 @@ impl TransactionCoordinator {
         std::fs::File::open(&self.root)?.sync_all()?;
         Ok(())
     }
+
+    fn mark_dirty(&self, shard: usize) {
+        self.dirty[shard].store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Snapshot every dirty shard. Runs off the produce path: periodically from
+    /// the coordinator maintenance loop, and synchronously before retention
+    /// reclaims log ranges (a snapshot must capture any sequence state whose
+    /// log evidence is about to be deleted). Returns the number of shards
+    /// persisted.
+    pub async fn flush_dirty(&self) -> Result<usize, TransactionError> {
+        use std::sync::atomic::Ordering;
+        let mut flushed = 0usize;
+        for shard in 0..self.shards.len() {
+            if !self.dirty[shard].swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            let state = self.shards[shard].lock().await;
+            if let Err(error) = self.persist_shard(shard, &state) {
+                self.dirty[shard].store(true, Ordering::Release);
+                return Err(error);
+            }
+            flushed += 1;
+        }
+        Ok(flushed)
+    }
 }
 
 fn producer_shard(producer_id: i64) -> usize {
@@ -1056,6 +1105,86 @@ mod tests {
         assert_eq!(
             no_append.prepare_append(partition, next).await.unwrap(),
             AppendDecision::Append
+        );
+    }
+
+    /// T1 contract: produce-path sequence updates never fsync a snapshot.
+    /// A crash after acked appends recovers duplicate detection from the
+    /// durable log scan alone, and `flush_dirty` (the retention barrier)
+    /// makes the snapshot self-sufficient once log evidence is reclaimed.
+    #[tokio::test]
+    async fn unpersisted_sequences_recover_from_log_and_flush_covers_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let coordinator = TransactionCoordinator::open(root.path()).unwrap();
+        let producer = coordinator.init_producer(None, 60_000, 0).await.unwrap();
+        let partition = TransactionPartition::new("events", 0);
+        let shard_path = |shard: usize| root.path().join(format!("shard-{shard}.json"));
+        let shard = producer_shard(producer.producer_id);
+        let registered = std::fs::read(shard_path(shard)).unwrap();
+
+        let first = identity(producer, 0, false);
+        let second = identity(producer, 1, false);
+        for (batch, base) in [(first, 5u64), (second, 6u64)] {
+            assert_eq!(
+                coordinator
+                    .prepare_append(partition.clone(), batch)
+                    .await
+                    .unwrap(),
+                AppendDecision::Append
+            );
+            coordinator
+                .complete_append(partition.clone(), batch, base, base)
+                .await
+                .unwrap();
+        }
+        // The produce path must not have persisted anything: the shard file is
+        // byte-identical to the state init_producer wrote.
+        assert_eq!(std::fs::read(shard_path(shard)).unwrap(), registered);
+
+        // Crash without a flush: the log scan alone must restore duplicate
+        // detection and sequence continuity.
+        drop(coordinator);
+        let recovered = TransactionCoordinator::open(root.path()).unwrap();
+        recovered
+            .recover_partition(partition.clone(), vec![(first, 5, 5), (second, 6, 6)])
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .prepare_append(partition.clone(), second)
+                .await
+                .unwrap(),
+            AppendDecision::Duplicate { base_offset: 6 }
+        );
+        let third = identity(producer, 2, false);
+        assert_eq!(
+            recovered
+                .prepare_append(partition.clone(), third)
+                .await
+                .unwrap(),
+            AppendDecision::Append
+        );
+        recovered
+            .complete_append(partition.clone(), third, 7, 7)
+            .await
+            .unwrap();
+
+        // flush_dirty snapshots the recovered + new state; after the flush a
+        // reopen with an EMPTY log (retention reclaimed everything) must still
+        // detect duplicates purely from the snapshot.
+        assert!(recovered.flush_dirty().await.unwrap() >= 1);
+        drop(recovered);
+        let from_snapshot = TransactionCoordinator::open(root.path()).unwrap();
+        from_snapshot
+            .recover_partition(partition.clone(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            from_snapshot
+                .prepare_append(partition, third)
+                .await
+                .unwrap(),
+            AppendDecision::Duplicate { base_offset: 7 }
         );
     }
 }

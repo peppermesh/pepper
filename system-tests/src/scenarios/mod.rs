@@ -10,6 +10,7 @@ mod fault_injection;
 mod filesystem_suite;
 mod identity_fencing;
 mod immutable_content;
+mod kafka_suite;
 mod namespace_suite;
 mod phase7;
 mod phase8;
@@ -34,6 +35,7 @@ pub use identity_fencing::IdentityFencingScenario;
 pub use immutable_content::{
     DagRegistryScenario, DeduplicationScenario, DirectoryScenario, ObjectScenario, RawBlockScenario,
 };
+pub use kafka_suite::KafkaProduceDurabilityScenario;
 pub use namespace_suite::{
     NamespaceCreationScenario, NamespaceFailoverScenario, NamespaceIdempotencyScenario,
     NamespaceRestartScenario, NamespaceRoutingScenario, NamespaceTransactionScenario,

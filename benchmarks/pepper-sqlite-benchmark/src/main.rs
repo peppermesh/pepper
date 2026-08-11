@@ -21,6 +21,9 @@ mod unix {
         Both,
         Filesystem,
         Pepper,
+        /// Replicated-SQL competitor over the rqlite HTTP API; used by the
+        /// parity harness. `both` intentionally remains filesystem+pepper.
+        Rqlite,
     }
 
     impl TargetSelection {
@@ -30,6 +33,10 @@ mod unix {
 
         fn pepper(self) -> bool {
             matches!(self, Self::Both | Self::Pepper)
+        }
+
+        fn rqlite(self) -> bool {
+            matches!(self, Self::Rqlite)
         }
     }
 
@@ -56,6 +63,14 @@ mod unix {
         /// Optional bearer token for the Pepper HTTP API.
         #[arg(long, env = "PEPPER_API_TOKEN")]
         api_token: Option<String>,
+
+        /// rqlite HTTP base URL for the rqlite target.
+        #[arg(long, env = "RQLITE_URL", default_value = "http://127.0.0.1:24001")]
+        rqlite_url: String,
+
+        /// rqlite read consistency level for measured reads.
+        #[arg(long, default_value = "linearizable")]
+        rqlite_read_level: String,
 
         /// Existing disk-backed directory for the private filesystem database.
         #[arg(long, required_if_eq_any = [("target", "both"), ("target", "filesystem")])]
@@ -305,6 +320,10 @@ mod unix {
                 ),
                 &args,
             )?);
+        }
+
+        if args.target.rqlite() {
+            backends.push(rqlite::run_backend(&args).await?);
         }
 
         let mut vfs_registration = None;
@@ -890,6 +909,314 @@ mod unix {
             + 1
     }
 
+    /// Replicated-SQL competitor backend over the rqlite HTTP API. The same
+    /// statement streams, seed data, and per-sample measurement points as the
+    /// SQLite-library backends; durability comes from rqlite's Raft log
+    /// rather than SQLite pragmas, so `effective_pragmas` records rqlite's
+    /// own values instead of enforcing the library configuration.
+    mod rqlite {
+        use super::*;
+        use serde_json::{Value, json};
+
+        struct Client {
+            http: reqwest::Client,
+            base: String,
+            read_level: String,
+        }
+
+        impl Client {
+            fn new(base: &str, read_level: &str) -> Result<Self> {
+                Ok(Self {
+                    http: reqwest::Client::builder()
+                        .timeout(Duration::from_secs(300))
+                        .build()
+                        .context("build rqlite HTTP client")?,
+                    base: base.trim_end_matches('/').to_string(),
+                    read_level: read_level.to_string(),
+                })
+            }
+
+            async fn post(&self, path: &str, statements: Value) -> Result<Value> {
+                let response = self
+                    .http
+                    .post(format!("{}{path}", self.base))
+                    .json(&statements)
+                    .send()
+                    .await
+                    .with_context(|| format!("rqlite request {path}"))?;
+                let status = response.status();
+                let body: Value = response
+                    .json()
+                    .await
+                    .with_context(|| format!("decode rqlite response for {path}"))?;
+                ensure!(
+                    status.is_success(),
+                    "rqlite {path} returned {status}: {body}"
+                );
+                let results = body
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .with_context(|| format!("rqlite {path} response has no results"))?;
+                for result in results {
+                    if let Some(error) = result.get("error").and_then(Value::as_str) {
+                        bail!("rqlite statement failed: {error}");
+                    }
+                }
+                Ok(body)
+            }
+
+            async fn execute(&self, statements: Value, transaction: bool) -> Result<Value> {
+                let path = if transaction {
+                    "/db/execute?transaction"
+                } else {
+                    "/db/execute"
+                };
+                self.post(path, statements).await
+            }
+
+            async fn query_one(&self, statement: Value) -> Result<Value> {
+                let path = format!("/db/query?level={}", self.read_level);
+                let body = self.post(&path, json!([statement])).await?;
+                let value = body["results"][0]["values"][0][0].clone();
+                ensure!(
+                    !value.is_null(),
+                    "rqlite query returned no rows: {statement}"
+                );
+                Ok(value)
+            }
+        }
+
+        fn as_i64(value: &Value) -> Result<i64> {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+                .with_context(|| format!("rqlite value {value} is not an integer"))
+        }
+
+        async fn seed(client: &Client, rows: u64, payload_bytes: u32) -> Result<()> {
+            let mut statements = vec![
+                json!(["DROP TABLE IF EXISTS benchmark_rows"]),
+                json!([
+                    "CREATE TABLE benchmark_rows(id INTEGER PRIMARY KEY, lookup_key INTEGER NOT NULL UNIQUE, payload BLOB NOT NULL)"
+                ]),
+            ];
+            for key in 1..=rows {
+                statements.push(json!([
+                    "INSERT INTO benchmark_rows(lookup_key, payload) VALUES (?, zeroblob(?))",
+                    key,
+                    payload_bytes
+                ]));
+            }
+            client.execute(Value::Array(statements), true).await?;
+            Ok(())
+        }
+
+        async fn point_read(client: &Client, key: u64) -> Result<()> {
+            let value = client
+                .query_one(json!([
+                    "SELECT length(payload) FROM benchmark_rows WHERE lookup_key=?",
+                    key
+                ]))
+                .await?;
+            ensure!(as_i64(&value)? > 0, "point read returned an empty payload");
+            Ok(())
+        }
+
+        async fn measure_point_reads(
+            client: &Client,
+            rows: u64,
+            count: u64,
+        ) -> Result<WorkloadReport> {
+            let mut latencies = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let key = lookup_key(index, rows);
+                let started = Instant::now();
+                point_read(client, key).await?;
+                latencies.push(started.elapsed());
+            }
+            Ok(workload(
+                "point_read_connection_cache",
+                "query",
+                count,
+                1,
+                latencies,
+            ))
+        }
+
+        async fn measure_scans(client: &Client, rows: u64, scans: u64) -> Result<WorkloadReport> {
+            let mut latencies = Vec::with_capacity(scans as usize);
+            for _ in 0..scans {
+                let started = Instant::now();
+                let bytes = client
+                    .query_one(json!([
+                        "SELECT coalesce(sum(length(payload)), 0) FROM benchmark_rows"
+                    ]))
+                    .await?;
+                ensure!(
+                    as_i64(&bytes)? > 0,
+                    "sequential scan returned no payload bytes"
+                );
+                latencies.push(started.elapsed());
+            }
+            Ok(workload(
+                "sequential_scan_connection_cache",
+                "scan",
+                scans,
+                rows,
+                latencies,
+            ))
+        }
+
+        async fn measure_reopen_reads(
+            args: &Args,
+            rows: u64,
+            count: u64,
+        ) -> Result<WorkloadReport> {
+            let mut latencies = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let key = lookup_key(index, rows);
+                let started = Instant::now();
+                // A fresh client per read is the closest HTTP analogue of the
+                // library backends' open/query/close cycle: new connection
+                // establishment is inside the measured sample.
+                let client = Client::new(&args.rqlite_url, &args.rqlite_read_level)?;
+                point_read(&client, key).await?;
+                latencies.push(started.elapsed());
+            }
+            Ok(workload(
+                "point_read_reopen",
+                "open/query/close",
+                count,
+                1,
+                latencies,
+            ))
+        }
+
+        async fn measure_writes(
+            client: &Client,
+            batch_size: u64,
+            transactions: u64,
+            payload_bytes: u32,
+            next_lookup_key: &mut u64,
+        ) -> Result<WorkloadReport> {
+            let mut latencies = Vec::with_capacity(transactions as usize);
+            for _ in 0..transactions {
+                let mut statements = Vec::with_capacity(batch_size as usize);
+                for _ in 0..batch_size {
+                    statements.push(json!([
+                        "INSERT INTO benchmark_rows(lookup_key, payload) VALUES (?, zeroblob(?))",
+                        *next_lookup_key,
+                        payload_bytes
+                    ]));
+                    *next_lookup_key = next_lookup_key.saturating_add(1);
+                }
+                let started = Instant::now();
+                client
+                    .execute(Value::Array(statements), batch_size > 1)
+                    .await?;
+                latencies.push(started.elapsed());
+            }
+            let name = if batch_size == 1 {
+                "insert_autocommit_1".to_string()
+            } else {
+                format!("insert_transaction_{batch_size}")
+            };
+            Ok(workload(
+                name,
+                "transaction",
+                transactions,
+                batch_size,
+                latencies,
+            ))
+        }
+
+        async fn effective_pragmas(client: &Client) -> Result<BTreeMap<String, String>> {
+            let mut pragmas = BTreeMap::new();
+            for (name, query) in [
+                ("page_size", "PRAGMA page_size"),
+                ("journal_mode", "PRAGMA journal_mode"),
+                ("synchronous", "PRAGMA synchronous"),
+                ("mmap_size", "PRAGMA mmap_size"),
+                ("cache_size", "PRAGMA cache_size"),
+            ] {
+                let value = client.query_one(json!([query])).await?;
+                let rendered = match &value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                pragmas.insert(name.to_string(), rendered);
+            }
+            Ok(pragmas)
+        }
+
+        pub(super) async fn run_backend(args: &Args) -> Result<BackendReport> {
+            let client = Client::new(&args.rqlite_url, &args.rqlite_read_level)?;
+            let setup_started = Instant::now();
+            seed(&client, args.seed_rows, args.payload_bytes).await?;
+            let setup_seconds = setup_started.elapsed().as_secs_f64();
+            let effective_pragmas = effective_pragmas(&client).await?;
+
+            for index in 0..args.point_reads {
+                point_read(&client, lookup_key(index, args.seed_rows)).await?;
+            }
+            let mut workloads = vec![
+                measure_point_reads(&client, args.seed_rows, args.point_reads).await?,
+                measure_scans(&client, args.seed_rows, args.scans).await?,
+            ];
+            if args.reopen_reads > 0 {
+                workloads
+                    .push(measure_reopen_reads(args, args.seed_rows, args.reopen_reads).await?);
+            }
+
+            let mut next_lookup_key = args.seed_rows.saturating_add(1);
+            for batch_size in &args.batch_sizes {
+                workloads.push(
+                    measure_writes(
+                        &client,
+                        *batch_size,
+                        args.transactions_per_batch,
+                        args.payload_bytes,
+                        &mut next_lookup_key,
+                    )
+                    .await?,
+                );
+            }
+
+            let final_rows = u64::try_from(as_i64(
+                &client
+                    .query_one(json!(["SELECT count(*) FROM benchmark_rows"]))
+                    .await?,
+            )?)?;
+            let expected_rows = args.seed_rows.saturating_add(
+                args.batch_sizes
+                    .iter()
+                    .map(|size| size.saturating_mul(args.transactions_per_batch))
+                    .sum::<u64>(),
+            );
+            ensure!(
+                final_rows == expected_rows,
+                "rqlite final row count {final_rows} differs from expected {expected_rows}"
+            );
+            let integrity_check = match client.query_one(json!(["PRAGMA integrity_check"])).await {
+                Ok(Value::String(text)) => text,
+                Ok(other) => other.to_string(),
+                Err(error) => bail!("rqlite integrity_check failed: {error}"),
+            };
+            ensure!(
+                integrity_check == "ok",
+                "rqlite integrity_check failed: {integrity_check}"
+            );
+            Ok(BackendReport {
+                backend: "rqlite",
+                setup_seconds,
+                effective_pragmas,
+                final_rows,
+                integrity_check,
+                workloads,
+            })
+        }
+    }
+
     fn workload(
         name: impl Into<String>,
         sample_unit: &'static str,
@@ -1074,6 +1401,8 @@ mod unix {
                 api: "http://127.0.0.1:9080".into(),
                 socket: PathBuf::from("unused"),
                 api_token: None,
+                rqlite_url: "http://127.0.0.1:24001".into(),
+                rqlite_read_level: "linearizable".into(),
                 filesystem_directory: Some(temporary.path().to_path_buf()),
                 database: None,
                 reuse_database: false,

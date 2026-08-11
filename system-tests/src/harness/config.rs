@@ -57,6 +57,15 @@ pub fn render_agent_config(
         })
         .collect::<Result<Vec<_>>>()?
         .join(", ");
+    let kafka_section = if cluster.kafka_enabled {
+        format!(
+            "\n[kafka]\nenabled = true\nbind_addr = \"127.0.0.1:{kafka_port}\"\nadvertise_addr = \"127.0.0.1:{kafka_port}\"\nbroker_id = {broker_id}\n",
+            kafka_port = runtime.kafka_port,
+            broker_id = broker_id(cluster, &node.id),
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
         r#"[node]
 name = "{name}"
@@ -94,7 +103,7 @@ repair_interval_seconds = {repair_interval}
 
 [sqlite]
 enabled = {sqlite_enabled}
-
+{kafka_section}
 [compute]
 enabled = {compute}
 runtime = "firecracker"
@@ -123,9 +132,19 @@ format = "json"
         replication = cluster.replication_factor,
         repair_interval = node.storage.repair_interval_seconds,
         sqlite_enabled = cluster.sqlite_enabled,
+        kafka_section = kafka_section,
         compute = node.compute_enabled,
         compute_path = runtime.data_path.join("compute").display(),
     ))
+}
+
+/// Deterministic broker id for a node: its ordinal position in the cluster spec.
+fn broker_id(cluster: &ClusterSpec, node: &NodeId) -> i32 {
+    cluster
+        .nodes
+        .iter()
+        .position(|candidate| &candidate.id == node)
+        .unwrap_or(0) as i32
 }
 
 pub fn render_docker_agent_config(
@@ -145,6 +164,16 @@ pub fn render_docker_agent_config(
         })
         .collect::<Result<Vec<_>>>()?
         .join(", ");
+    let kafka_section = if cluster.kafka_enabled {
+        format!(
+            "\n[kafka]\nenabled = true\nbind_addr = \"0.0.0.0:{kafka_port}\"\nadvertise_addr = \"{address}:{kafka_port}\"\nbroker_id = {broker_id}\n",
+            kafka_port = runtime.kafka_port,
+            address = runtime.address,
+            broker_id = broker_id(cluster, &node.id),
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
         r#"[node]
 name = "{name}"
@@ -186,7 +215,7 @@ repair_interval_seconds = {repair_interval}
 [sqlite]
 enabled = {sqlite_enabled}
 socket_path = "/var/lib/pepper/metadata/sqlite.sock"
-
+{kafka_section}
 [compute]
 enabled = {compute}
 runtime = "firecracker"
@@ -213,6 +242,7 @@ format = "json"
         replication = cluster.replication_factor,
         repair_interval = node.storage.repair_interval_seconds,
         sqlite_enabled = cluster.sqlite_enabled,
+        kafka_section = kafka_section,
         compute = node.compute_enabled,
     ))
 }

@@ -2070,38 +2070,56 @@ pub(super) async fn s3_put_object(
             .min(u128::from(u64::MAX)) as u64,
         Ordering::Relaxed,
     );
-    let (partition, current) =
-        current_bucket_descriptor_snapshot(&state, &bucket, key.as_bytes()).await?;
-    let namespace_id = partition.partition.namespace_id.clone();
-    let mut if_cid = None;
     if headers.contains_key(header::IF_MATCH) && headers.contains_key(header::IF_NONE_MATCH) {
         return Err(S3Error::invalid(
             "If-Match and If-None-Match cannot be combined",
             uri.path(),
         ));
     }
-    if let Some(expected) = header_text(&headers, header::IF_MATCH)? {
-        let Some((value, descriptor)) = current.as_ref() else {
-            return Err(precondition_failed(uri.path()));
-        };
-        if descriptor.tombstone || unquote_etag(expected) != descriptor_etag(descriptor) {
-            return Err(precondition_failed(uri.path()));
-        }
-        if_cid = Some(value.cid.clone());
-    } else if let Some(expected) = header_text(&headers, header::IF_NONE_MATCH)? {
-        if expected != "*" {
-            return Err(S3Error::invalid(
-                "PutObject supports only If-None-Match: *",
-                uri.path(),
-            ));
-        }
-        if let Some((value, descriptor)) = current.as_ref() {
-            if !descriptor.tombstone {
+    // Conditional PUTs must evaluate their precondition against a linearizable
+    // view of the object, so they resolve the partition head and current
+    // descriptor. Unconditional PUTs — the common path — need neither: they carry
+    // no precondition, and the namespace state machine applies them
+    // last-writer-wins after rebasing onto the committed root. Resolving only the
+    // routing partition there removes the per-write linearizable partition head
+    // read, which was a read-after-write serializer that stopped concurrent
+    // writers from coalescing into shared commits.
+    let conditional_headers =
+        headers.contains_key(header::IF_MATCH) || headers.contains_key(header::IF_NONE_MATCH);
+    let (namespace_id, write_fence, if_cid) = if conditional_headers {
+        let (partition, current) =
+            current_bucket_descriptor_snapshot(&state, &bucket, key.as_bytes()).await?;
+        let namespace_id = partition.partition.namespace_id.clone();
+        let write_fence = partition.write_fence();
+        let mut if_cid = None;
+        if let Some(expected) = header_text(&headers, header::IF_MATCH)? {
+            let Some((value, descriptor)) = current.as_ref() else {
+                return Err(precondition_failed(uri.path()));
+            };
+            if descriptor.tombstone || unquote_etag(expected) != descriptor_etag(descriptor) {
                 return Err(precondition_failed(uri.path()));
             }
             if_cid = Some(value.cid.clone());
+        } else if let Some(expected) = header_text(&headers, header::IF_NONE_MATCH)? {
+            if expected != "*" {
+                return Err(S3Error::invalid(
+                    "PutObject supports only If-None-Match: *",
+                    uri.path(),
+                ));
+            }
+            if let Some((value, descriptor)) = current.as_ref() {
+                if !descriptor.tombstone {
+                    return Err(precondition_failed(uri.path()));
+                }
+                if_cid = Some(value.cid.clone());
+            }
         }
-    }
+        (namespace_id, write_fence, if_cid)
+    } else {
+        let partition = bucket_partition_routing(&state, &bucket, key.as_bytes()).await?;
+        let write_fence = partition_write_fence(&partition);
+        (partition.namespace_id.clone(), write_fence, None)
+    };
 
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -2129,7 +2147,7 @@ pub(super) async fn s3_put_object(
                 if_cid: if_cid.clone(),
                 request_id: request_id(),
                 preverified_durability: preverified_durability.clone(),
-                partition_fence: Some(partition.write_fence()),
+                partition_fence: Some(write_fence.clone()),
             }),
         )
         .await
@@ -8482,11 +8500,40 @@ struct ResolvedS3Partition {
 
 impl ResolvedS3Partition {
     fn write_fence(&self) -> PartitionFence {
-        PartitionFence {
-            generation: self.partition.fence_generation,
-            cid: self.partition.fence_cid.clone(),
-        }
+        partition_write_fence(&self.partition)
     }
+}
+
+fn partition_write_fence(partition: &BucketPartition) -> PartitionFence {
+    PartitionFence {
+        generation: partition.fence_generation,
+        cid: partition.fence_cid.clone(),
+    }
+}
+
+/// Resolve only the routing partition for a key from the bucket's partition map,
+/// without a linearizable read of the partition namespace head. Unconditional
+/// writes need the routing target and its write fence but not a linearizable
+/// object view, so this avoids the per-write read-after-write serialization that
+/// a partition head read imposes. Conditional writes must still resolve the head
+/// and current descriptor via [`bucket_partition_state`].
+async fn bucket_partition_routing(
+    state: &AppState,
+    bucket: &str,
+    key: &[u8],
+) -> Result<BucketPartition, S3Error> {
+    let resolved = bucket_namespace_state(state, bucket).await?;
+    if resolved.partition_map.state != BucketPartitionMapState::Active {
+        return Err(S3Error::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "bucket metadata is being repartitioned",
+            format!("/{bucket}"),
+        )
+        .with_retry_after(1));
+    }
+    metrics::S3_PARTITION_ROUTES.fetch_add(1, Ordering::Relaxed);
+    Ok(resolved.partition_map.partition_for_key(key).clone())
 }
 
 async fn bucket_namespace_state(

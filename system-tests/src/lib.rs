@@ -27,17 +27,17 @@ use scenarios::{
     ContinuousPartitionScenario, CorruptionScenario, DagRegistryScenario, DeduplicationScenario,
     DirectoryScenario, ErasureInventoryScenario, ErasureRepairScenario, ErasureToleranceScenario,
     FilesystemHistoryScenario, FilesystemSharingScenario, FilesystemTreeScenario,
-    GarbageCollectionScenario, IdentityFencingScenario, KvmFirecrackerScenario,
-    LearnerReplacementScenario, LinearizabilityScenario, NamespaceCreationScenario,
-    NamespaceFailoverScenario, NamespaceIdempotencyScenario, NamespaceRestartScenario,
-    NamespaceRoutingScenario, NamespaceTransactionScenario, NemesisScenario, NetworkFaultScenario,
-    ObjectScenario, PinDeletionScenario, PinProtectionScenario, PlacementScenario,
-    ProcessFaultScenario, ProviderFallbackScenario, RawBlockScenario, RepairScenario,
-    SoakQualificationScenario, SqliteBatchAtomicScenario, SqliteCompatibilityScenario,
-    SqliteDurabilityScenario, SqliteImportExportScenario, SqliteLargeTransactionScenario,
-    SqliteLeaderFailoverScenario, SqliteMinorityFencingScenario, SqliteMultiWriterScenario,
-    SqliteReadOnlyMultiIngressScenario, SqliteSoakScenario, StorageFaultScenario,
-    ThreeNodeBootstrapScenario, WanQualificationScenario,
+    GarbageCollectionScenario, IdentityFencingScenario, KafkaProduceDurabilityScenario,
+    KvmFirecrackerScenario, LearnerReplacementScenario, LinearizabilityScenario,
+    NamespaceCreationScenario, NamespaceFailoverScenario, NamespaceIdempotencyScenario,
+    NamespaceRestartScenario, NamespaceRoutingScenario, NamespaceTransactionScenario,
+    NemesisScenario, NetworkFaultScenario, ObjectScenario, PinDeletionScenario,
+    PinProtectionScenario, PlacementScenario, ProcessFaultScenario, ProviderFallbackScenario,
+    RawBlockScenario, RepairScenario, SoakQualificationScenario, SqliteBatchAtomicScenario,
+    SqliteCompatibilityScenario, SqliteDurabilityScenario, SqliteImportExportScenario,
+    SqliteLargeTransactionScenario, SqliteLeaderFailoverScenario, SqliteMinorityFencingScenario,
+    SqliteMultiWriterScenario, SqliteReadOnlyMultiIngressScenario, SqliteSoakScenario,
+    StorageFaultScenario, ThreeNodeBootstrapScenario, WanQualificationScenario,
 };
 use std::sync::Arc;
 
@@ -99,6 +99,7 @@ pub fn scenario_names() -> &'static [(&'static str, &'static str)] {
         ("SOAK-001", "fixed-kernel-growth-soak"),
         ("WAN-001", "tailscale-direct-wan"),
         ("KVM-001", "firecracker-rootfs-cancel"),
+        ("KAFKA-001", "kafka-produce-crash-durability"),
         ("SQLITE-001", "sqlite-import-export-format"),
         ("SQLITE-002", "sqlite-read-only-multi-ingress"),
         ("SQLITE-003", "sqlite-batch-atomic-commit"),
@@ -163,6 +164,9 @@ pub fn scenario_by_name(name: &str) -> Result<Arc<dyn Scenario>> {
         "SOAK-001" | "fixed-kernel-growth-soak" => Ok(Arc::new(SoakQualificationScenario)),
         "WAN-001" | "tailscale-direct-wan" => Ok(Arc::new(WanQualificationScenario)),
         "KVM-001" | "firecracker-rootfs-cancel" => Ok(Arc::new(KvmFirecrackerScenario)),
+        "KAFKA-001" | "kafka-produce-crash-durability" => {
+            Ok(Arc::new(KafkaProduceDurabilityScenario))
+        }
         "SQLITE-001" | "sqlite-import-export-format" => Ok(Arc::new(SqliteImportExportScenario)),
         "SQLITE-002" | "sqlite-read-only-multi-ingress" => {
             Ok(Arc::new(SqliteReadOnlyMultiIngressScenario))

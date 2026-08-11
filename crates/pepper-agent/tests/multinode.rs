@@ -3599,6 +3599,106 @@ async fn transactional_namespace_http_contract() -> TestResult<()> {
     Ok(())
 }
 
+// Regression: a SQLite database create on a three-voter cluster configured
+// with data replication factor 1 must publish successfully. The value blocks
+// (database config, snapshot) are placed at the configured data replication
+// factor, so the namespace durability barrier must require exactly that many
+// copies — not the voter count. Before the fix, non-S3 namespaces defaulted
+// their durability policy to the voter count (3) while placement stored one
+// copy, so the create failed the barrier with HTTP 503 "durability requirement
+// was not met". The existing whole-file test above runs at default_factor = 3
+// and therefore never exercised this path.
+#[tokio::test]
+async fn sqlite_create_publishes_durably_at_replication_factor_one() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let p2p1 = free_port()?;
+    let p2p2 = free_port()?;
+    let p2p3 = free_port()?;
+    let api1 = free_port()?;
+    let api2 = free_port()?;
+    let api3 = free_port()?;
+    let config1 = write_config(temp.path(), "rf1-sqlite1", p2p1, api1, &[])?;
+    let config2 = write_config(
+        temp.path(),
+        "rf1-sqlite2",
+        p2p2,
+        api2,
+        &[format!("127.0.0.1:{p2p1}")],
+    )?;
+    let config3 = write_config(
+        temp.path(),
+        "rf1-sqlite3",
+        p2p3,
+        api3,
+        &[format!("127.0.0.1:{p2p1}"), format!("127.0.0.1:{p2p2}")],
+    )?;
+    for config in [&config1, &config2, &config3] {
+        let contents = fs::read_to_string(config)?;
+        fs::write(
+            config,
+            format!(
+                "{}\n[sqlite]\nenabled = true\n",
+                contents
+                    .replace("default_factor = 2", "default_factor = 1")
+                    .replace(
+                        "consensus_enabled = true",
+                        "consensus_enabled = true\nheartbeat_interval_ms = 250\nelection_timeout_min_ms = 1500\nelection_timeout_max_ms = 3000",
+                    )
+            ),
+        )?;
+    }
+    let agent = env!("CARGO_BIN_EXE_pepper-agent");
+    for config in [&config1, &config2, &config3] {
+        run_init(agent, config)?;
+    }
+    let _one = spawn_agent(agent, &config1)?;
+    let _two = spawn_agent(agent, &config2)?;
+    let _three = spawn_agent(agent, &config3)?;
+    for port in [api1, api2, api3] {
+        wait_health(port).await?;
+    }
+    wait_for_peer_count(api1, 2).await?;
+    wait_for_peer_count(api2, 2).await?;
+    wait_for_peer_count(api3, 2).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let create = client
+        .post(format!("http://127.0.0.1:{api1}/v1/sqlite/databases"))
+        .json(&serde_json::json!({
+            "database": "rf1-db",
+            "request_id": "rf1-sqlite-create",
+            "page_size": 4096
+        }))
+        .send()
+        .await?;
+    if !create.status().is_success() {
+        return Err(format!(
+            "RF=1 SQLite create failed: {} {}",
+            create.status(),
+            create.text().await?
+        )
+        .into());
+    }
+
+    // The database must be readable back through a different ingress node,
+    // confirming the create actually committed durably rather than returning
+    // a degraded/unverified success.
+    let info = client
+        .get(format!(
+            "http://127.0.0.1:{api2}/v1/sqlite/databases/rf1-db"
+        ))
+        .send()
+        .await?;
+    assert!(
+        info.status().is_success(),
+        "RF=1 SQLite database not readable after create: {}",
+        info.status()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn sqlite_whole_file_multi_ingress_exactly_one_writer_commits() -> TestResult<()> {
     let temp = tempfile::tempdir()?;

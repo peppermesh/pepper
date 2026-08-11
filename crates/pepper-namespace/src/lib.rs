@@ -231,8 +231,18 @@ impl NamespaceLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyPrecondition {
+    /// The key must not exist (create-only semantics).
     Absent,
+    /// The key must be at exactly this generation and CID (compare-and-set).
     Match { generation: u64, cid: Cid },
+    /// No precondition — the mutation applies unconditionally (last-writer-wins).
+    /// This lets an unconditional write commit against a stale transaction base:
+    /// concurrent disjoint writers rebase onto the current root, and same-key
+    /// unconditional writers resolve by commit order, without a per-write
+    /// linearizable base read. Conditional writes still use `Absent`/`Match`,
+    /// which the state machine checks against the current per-key state at apply
+    /// time regardless of base staleness.
+    Any,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1172,6 +1182,7 @@ fn check_precondition(
         KeyPrecondition::Match { generation, cid } => {
             current.is_some_and(|current| current.generation == *generation && current.cid == *cid)
         }
+        KeyPrecondition::Any => true,
     };
     if matches {
         Ok(())
@@ -2086,6 +2097,228 @@ mod tests {
                 },
             },
         }
+    }
+
+    fn commit_generation(result: &ApplyResult, key: &str) -> Option<u64> {
+        let CommandResponse::Commit(commit) = &result.response else {
+            return None;
+        };
+        commit
+            .changed_keys
+            .iter()
+            .find(|changed| changed.key_hex == hex::encode(key))
+            .and_then(|changed| changed.generation)
+    }
+
+    // Consistency net for the S3 cached-base change (WRITE_PATH_OPTIMIZATION.md
+    // §5). These lock in the state machine's stale-base behavior that the change
+    // relies on: a transaction built against an older base still rebases onto
+    // the current root and enforces per-key preconditions against the CURRENT
+    // state, so a cached (non-linearizable) base at the ingress stays correct.
+
+    #[tokio::test]
+    async fn stale_base_disjoint_key_transactions_rebase_and_apply() {
+        let store = MemoryStore::default();
+        let created = create_namespace(
+            &store,
+            descriptor(),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut machine = NamespaceStateMachine::new(store, created.state).unwrap();
+        let stale = machine.state().clone();
+        // A concurrent writer commits key "alpha", advancing revision and root.
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r1",
+                "alpha",
+                "va",
+                KeyPrecondition::Absent,
+                10,
+            ))
+            .await
+            .unwrap();
+        // A writer still holding the STALE base commits a DISJOINT key "bravo".
+        let outcome = machine
+            .apply(put_command(
+                &stale,
+                "r2",
+                "bravo",
+                "vb",
+                KeyPrecondition::Absent,
+                11,
+            ))
+            .await
+            .expect("stale-base disjoint-key transaction must rebase and apply");
+        assert_eq!(commit_generation(&outcome, "bravo"), Some(1));
+        assert_eq!(
+            machine.state().current_revision,
+            2,
+            "both concurrent commits applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_base_absent_precondition_preserves_create_only() {
+        let store = MemoryStore::default();
+        let created = create_namespace(
+            &store,
+            descriptor(),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut machine = NamespaceStateMachine::new(store, created.state).unwrap();
+        let stale = machine.state().clone();
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r1",
+                "alpha",
+                "va",
+                KeyPrecondition::Absent,
+                10,
+            ))
+            .await
+            .unwrap();
+        // Create-only (If-None-Match) on the SAME key with a stale base must
+        // fail: the key now exists. Only one concurrent creator wins.
+        let result = machine
+            .apply(put_command(
+                &stale,
+                "r2",
+                "alpha",
+                "va2",
+                KeyPrecondition::Absent,
+                11,
+            ))
+            .await;
+        assert!(
+            matches!(result, Err(NamespaceError::GenerationConflict(_))),
+            "create-only must fail when the key was created concurrently"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_base_match_precondition_preserves_cas() {
+        let store = MemoryStore::default();
+        let created = create_namespace(
+            &store,
+            descriptor(),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut machine = NamespaceStateMachine::new(store, created.state).unwrap();
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r1",
+                "alpha",
+                "va",
+                KeyPrecondition::Absent,
+                10,
+            ))
+            .await
+            .unwrap();
+        let stale = machine.state().clone(); // "alpha" at generation 1
+        // Concurrent modification advances "alpha" to generation 2.
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r2",
+                "alpha",
+                "va2",
+                KeyPrecondition::Match {
+                    generation: 1,
+                    cid: Cid::new(CODEC_RAW, b"va"),
+                },
+                11,
+            ))
+            .await
+            .unwrap();
+        // A stale-base compare-and-set expecting generation 1 must fail.
+        let result = machine
+            .apply(put_command(
+                &stale,
+                "r3",
+                "alpha",
+                "va3",
+                KeyPrecondition::Match {
+                    generation: 1,
+                    cid: Cid::new(CODEC_RAW, b"va"),
+                },
+                12,
+            ))
+            .await;
+        assert!(
+            matches!(result, Err(NamespaceError::GenerationConflict(_))),
+            "compare-and-set must fail after concurrent modification"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_base_any_precondition_is_last_writer_wins() {
+        let store = MemoryStore::default();
+        let created = create_namespace(
+            &store,
+            descriptor(),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut machine = NamespaceStateMachine::new(store, created.state).unwrap();
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r1",
+                "alpha",
+                "va",
+                KeyPrecondition::Absent,
+                10,
+            ))
+            .await
+            .unwrap();
+        let stale = machine.state().clone(); // "alpha" at generation 1
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r2",
+                "alpha",
+                "va2",
+                KeyPrecondition::Match {
+                    generation: 1,
+                    cid: Cid::new(CODEC_RAW, b"va"),
+                },
+                11,
+            ))
+            .await
+            .unwrap();
+        // An unconditional (Any) write with a stale base must apply regardless of
+        // the concurrent modification, and the generation increments from the
+        // CURRENT state (2 -> 3), not the stale base.
+        let outcome = machine
+            .apply(put_command(
+                &stale,
+                "r3",
+                "alpha",
+                "va3",
+                KeyPrecondition::Any,
+                12,
+            ))
+            .await
+            .expect("unconditional write must apply regardless of concurrent modification");
+        assert_eq!(
+            commit_generation(&outcome, "alpha"),
+            Some(3),
+            "generation increments from current, not the stale base"
+        );
     }
 
     #[tokio::test]

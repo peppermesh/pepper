@@ -51,6 +51,7 @@
         "address": { "type": "string", "minLength": 1, "maxLength": 256 },
         "p2p_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "api_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "kafka_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "failure_domain": { "type": "string", "minLength": 1, "maxLength": 256 },
         "placement_labels": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 256 } },
         "bootstrap_nodes": { "type": "array", "items": { "type": "string", "maxLength": 128 }, "uniqueItems": true },

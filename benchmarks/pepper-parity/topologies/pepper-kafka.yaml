@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Compose overlay for the Pepper-with-Kafka topology. Merge it with the S3
+# benchmark compose so the three single-profile Pepper nodes (whose generated
+# configs get Kafka listeners from prepare-pepper-kafka.sh) share their
+# isolated network with a pinned Apache Kafka tools container:
+#
+#   docker compose \
+#     -f benchmarks/pepper-s3-throughput/compose.yaml \
+#     -f benchmarks/pepper-parity/topologies/pepper-kafka.yaml \
+#     --profile single up -d --wait
+#
+# The tools container pins the same image digest as the external Kafka
+# comparator topology (benchmarks/pepper-phase0/kafka/compose.yaml) so both
+# sides of the parity comparison run the identical client stack.
+
+services:
+  kafka-client:
+    image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    profiles: ["single"]
+    container_name: pepper-parity-kafka-client
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
+    stop_grace_period: 1s
+    networks:
+      benchmark:

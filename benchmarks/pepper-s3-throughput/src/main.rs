@@ -26,6 +26,9 @@ enum Command {
     Loadgen(loadgen::LoadgenArgs),
     /// Run or resume the Docker benchmark matrix.
     RunMatrix(matrix::MatrixArgs),
+    /// Prepare the benchmark root and generated node configs without
+    /// running the matrix (topology bootstrap for external orchestrators).
+    PrepareTopology(matrix::PrepareTopologyArgs),
     /// Flatten completed cell artifacts into CSV.
     Summarize(summarize::SummarizeArgs),
 }
@@ -37,6 +40,7 @@ async fn main() -> Result<()> {
         Command::SummarizeCacheFill(args) => cache_fill::summarize(args),
         Command::Loadgen(args) => loadgen::run(args).await,
         Command::RunMatrix(args) => matrix::run(args).await,
+        Command::PrepareTopology(args) => matrix::prepare_topology(args),
         Command::Summarize(args) => summarize::run(args),
     }
 }
