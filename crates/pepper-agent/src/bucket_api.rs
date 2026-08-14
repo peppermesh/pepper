@@ -136,18 +136,17 @@ async fn cached_namespace_base(
     state: &AppState,
     namespace_id: &NamespaceId,
 ) -> Result<NamespaceState, ApiError> {
-    if let Some(cached) = state.namespace_head_cache.lock().await.get(namespace_id) {
+    if let Some((cached, _)) = state.namespace_head_cache.lock().await.get(namespace_id) {
         return Ok(cached.clone());
     }
     let base = namespace_manager(state)?
         .linearizable_namespace_state(namespace_id)
         .await
         .map_err(consensus_error)?;
-    state
-        .namespace_head_cache
-        .lock()
-        .await
-        .insert(namespace_id.clone(), base.clone());
+    state.namespace_head_cache.lock().await.insert(
+        namespace_id.clone(),
+        (base.clone(), std::time::Instant::now()),
+    );
     Ok(base)
 }
 
@@ -169,11 +168,15 @@ async fn refresh_cached_namespace_head(
         return;
     };
     let mut cache = state.namespace_head_cache.lock().await;
-    if let Some(cached) = cache.get_mut(namespace_id)
-        && revision > cached.current_revision
-    {
-        cached.current_revision = revision;
-        cached.current_root_cid = root;
+    if let Some((cached, refreshed)) = cache.get_mut(namespace_id) {
+        if revision > cached.current_revision {
+            cached.current_revision = revision;
+            cached.current_root_cid = root;
+        }
+        // The commit proves this entry reflects the namespace as of now, so
+        // the read fast path's staleness clock restarts even when the
+        // revision itself did not advance past the cached one.
+        *refreshed = std::time::Instant::now();
     }
 }
 
@@ -189,6 +192,12 @@ pub(super) async fn bucket_put(
     let namespace_id = parse_namespace(&state, &request.bucket)?;
     let key =
         hex::decode(&request.key_hex).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    // X2 leadership affinity: the gateway serving this bucket's writes should
+    // lead the partition's Raft group so the commit is local instead of a
+    // forwarded hop. Rate-limited inside the manager; no-op when already led.
+    if let Ok(manager) = namespace_manager(&state) {
+        manager.nudge_local_leadership(&namespace_id).await;
+    }
     let base = cached_namespace_base(&state, &namespace_id).await?;
     let namespace_store = super::s3_api::direct_namespace_store(&state, &base).await;
     let current = pepper_merkle::get(

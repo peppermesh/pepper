@@ -14,7 +14,7 @@ use pepper_consensus::{
 use pepper_dag::{BlockResolver, DagCodecRegistry, TraversalLimits, traverse};
 use pepper_metadata::{
     MetadataStore, NAMESPACE_DURABILITY_RECEIPTS, NAMESPACE_PUBLICATION_INTENTS,
-    NAMESPACE_READ_LEASES, NAMESPACE_STAGING_LEASES,
+    NAMESPACE_PUBLICATION_INTENTS_HISTORY, NAMESPACE_READ_LEASES, NAMESPACE_STAGING_LEASES,
 };
 use pepper_namespace::{
     ApplyResult, CommandEnvelope, NamespaceCommand, NamespaceId, NamespaceMutation, PinAction,
@@ -37,6 +37,79 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+
+/// X0 publish-stage instrumentation (WRITE_PATH_OPTIMIZATION.md §5 "S3 audit").
+/// `namespace_commit_latency` measured ~1 s/op while every existing phase
+/// timer summed to ~80 ms; these per-stage wall clocks make the commit engine's
+/// workflow explain the difference. Order matches the engine's execution.
+pub const PUBLISH_STAGES: [&str; 7] = [
+    "prepare",
+    "stage",
+    "durability",
+    "propose",
+    "lookup",
+    "finalize",
+    "reconcile",
+];
+static PUBLISH_STAGE_MICROS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static PUBLISH_STAGE_OBSERVATIONS: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Records the enclosing publish stage's wall time on drop, so early returns
+/// and `?` propagation are counted exactly like successful completions.
+struct PublishStageTimer {
+    stage: usize,
+    started: Instant,
+}
+
+impl PublishStageTimer {
+    fn start(stage: usize) -> Self {
+        Self {
+            stage,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for PublishStageTimer {
+    fn drop(&mut self) {
+        PUBLISH_STAGE_MICROS[self.stage].fetch_add(
+            self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        PUBLISH_STAGE_OBSERVATIONS[self.stage].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Cumulative (stage name, total microseconds, observations) for /metrics.
+pub fn publish_stage_stats() -> Vec<(&'static str, u64, u64)> {
+    PUBLISH_STAGES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                *name,
+                PUBLISH_STAGE_MICROS[index].load(Ordering::Relaxed),
+                PUBLISH_STAGE_OBSERVATIONS[index].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
 
 static DURABILITY_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static DURABILITY_MICROS: AtomicU64 = AtomicU64::new(0);
@@ -366,6 +439,58 @@ pub trait ProtectionBackend: Send + Sync + 'static {
         }
         Ok(())
     }
+
+    /// Build the signed pin records that `protect_many` would persist for
+    /// these roots, without writing them. Backends that support preparation
+    /// let the caller fold the pin writes into another transaction (staging
+    /// leases ride the same fsync); the `None` default keeps other backends
+    /// on the two-step path.
+    fn prepare_protect_pins(
+        &self,
+        _namespace_id: &NamespaceId,
+        _cids: &[Cid],
+        _reason: &str,
+        _expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Option<Vec<pepper_types::PinRecord>>, PublicationError> {
+        Ok(None)
+    }
+
+    /// Release every (root, reason) pair in one backend operation. The
+    /// default falls back to per-reason releases; transactional backends
+    /// override it to retire all covered pins with a single write.
+    async fn release_many_grouped(
+        &self,
+        namespace_id: &NamespaceId,
+        cids: &[Cid],
+        reasons: &[&str],
+    ) -> Result<(), PublicationError> {
+        for reason in reasons {
+            self.release_many(namespace_id, cids, reason).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply a batch of reconciliation intents. The default is the per-intent
+    /// path; backends with transactional stores override this to persist the
+    /// whole batch with one write transaction instead of one per pin.
+    async fn apply_pin_intents(
+        &self,
+        intents: &[PublicationIntentRecord],
+    ) -> Result<(), PublicationError> {
+        for intent in intents {
+            match intent.action {
+                PinAction::Protect => {
+                    self.protect(&intent.namespace_id, &intent.cid, &intent.reason, None)
+                        .await?;
+                }
+                PinAction::Release => {
+                    self.release(&intent.namespace_id, &intent.cid, &intent.reason)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -373,6 +498,13 @@ pub struct PublicationRepository {
     metadata: Arc<MetadataStore>,
     limits: PublicationLimits,
     reconciliation_lock: Arc<AsyncMutex<()>>,
+    /// Recent durability receipts by CID. A receipt is only usable for an
+    /// hour (`durable_receipt` filters on `verified_at`), so this is a
+    /// recency cache, not authority: the persisted table survives restarts,
+    /// misses fall back to re-verifying durability, and the previous
+    /// implementation's full-table scan per checked CID — O(every receipt
+    /// ever recorded) on each publication — is gone.
+    recent_receipts: Arc<std::sync::Mutex<HashMap<String, StoredDurabilityReceipt>>>,
 }
 
 impl PublicationRepository {
@@ -380,11 +512,97 @@ impl PublicationRepository {
         metadata: Arc<MetadataStore>,
         limits: PublicationLimits,
     ) -> Result<Self, PublicationError> {
-        Ok(Self {
+        let repository = Self {
             metadata,
             limits: limits.validate()?,
             reconciliation_lock: Arc::new(AsyncMutex::new(())),
-        })
+            recent_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        // One-time boot migration for stores written before the live/history
+        // intent split and terminal-lease cleanup: both keep per-commit scans
+        // O(outstanding work) instead of O(history).
+        repository.migrate_terminal_intents()?;
+        repository.purge_terminal_staging_leases()?;
+        repository.purge_stale_durability_receipts(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or(0),
+        )?;
+        Ok(repository)
+    }
+
+    /// Runtime entry point for receipt hygiene (see
+    /// `purge_stale_durability_receipts`).
+    pub fn purge_stale_durability_receipts_now(&self) -> Result<usize, PublicationError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        self.purge_stale_durability_receipts(now)
+    }
+
+    /// Receipts older than the reuse window can never satisfy
+    /// `durable_receipt` again; dropping them keeps the table bounded by
+    /// recent activity instead of growing forever. Runs at boot and on the
+    /// reconciler's hygiene cadence.
+    fn purge_stale_durability_receipts(&self, now: i64) -> Result<usize, PublicationError> {
+        let stale: Vec<String> =
+            read_all::<StoredDurabilityReceipt>(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS)?
+                .into_iter()
+                .filter(|record| record.verified_at_unix_seconds < now.saturating_sub(60 * 60))
+                .map(|record| {
+                    format!(
+                        "{}|{}|{}",
+                        record.namespace_id, record.request_id, record.receipt.cid
+                    )
+                })
+                .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(storage_error)?;
+        {
+            let mut table = write
+                .open_table(NAMESPACE_DURABILITY_RECEIPTS)
+                .map_err(storage_error)?;
+            for key in &stale {
+                table.remove(key.as_str()).map_err(storage_error)?;
+            }
+        }
+        write.commit().map_err(storage_error)?;
+        Ok(stale.len())
+    }
+
+    fn purge_terminal_staging_leases(&self) -> Result<usize, PublicationError> {
+        let terminal: Vec<String> =
+            read_all::<StagingLease>(&self.metadata, NAMESPACE_STAGING_LEASES)?
+                .into_iter()
+                .filter(|lease| lease.status != "active")
+                .map(|lease| lease.lease_id)
+                .collect();
+        if terminal.is_empty() {
+            return Ok(0);
+        }
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(storage_error)?;
+        {
+            let mut table = write
+                .open_table(NAMESPACE_STAGING_LEASES)
+                .map_err(storage_error)?;
+            for lease_id in &terminal {
+                table.remove(lease_id.as_str()).map_err(storage_error)?;
+            }
+        }
+        write.commit().map_err(storage_error)?;
+        Ok(terminal.len())
     }
 
     pub fn put_staging(&self, lease: &StagingLease) -> Result<(), PublicationError> {
@@ -404,6 +622,35 @@ impl PublicationRepository {
             &lease.lease_id,
             lease,
         )
+    }
+
+    /// Persist a staging lease and its prepared protection pins in one
+    /// transaction (one fsync instead of two), enforcing the same admission
+    /// limits as `put_staging`.
+    pub fn put_staging_with_pins(
+        &self,
+        lease: &StagingLease,
+        pins: &[pepper_types::PinRecord],
+    ) -> Result<(), PublicationError> {
+        if lease.roots.len() > self.limits.max_staging_roots
+            || lease.staged_bytes > self.limits.max_staging_bytes
+            || lease.expires_at_unix_seconds <= lease.created_at_unix_seconds
+            || lease.expires_at_unix_seconds - lease.created_at_unix_seconds
+                > self.limits.max_staging_ttl_seconds
+            || self.active_staging(lease.created_at_unix_seconds)?.len()
+                >= self.limits.max_staging_leases
+        {
+            return Err(PublicationError::StagingUnavailable);
+        }
+        let bytes = serde_json::to_vec(lease).map_err(storage_error)?;
+        self.metadata
+            .pins()
+            .put_record_with_pins(NAMESPACE_STAGING_LEASES, &lease.lease_id, &bytes, pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
+    }
+
+    pub fn remove_staging(&self, lease_id: &str) -> Result<(), PublicationError> {
+        delete_record(&self.metadata, NAMESPACE_STAGING_LEASES, lease_id)
     }
 
     pub fn update_staging(&self, lease: &StagingLease) -> Result<(), PublicationError> {
@@ -493,11 +740,18 @@ impl PublicationRepository {
     pub fn all_intents(&self) -> Result<Vec<PublicationIntentRecord>, PublicationError> {
         let mut intents =
             read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?;
+        intents.extend(read_all::<PublicationIntentRecord>(
+            &self.metadata,
+            NAMESPACE_PUBLICATION_INTENTS_HISTORY,
+        )?);
         intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
         Ok(intents)
     }
 
     pub fn pending_intents(&self) -> Result<Vec<PublicationIntentRecord>, PublicationError> {
+        // Terminal intents move to the history table, so this per-commit scan
+        // is O(pending). The status filter stays as a belt-and-braces guard
+        // for records written before the split (migrated lazily below).
         Ok(
             read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?
                 .into_iter()
@@ -506,32 +760,123 @@ impl PublicationRepository {
         )
     }
 
+    /// One-time migration: move terminal intents written before the
+    /// live/history split out of the live table so per-commit scans only see
+    /// pending work. Batched into large single transactions — stores that
+    /// accumulated millions of terminal intents must not pay one fsync per
+    /// record at boot. Idempotent: each chunk moves records atomically, and a
+    /// crash between chunks just leaves later chunks for the next boot.
+    pub fn migrate_terminal_intents(&self) -> Result<usize, PublicationError> {
+        const CHUNK: usize = 50_000;
+        let mut moved = 0usize;
+        loop {
+            let terminal: Vec<PublicationIntentRecord> =
+                read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?
+                    .into_iter()
+                    .filter(|intent| intent.status != "pending")
+                    .take(CHUNK)
+                    .collect();
+            if terminal.is_empty() {
+                return Ok(moved);
+            }
+            let write = self
+                .metadata
+                .database()
+                .begin_write()
+                .map_err(storage_error)?;
+            {
+                let mut history = write
+                    .open_table(NAMESPACE_PUBLICATION_INTENTS_HISTORY)
+                    .map_err(storage_error)?;
+                let mut live = write
+                    .open_table(NAMESPACE_PUBLICATION_INTENTS)
+                    .map_err(storage_error)?;
+                for intent in &terminal {
+                    let bytes = serde_json::to_vec(intent).map_err(storage_error)?;
+                    history
+                        .insert(intent.intent_id.as_str(), bytes.as_slice())
+                        .map_err(storage_error)?;
+                    live.remove(intent.intent_id.as_str())
+                        .map_err(storage_error)?;
+                }
+            }
+            write.commit().map_err(storage_error)?;
+            moved += terminal.len();
+        }
+    }
+
+    fn retire_intent(
+        &self,
+        intent: &PublicationIntentRecord,
+        status: &str,
+    ) -> Result<(), PublicationError> {
+        let mut terminal = intent.clone();
+        terminal.status = status.to_string();
+        // History first, then remove from the live table. A crash in between
+        // leaves the original (still pending) live record alongside the
+        // history copy: reconciliation re-applies it once — protect and
+        // release are idempotent — and then retires it again.
+        write_record(
+            &self.metadata,
+            NAMESPACE_PUBLICATION_INTENTS_HISTORY,
+            &terminal.intent_id,
+            &terminal,
+        )?;
+        delete_record(
+            &self.metadata,
+            NAMESPACE_PUBLICATION_INTENTS,
+            &terminal.intent_id,
+        )
+    }
+
+    /// Retire a whole batch of intents (history write + live delete) in one
+    /// transaction.
+    pub fn retire_intents(
+        &self,
+        intents: &[PublicationIntentRecord],
+        status: &str,
+    ) -> Result<(), PublicationError> {
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(storage_error)?;
+        {
+            let mut history = write
+                .open_table(NAMESPACE_PUBLICATION_INTENTS_HISTORY)
+                .map_err(storage_error)?;
+            let mut live = write
+                .open_table(NAMESPACE_PUBLICATION_INTENTS)
+                .map_err(storage_error)?;
+            for intent in intents {
+                let mut terminal = intent.clone();
+                terminal.status = status.to_string();
+                let bytes = serde_json::to_vec(&terminal).map_err(storage_error)?;
+                history
+                    .insert(terminal.intent_id.as_str(), bytes.as_slice())
+                    .map_err(storage_error)?;
+                live.remove(terminal.intent_id.as_str())
+                    .map_err(storage_error)?;
+            }
+        }
+        write.commit().map_err(storage_error)
+    }
+
     pub fn mark_intent_resolved(
         &self,
         intent: &PublicationIntentRecord,
     ) -> Result<(), PublicationError> {
-        let mut resolved = intent.clone();
-        resolved.status = "resolved".to_string();
-        write_record(
-            &self.metadata,
-            NAMESPACE_PUBLICATION_INTENTS,
-            &resolved.intent_id,
-            &resolved,
-        )
+        self.retire_intent(intent, "resolved")
     }
 
     pub fn mark_intent_applied(
         &self,
         intent: &PublicationIntentRecord,
     ) -> Result<(), PublicationError> {
-        let mut applied = intent.clone();
-        applied.status = "applied".to_string();
-        write_record(
-            &self.metadata,
-            NAMESPACE_PUBLICATION_INTENTS,
-            &applied.intent_id,
-            &applied,
-        )
+        self.retire_intent(intent, "applied")
     }
 
     pub fn durable_receipt(
@@ -541,21 +886,47 @@ impl PublicationRepository {
         required: usize,
         now: i64,
     ) -> Result<Option<DurabilityReceipt>, PublicationError> {
-        Ok(
-            read_all::<StoredDurabilityReceipt>(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS)?
-                .into_iter()
-                .filter(|record| {
-                    &record.receipt.cid == cid
-                        && placement.is_none_or(|expected| {
-                            record.receipt.placement.as_ref() == Some(expected)
-                        })
-                        && record.receipt.replicas_accepted >= required
-                        && record.receipt.status == "durable"
-                        && record.verified_at_unix_seconds >= now.saturating_sub(60 * 60)
-                })
-                .max_by_key(|record| record.verified_at_unix_seconds)
-                .map(|record| record.receipt),
-        )
+        let matches = |record: &StoredDurabilityReceipt| {
+            record.receipt.cid == *cid
+                && placement
+                    .is_none_or(|expected| record.receipt.placement.as_ref() == Some(expected))
+                && record.receipt.replicas_accepted >= required
+                && record.receipt.status == "durable"
+                && record.verified_at_unix_seconds >= now.saturating_sub(60 * 60)
+        };
+        {
+            let recent = self
+                .recent_receipts
+                .lock()
+                .expect("receipt cache lock poisoned");
+            if !recent.is_empty() {
+                return Ok(recent
+                    .values()
+                    .filter(|record| matches(record))
+                    .max_by_key(|record| record.verified_at_unix_seconds)
+                    .map(|record| record.receipt.clone()));
+            }
+        }
+        // Cold cache (first lookup after boot): hydrate once from the
+        // persisted table, then serve from memory.
+        let records =
+            read_all::<StoredDurabilityReceipt>(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS)?;
+        let mut recent = self
+            .recent_receipts
+            .lock()
+            .expect("receipt cache lock poisoned");
+        for record in records {
+            let key = format!(
+                "{}|{}|{}",
+                record.namespace_id, record.request_id, record.receipt.cid
+            );
+            recent.insert(key, record);
+        }
+        Ok(recent
+            .values()
+            .filter(|record| matches(record))
+            .max_by_key(|record| record.verified_at_unix_seconds)
+            .map(|record| record.receipt.clone()))
     }
 
     pub fn put_durability(&self, record: &StoredDurabilityReceipt) -> Result<(), PublicationError> {
@@ -592,7 +963,28 @@ impl PublicationRepository {
                     .map_err(storage_error)?;
             }
         }
-        write.commit().map_err(storage_error)
+        write.commit().map_err(storage_error)?;
+        let mut recent = self
+            .recent_receipts
+            .lock()
+            .expect("receipt cache lock poisoned");
+        for record in records {
+            let key = format!(
+                "{}|{}|{}",
+                record.namespace_id, record.request_id, record.receipt.cid
+            );
+            recent.insert(key, record.clone());
+        }
+        // Opportunistically shed entries past the reuse window so the cache
+        // tracks recent activity rather than the store's full history.
+        let horizon = records
+            .iter()
+            .map(|record| record.verified_at_unix_seconds)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(60 * 60);
+        recent.retain(|_, record| record.verified_at_unix_seconds >= horizon);
+        Ok(())
     }
 
     pub fn protected_roots(&self, now: i64) -> Result<HashSet<Cid>, PublicationError> {
@@ -605,8 +997,17 @@ impl PublicationRepository {
                 .into_iter()
                 .map(|lease| lease.root_cid),
         );
+        // Union of the live (pending) and history (applied) tables: the GC
+        // barrier set is exactly what it was before terminal intents moved to
+        // the history table.
+        let mut intents =
+            read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?;
+        intents.extend(read_all::<PublicationIntentRecord>(
+            &self.metadata,
+            NAMESPACE_PUBLICATION_INTENTS_HISTORY,
+        )?);
         roots.extend(
-            read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?
+            intents
                 .into_iter()
                 .filter(|intent| {
                     intent.action == PinAction::Protect
@@ -1120,21 +1521,22 @@ where
     async fn release_staging(&self, lease: &mut StagingLease) -> Result<(), PublicationError> {
         self.fault(PublicationFaultPoint::StagingRelease)?;
         lease.status = "released".to_string();
-        self.repository.update_staging(lease)?;
+        // One transaction retires both protection reasons; a second removes
+        // the lease record (kept last so a crash mid-release leaves the lease
+        // visible and the expiry sweep re-runs the idempotent releases). The
+        // previous flow spent four fsynced transactions here, including a
+        // status update on a record deleted one call later.
         self.protection
-            .release_many(
+            .release_many_grouped(
                 &lease.namespace_id,
                 &lease.roots,
-                &format!("namespace-staging:{}", lease.lease_id),
+                &[
+                    &format!("namespace-staging:{}", lease.lease_id),
+                    &format!("namespace-candidate:{}", lease.lease_id),
+                ],
             )
             .await?;
-        self.protection
-            .release_many(
-                &lease.namespace_id,
-                &lease.roots,
-                &format!("namespace-candidate:{}", lease.lease_id),
-            )
-            .await?;
+        self.repository.remove_staging(&lease.lease_id)?;
         Ok(())
     }
 
@@ -1187,6 +1589,7 @@ where
         &self,
         input: &NamespaceCommitRequest,
     ) -> Result<PreparedNamespacePublication, PublicationError> {
+        let _stage = PublishStageTimer::start(0);
         let request = &input.request;
         let lease_id = format!("{}:{}", request.namespace_id, request.command.request_id);
         let expires = input
@@ -1240,7 +1643,23 @@ where
         input: &NamespaceCommitRequest,
         prepared: &mut PreparedNamespacePublication,
     ) -> Result<(), PublicationError> {
+        let _stage = PublishStageTimer::start(1);
         let lease = &prepared.lease;
+        let reason = format!("namespace-staging:{}", lease.lease_id);
+        if let Some(pins) = self.coordinator.protection.prepare_protect_pins(
+            &input.request.namespace_id,
+            &lease.roots,
+            &reason,
+            Some(lease.expires_at_unix_seconds),
+        )? {
+            // Lease and pins become durable in one transaction.
+            self.coordinator
+                .repository
+                .put_staging_with_pins(lease, &pins)?;
+            self.coordinator
+                .fault(PublicationFaultPoint::StagingLease)?;
+            return Ok(());
+        }
         self.coordinator.repository.put_staging(lease)?;
         self.coordinator
             .fault(PublicationFaultPoint::StagingLease)?;
@@ -1249,7 +1668,7 @@ where
             .protect_many(
                 &input.request.namespace_id,
                 &lease.roots,
-                &format!("namespace-staging:{}", lease.lease_id),
+                &reason,
                 Some(lease.expires_at_unix_seconds),
             )
             .await
@@ -1261,6 +1680,7 @@ where
         prepared: &mut PreparedNamespacePublication,
         disposition: CommitDisposition,
     ) -> Result<(), PublicationError> {
+        let _stage = PublishStageTimer::start(5);
         if disposition != CommitDisposition::Committed && input.request.retain_uploaded_on_conflict
         {
             self.coordinator
@@ -1288,6 +1708,7 @@ where
         input: &NamespaceCommitRequest,
         prepared: &mut PreparedNamespacePublication,
     ) -> Result<Vec<DurabilityReceipt>, PublicationError> {
+        let _stage = PublishStageTimer::start(2);
         self.coordinator
             .establish_durability(&input.request, &mut prepared.lease, input.now)
             .await
@@ -1307,6 +1728,7 @@ where
         _evidence: &Vec<DurabilityReceipt>,
         guard: &PublicationGuard,
     ) -> ProposalAttempt<Result<ConsensusResponse, PublicationError>, PublicationError> {
+        let _stage = PublishStageTimer::start(3);
         self.coordinator
             .propose_durable(&input.request, guard)
             .await
@@ -1331,6 +1753,7 @@ where
         input: &NamespaceCommitRequest,
         _prepared: &PreparedNamespacePublication,
     ) -> Result<Option<ApplyResult>, PublicationError> {
+        let _stage = PublishStageTimer::start(4);
         let state = self
             .coordinator
             .manager
@@ -1356,6 +1779,7 @@ where
         _evidence: &Vec<DurabilityReceipt>,
         _result: &ApplyResult,
     ) -> Result<(), PublicationError> {
+        let _stage = PublishStageTimer::start(6);
         // Permanent distributed protection must be visible before temporary
         // staging pins are withdrawn.
         self.coordinator.reconcile_pin_intents().await.map(|_| ())
@@ -1396,6 +1820,7 @@ pub async fn expire_staging_leases<P: ProtectionBackend + ?Sized>(
         }
         lease.status = "expired".to_string();
         repository.update_staging(&lease)?;
+        let expired_lease_id = lease.lease_id.clone();
         for root in &lease.roots {
             if !committed.contains(root) {
                 protection
@@ -1414,6 +1839,7 @@ pub async fn expire_staging_leases<P: ProtectionBackend + ?Sized>(
                     .await?;
             }
         }
+        repository.remove_staging(&expired_lease_id)?;
         expired += 1;
     }
     Ok(expired)
@@ -1428,24 +1854,16 @@ pub async fn reconcile_pin_intents<P: ProtectionBackend + ?Sized>(
     // apply the same pending set, multiplying protection work quadratically.
     let _guard = repository.reconciliation_lock.lock().await;
     let intents = repository.pending_intents()?;
-    let mut applied = 0;
-    for intent in intents {
-        match intent.action {
-            PinAction::Protect => {
-                protection
-                    .protect(&intent.namespace_id, &intent.cid, &intent.reason, None)
-                    .await?;
-            }
-            PinAction::Release => {
-                protection
-                    .release(&intent.namespace_id, &intent.cid, &intent.reason)
-                    .await?;
-            }
-        }
-        repository.mark_intent_applied(&intent)?;
-        applied += 1;
+    if intents.is_empty() {
+        return Ok(0);
     }
-    Ok(applied)
+    // Apply the whole pending set through the backend's batched path, then
+    // retire every intent in one transaction. The previous per-intent flow
+    // paid three-plus fsynced metadata transactions per intent, which
+    // dominated commit latency once protection stopped being scan-bound.
+    protection.apply_pin_intents(&intents).await?;
+    repository.retire_intents(&intents, "applied")?;
+    Ok(intents.len())
 }
 
 fn command_value_cids(command: &CommandEnvelope) -> Vec<Cid> {
@@ -1539,7 +1957,13 @@ fn read_all<T: for<'de> Deserialize<'de>>(
     definition: TableDefinition<&str, &[u8]>,
 ) -> Result<Vec<T>, PublicationError> {
     let read = metadata.database().begin_read().map_err(storage_error)?;
-    let table = read.open_table(definition).map_err(storage_error)?;
+    // A table that was never written (e.g. the intents history table before
+    // the first terminal intent) is an empty result, not an error.
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(source) => return Err(storage_error(source)),
+    };
     table
         .iter()
         .map_err(storage_error)?

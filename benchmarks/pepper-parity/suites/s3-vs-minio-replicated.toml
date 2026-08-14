@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# S3 parity: Pepper vs MinIO at the replicated durable profile.
+#
+# Both sides run three nodes on the same filesystem and must tolerate the
+# permanent loss of any one node after acknowledgment:
+# - Pepper: RF=3 payload replication + three-voter namespace consensus;
+# - MinIO: distributed mode, 3 nodes x 2 drives, EC:2 (survives two drives =
+#   one node), MINIO_DRIVE_SYNC=on.
+#
+# The audit is stronger than the single-node suite's restart-readback: the
+# object pool is ingested through node 1, node 1 is SIGKILLed, and every
+# acknowledged object must read back through node 2 WHILE node 1 is down —
+# the cross-gateway read-after-write + node-loss guarantee both systems claim
+# at this profile. A full-topology restart readback follows.
+#
+# Prerequisites: same as s3-vs-minio.toml, except prepare-topology runs with
+# --replication-factor 3 and a dedicated bench root should be used so RF=1
+# state from the single-node suite is never mixed in.
+
+version = 1
+api = "s3"
+title = "S3 parity: Pepper vs MinIO, replicated durable (3 nodes, one-node fault tolerance)"
+
+[[profiles]]
+name = "s3-replicated-durable"
+fault_tolerance = "one node, durable and replicated at acknowledgment"
+
+[profiles.claims]
+durability = "synced to media and replicated across nodes before acknowledgment"
+consistency = "cross-gateway read-after-write"
+replication = "Pepper RF=3 full copies; MinIO EC:2 erasure across 3 nodes x 2 drives"
+
+[[targets]]
+name = "pepper"
+role = "subject"
+profile = "s3-replicated-durable"
+endpoint = "http://127.0.0.1:29080"
+parser = "s3-loadgen-json"
+
+[targets.lifecycle]
+prepare = [
+    [
+        "bash", "-c",
+        "cargo run --release -p pepper-s3-throughput -- prepare-topology --root \"$PEPPER_BENCH_ROOT\" --replication-factor 3",
+    ],
+]
+up = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "--profile", "single",
+    "up", "-d", "--wait",
+]
+down = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+    "--profile", "single",
+    "down", "-v",
+]
+ready_url = "http://127.0.0.1:29080/readyz"
+
+# Node-loss audit: ingest an acknowledged pool through node 1, SIGKILL node 1,
+# and read every object back through node 2 while node 1 is down (leadership
+# failover is allowed settle time; the read itself runs with zero retries).
+# Then restore the full topology and read back again through node 1.
+[targets.audit]
+steps = [
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--prepare", "--prepare-only", "--endpoints", "http://127.0.0.1:29080",
+        "--quiet",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "--profile", "single", "kill", "single",
+    ],
+    ["bash", "-c", "sleep 12"],
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--duration", "5", "--allow-short", "--retries", "0",
+        "--fail-on-errors", "--endpoints", "http://127.0.0.1:29081",
+        "--quiet",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-s3-throughput/compose.yaml",
+        "--profile", "single", "up", "-d", "--wait",
+    ],
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--duration", "5", "--allow-short", "--retries", "0",
+        "--fail-on-errors", "--endpoints", "http://127.0.0.1:29080",
+        "--quiet",
+    ],
+]
+
+[targets.measure]
+command = [
+    "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+    "loadgen",
+    "--backend", "s3",
+    "--operation", "{operation}",
+    "--size", "{payload_size_bytes}",
+    "--concurrency", "{concurrency}",
+    "--duration", "{duration_seconds}",
+    "--object-count", "256",
+    "--prepare",
+    "--endpoints", "{endpoint}",
+    "--quiet",
+    "--output", "{output}",
+]
+
+[[targets]]
+name = "minio"
+role = "competitor"
+profile = "s3-replicated-durable"
+endpoint = "http://127.0.0.1:29090"
+parser = "s3-loadgen-json"
+
+[targets.lifecycle]
+up = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-parity/topologies/minio-distributed.yaml",
+    "up", "-d", "--wait",
+]
+down = [
+    "docker", "compose",
+    "-f", "benchmarks/pepper-parity/topologies/minio-distributed.yaml",
+    "down", "-v",
+]
+ready_url = "http://127.0.0.1:29090/minio/health/ready"
+
+# Same node-loss audit shape: pool through minio1, SIGKILL minio1, read back
+# through minio2 on the surviving 4-of-6 drives, then restore and re-read.
+[targets.audit]
+steps = [
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--prepare", "--prepare-only", "--endpoints", "http://127.0.0.1:29090",
+        "--quiet",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-parity/topologies/minio-distributed.yaml",
+        "kill", "minio1",
+    ],
+    ["bash", "-c", "sleep 12"],
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--duration", "5", "--allow-short", "--retries", "0",
+        "--fail-on-errors", "--endpoints", "http://127.0.0.1:29091",
+        "--quiet",
+    ],
+    [
+        "docker", "compose",
+        "-f", "benchmarks/pepper-parity/topologies/minio-distributed.yaml",
+        "up", "-d", "--wait",
+    ],
+    [
+        "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+        "loadgen", "--backend", "s3", "--operation", "get",
+        "--size", "1048576", "--concurrency", "8", "--object-count", "64",
+        "--duration", "5", "--allow-short", "--retries", "0",
+        "--fail-on-errors", "--endpoints", "http://127.0.0.1:29090",
+        "--quiet",
+    ],
+]
+
+[targets.measure]
+command = [
+    "cargo", "run", "--release", "-p", "pepper-s3-throughput", "--",
+    "loadgen",
+    "--backend", "s3",
+    "--operation", "{operation}",
+    "--size", "{payload_size_bytes}",
+    "--concurrency", "{concurrency}",
+    "--duration", "{duration_seconds}",
+    "--object-count", "256",
+    "--prepare",
+    "--endpoints", "{endpoint}",
+    "--quiet",
+    "--output", "{output}",
+]
+
+[workload]
+operations = ["put", "get"]
+payload_sizes_bytes = [4096, 1048576, 67108864]
+concurrency = [1, 8, 32]
+duration_seconds = 60
+warmup_seconds = 10
+repetitions = 3
+
+[gates]
+throughput_ratio_minimum = 1.0
+p99_ratio_maximum = 1.0
+tolerance_percent = 5.0
+required = true

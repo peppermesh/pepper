@@ -1683,6 +1683,9 @@ pub(super) async fn s3_delete_bucket(
     ensure_bucket_empty(&state, &namespace_id, uri.path()).await?;
     mark_bucket_deleted(&state, &namespace_id, uri.path()).await?;
     invalidate_fast_path_bucket(&state, &bucket);
+    // X5: same-gateway deletion must be immediately visible to the read fast
+    // path; cross-gateway visibility is bounded by S3_READ_CACHE_MAX_AGE.
+    invalidate_read_route(&state, &bucket).await;
     let mut response = StatusCode::NO_CONTENT.into_response();
     add_s3_headers(&mut response, &auth.request_id, Some(&state));
     Ok(response)
@@ -2684,12 +2687,34 @@ async fn object_response(
         headers,
         head_only,
     } = request;
+    let phase_started = std::time::Instant::now();
     let auth = authorize(&state, &method, &uri, &headers)?;
     validate_object_route(&bucket, &key, &query, uri.path())?;
     reject_object_query(uri.query(), uri.path())?;
     verify_empty_payload(&auth, uri.path())?;
-    let (resolved, current) =
-        current_bucket_descriptor_snapshot(&state, &bucket, key.as_bytes()).await?;
+    let phase_started = record_get_phase(0, phase_started);
+    // X5 read fast path: unconditional GET/HEAD resolves route and head from
+    // gateway caches (bounded staleness, write-through freshness); requests
+    // carrying read preconditions keep the linearizable resolution so their
+    // 412/304 decisions are made against a linearizable view.
+    let conditional_read =
+        headers.contains_key(header::IF_MATCH) || headers.contains_key(header::IF_NONE_MATCH);
+    let cached_resolution = if conditional_read {
+        None
+    } else {
+        cached_read_partition_state(&state, &bucket, key.as_bytes()).await
+    };
+    let (resolved, current) = match cached_resolution {
+        Some(resolved) => {
+            let current =
+                current_bucket_descriptor_at_root(&state, &resolved.namespace, key.as_bytes())
+                    .await
+                    .map_err(|error| map_api_error(error, &format!("/{bucket}")))?;
+            (resolved, current)
+        }
+        None => current_bucket_descriptor_snapshot(&state, &bucket, key.as_bytes()).await?,
+    };
+    let phase_started = record_get_phase(1, phase_started);
     let (value, descriptor) = current
         .filter(|(_, descriptor)| !descriptor.tombstone)
         .ok_or_else(|| S3Error::no_key(&bucket, &key))?;
@@ -2702,6 +2727,7 @@ async fn object_response(
         .clone()
         .ok_or_else(|| S3Error::no_key(&bucket, &key))?;
     apply_read_preconditions(&headers, &descriptor, uri.path())?;
+    let phase_started = record_get_phase(2, phase_started);
 
     let requested_range = header_text(&headers, header::RANGE)?
         .map(|value| parse_byte_range(value, descriptor.logical_size, uri.path()))
@@ -2810,6 +2836,7 @@ async fn object_response(
         uri.path(),
     )?;
     add_s3_headers(&mut response, &auth.request_id, Some(&state));
+    record_get_phase(3, phase_started);
     Ok(response)
 }
 
@@ -2821,6 +2848,12 @@ pub(super) async fn packed_small_object_payload(
     logical_size: u64,
     object_value: Option<&MerkleValue>,
 ) -> Result<Option<Bytes>, ApiError> {
+    // Content-addressed fast path: the payload below is CID-verified against
+    // `logical_cid` before it is ever cached, so a cache hit is always the
+    // exact object content regardless of which pack extent stores it.
+    if let Some(block) = state.block_payload_cache.get(logical_cid) {
+        return Ok(Some(Bytes::from(block.payload)));
+    }
     let location = match object_value {
         Some(value) => {
             packed_small_object_location_from_object_value(state, value, logical_cid, logical_size)?
@@ -2886,6 +2919,12 @@ pub(super) async fn packed_small_object_payload(
             "packed small-object CID verification failed",
         ));
     }
+    state.block_payload_cache.put(&pepper_types::Block {
+        cid: logical_cid.clone(),
+        codec: CODEC_SMALL_OBJECT,
+        size: payload.len() as u64,
+        payload: payload.clone(),
+    });
     Ok(Some(Bytes::from(payload)))
 }
 
@@ -8511,6 +8550,90 @@ fn partition_write_fence(partition: &BucketPartition) -> PartitionFence {
     }
 }
 
+/// F4 GET-phase wall clocks: attribute the local per-request read cost
+/// (auth/signature, route+head resolution, merkle descriptor lookup, payload
+/// assembly) so read optimization is measurement-driven like the write side.
+pub(crate) const S3_GET_PHASES: [&str; 4] = ["auth", "resolve", "descriptor", "payload"];
+pub(crate) static S3_GET_PHASE_MICROS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub(crate) static S3_GET_PHASE_OBSERVATIONS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn record_get_phase(phase: usize, started: std::time::Instant) -> std::time::Instant {
+    S3_GET_PHASE_MICROS[phase].fetch_add(
+        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+    S3_GET_PHASE_OBSERVATIONS[phase].fetch_add(1, Ordering::Relaxed);
+    std::time::Instant::now()
+}
+
+/// Freshness bound for the X5 cached bucket route (control resolution +
+/// partition map). The route only decides WHERE to read; the namespace head
+/// itself is always resolved linearizably, so object read-after-write holds
+/// across gateways unconditionally (proven by the gateway-loss multinode
+/// contract, which fails with any head staleness). The bound limits how long
+/// this gateway may keep routing reads for a bucket whose deletion or
+/// repartition it has not yet observed (same-gateway deletion invalidates
+/// immediately; repartition is additionally guarded by the map's Active check
+/// and, for writes, by the partition fence at apply).
+pub(crate) const S3_READ_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Cached bucket routing for reads: the partition map, so a GET does not
+/// re-resolve the catalog head and reload the map per request.
+pub(crate) struct CachedBucketRoute {
+    pub(crate) partition_map: BucketPartitionMap,
+    pub(crate) refreshed: std::time::Instant,
+}
+
+/// X5 read fast path: resolve a key's partition from the cached route, then
+/// resolve the partition's namespace head **linearizably** — with X2
+/// leadership affinity this is the local leader-lease path for most groups.
+/// Returns None when the route is missing, stale, or inactive; callers then
+/// take the full resolution (which repopulates the route). Read-after-write
+/// is never weakened: the head is linearizable regardless of which gateway
+/// acknowledged the write.
+async fn cached_read_partition_state(
+    state: &AppState,
+    bucket: &str,
+    key: &[u8],
+) -> Option<ResolvedS3Partition> {
+    let partition = {
+        let routes = state.s3_read_route_cache.lock().await;
+        let route = routes.get(bucket)?;
+        if std::time::Instant::now().duration_since(route.refreshed) > S3_READ_CACHE_MAX_AGE
+            || route.partition_map.state != BucketPartitionMapState::Active
+        {
+            return None;
+        }
+        route.partition_map.partition_for_key(key).clone()
+    };
+    let namespace = namespace_manager(state)
+        .ok()?
+        .linearizable_namespace_head(&partition.namespace_id)
+        .await
+        .ok()?;
+    metrics::S3_READ_FAST_PATH_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(ResolvedS3Partition {
+        partition,
+        namespace,
+    })
+}
+
+/// Drop the cached route for a bucket (same-gateway deletions and partition
+/// map changes must be visible immediately on this gateway).
+pub(super) async fn invalidate_read_route(state: &AppState, bucket: &str) {
+    state.s3_read_route_cache.lock().await.remove(bucket);
+}
+
 /// Resolve only the routing partition for a key from the bucket's partition map,
 /// without a linearizable read of the partition namespace head. Unconditional
 /// writes need the routing target and its write fence but not a linearizable
@@ -8574,6 +8697,15 @@ async fn bucket_namespace_state(
     }
     let partition_map =
         load_bucket_partition_map(state, &namespace_id, &format!("/{bucket}")).await?;
+    // X5: every full resolution refreshes the read route so subsequent
+    // unconditional reads can skip the catalog head for the staleness window.
+    state.s3_read_route_cache.lock().await.insert(
+        bucket.to_string(),
+        CachedBucketRoute {
+            partition_map: partition_map.clone(),
+            refreshed: std::time::Instant::now(),
+        },
+    );
     Ok(ResolvedS3Bucket {
         control_namespace_id: namespace_id,
         partition_map,

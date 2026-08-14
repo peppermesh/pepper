@@ -91,6 +91,8 @@ pub(super) static PLACEMENT_REPAIR_HEALTH_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_HEALTH_BATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_OWNER_RUNS: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_STANDBY_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+pub(super) static PLACEMENT_REPAIR_BUDGET_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+pub(super) static S3_READ_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_LEASE_RENEWALS: AtomicU64 = AtomicU64::new(0);
 pub(super) static PLACEMENT_REPAIR_LEASE_CONFLICTS: AtomicU64 = AtomicU64::new(0);
@@ -583,6 +585,27 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         publication_phases.durability_missing_preverified_receipts,
         publication_phases.durability_invalid_preverified_receipts,
     ));
+    // X0: per-stage wall clocks of the namespace commit workflow, so the
+    // publication's end-to-end latency is fully attributable (§5 "S3 audit").
+    body.push_str(
+        "# HELP pepper_publish_stage_microseconds_total Wall time spent in each namespace publish workflow stage.\n\
+         # TYPE pepper_publish_stage_microseconds_total counter\n",
+    );
+    let publish_stages = pepper_publication::publish_stage_stats();
+    for (stage, micros, _) in &publish_stages {
+        body.push_str(&format!(
+            "pepper_publish_stage_microseconds_total{{stage=\"{stage}\"}} {micros}\n"
+        ));
+    }
+    body.push_str(
+        "# HELP pepper_publish_stage_observations_total Namespace publish workflow stage executions.\n\
+         # TYPE pepper_publish_stage_observations_total counter\n",
+    );
+    for (stage, _, observations) in &publish_stages {
+        body.push_str(&format!(
+            "pepper_publish_stage_observations_total{{stage=\"{stage}\"}} {observations}\n"
+        ));
+    }
     body.push_str(&format!(
         "# HELP pepper_commit_engine_transitions_total Shared prepared-artifact commit transitions by stage.\n\
          # TYPE pepper_commit_engine_transitions_total counter\n\
@@ -760,6 +783,22 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          # HELP pepper_placement_repair_standby_deferrals_total Ordered standby delays before fenced lease contention.\n\
          # TYPE pepper_placement_repair_standby_deferrals_total counter\n\
          pepper_placement_repair_standby_deferrals_total {}\n\
+         # HELP pepper_placement_repair_budget_deferrals_total Repair passes that hit the per-pass dispatch budget and deferred remaining work.\n\
+         # TYPE pepper_placement_repair_budget_deferrals_total counter\n\
+         pepper_placement_repair_budget_deferrals_total {}\n\
+         # HELP pepper_s3_read_fast_path_hits_total Unconditional S3 reads served from the cached route and namespace head.\n\
+         # TYPE pepper_s3_read_fast_path_hits_total counter\n\
+         pepper_s3_read_fast_path_hits_total {}\n\
+         # HELP pepper_s3_get_phase_microseconds_total Wall time per local S3 GET phase.\n\
+         # TYPE pepper_s3_get_phase_microseconds_total counter\n\
+         {}\n\
+         # HELP pepper_s3_get_phase_observations_total S3 GET phase executions.\n\
+         # TYPE pepper_s3_get_phase_observations_total counter\n\
+         pepper_s3_get_phase_observations_total{{phase=\"payload\"}} {}\n\
+         # HELP pepper_block_payload_cache_requests_total Content-addressed block cache lookups by result.\n\
+         # TYPE pepper_block_payload_cache_requests_total counter\n\
+         pepper_block_payload_cache_requests_total{{result=\"hit\"}} {}\n\
+         pepper_block_payload_cache_requests_total{{result=\"miss\"}} {}\n\
          # HELP pepper_placement_repair_leases_acquired_total Committed repair leases or fence epochs acquired.\n\
          # TYPE pepper_placement_repair_leases_acquired_total counter\n\
          pepper_placement_repair_leases_acquired_total {}\n\
@@ -807,6 +846,22 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         PLACEMENT_REPAIR_HEALTH_BATCH_ERRORS.load(Ordering::Relaxed),
         PLACEMENT_REPAIR_OWNER_RUNS.load(Ordering::Relaxed),
         PLACEMENT_REPAIR_STANDBY_DEFERRALS.load(Ordering::Relaxed),
+        PLACEMENT_REPAIR_BUDGET_DEFERRALS.load(Ordering::Relaxed),
+        S3_READ_FAST_PATH_HITS.load(Ordering::Relaxed),
+        crate::s3_api::S3_GET_PHASES
+            .iter()
+            .zip(crate::s3_api::S3_GET_PHASE_MICROS.iter())
+            .map(|(phase, total)| {
+                format!(
+                    "pepper_s3_get_phase_microseconds_total{{phase=\"{phase}\"}} {}",
+                    total.load(Ordering::Relaxed)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        crate::s3_api::S3_GET_PHASE_OBSERVATIONS[3].load(Ordering::Relaxed),
+        crate::block_cache::BLOCK_CACHE_HITS.load(Ordering::Relaxed),
+        crate::block_cache::BLOCK_CACHE_MISSES.load(Ordering::Relaxed),
         PLACEMENT_REPAIR_LEASES_ACQUIRED.load(Ordering::Relaxed),
         PLACEMENT_REPAIR_LEASE_RENEWALS.load(Ordering::Relaxed),
         PLACEMENT_REPAIR_LEASE_CONFLICTS.load(Ordering::Relaxed),

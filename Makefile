@@ -171,6 +171,27 @@ kafka-bench-full:
 kafka-bench-replicated:
 	bash benchmarks/pepper-parity/run-kafka-parity.sh replicated-ack
 
+# S3 parity: Pepper vs MinIO (MINIO_DRIVE_SYNC=on) at single-node
+# durable-on-ack, same filesystem, SIGKILL audit on both sides.
+.PHONY: s3-bench
+s3-bench:
+	bash benchmarks/pepper-parity/run-s3-parity.sh
+
+.PHONY: s3-bench-full
+s3-bench-full:
+	SCALE=full bash benchmarks/pepper-parity/run-s3-parity.sh
+
+# Replicated profile: Pepper RF=3 vs distributed MinIO (3 nodes x 2 drives,
+# EC:2, drive sync on) — one-node fault tolerance on both sides, audited by
+# SIGKILLing the ingest node and reading back through a surviving node.
+.PHONY: s3-bench-replicated
+s3-bench-replicated:
+	PROFILE=replicated bash benchmarks/pepper-parity/run-s3-parity.sh
+
+.PHONY: s3-bench-replicated-full
+s3-bench-replicated-full:
+	PROFILE=replicated SCALE=full bash benchmarks/pepper-parity/run-s3-parity.sh
+
 # ---- Docker ---------------------------------------------------------------
 
 .PHONY: docker-image

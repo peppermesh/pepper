@@ -25,6 +25,12 @@ pub const NAMESPACE_READ_LEASES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("namespace_read_leases");
 pub const NAMESPACE_PUBLICATION_INTENTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("namespace_publication_intents");
+/// Terminal (applied/resolved) publication intents. Reconciliation moves
+/// records here so the live table holds only pending work: the per-commit
+/// reconcile scan is then O(pending) instead of O(every intent ever), while
+/// GC's protected-roots barrier still unions both tables.
+pub const NAMESPACE_PUBLICATION_INTENTS_HISTORY: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("namespace_publication_intents_history");
 pub const NAMESPACE_DURABILITY_RECEIPTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("namespace_durability_receipts");
 pub const NAMESPACE_DISCOVERY_RECORDS: TableDefinition<&str, &[u8]> =
@@ -265,6 +271,64 @@ impl PinRepository<'_> {
         Ok(())
     }
 
+    /// Write an arbitrary keyed record and a set of pins in one transaction,
+    /// maintaining the pin validation and by-root index exactly like `put`.
+    /// Publication staging uses this so a staging lease and its protection
+    /// pins become durable with a single fsync instead of two.
+    pub fn put_record_with_pins(
+        &self,
+        table: TableDefinition<&str, &[u8]>,
+        record_key: &str,
+        record_bytes: &[u8],
+        pins: &[PinRecord],
+    ) -> Result<(), MetadataError> {
+        let write_txn = self
+            .store
+            .db
+            .begin_write()
+            .map_err(|source| self.store.transaction(source))?;
+        {
+            let mut records = write_txn
+                .open_table(table)
+                .map_err(|source| self.store.table(source))?;
+            records
+                .insert(record_key, record_bytes)
+                .map_err(|source| self.store.storage(source))?;
+        }
+        {
+            let mut table = write_txn
+                .open_table(PINS)
+                .map_err(|source| self.store.table(source))?;
+            let mut by_root = write_txn
+                .open_table(PINS_BY_ROOT)
+                .map_err(|source| self.store.table(source))?;
+            for pin in pins {
+                if let Some(existing) = table
+                    .get(pin.pin_id.as_str())
+                    .map_err(|source| self.store.storage(source))?
+                {
+                    let existing: PinRecord = serde_json::from_slice(existing.value())
+                        .map_err(|source| self.store.serde(source))?;
+                    validate_pin_update(&existing, pin)?;
+                }
+                let bytes = serde_json::to_vec(pin).map_err(|source| self.store.serde(source))?;
+                table
+                    .insert(pin.pin_id.as_str(), bytes.as_slice())
+                    .map_err(|source| self.store.storage(source))?;
+                by_root
+                    .insert(
+                        format!("{}:{}", pin.root_cid, pin.pin_id).as_str(),
+                        pin.pin_id.as_str(),
+                    )
+                    .map_err(|source| self.store.storage(source))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|source| self.store.commit(source))?;
+        Ok(())
+    }
+
     pub fn replace(&self, pins: &[PinRecord]) -> Result<(), MetadataError> {
         if pins.is_empty() {
             return Ok(());
@@ -313,6 +377,37 @@ impl PinRepository<'_> {
         let mut pins = Vec::new();
         for item in table.iter().map_err(|source| self.store.storage(source))? {
             let (_, value) = item.map_err(|source| self.store.storage(source))?;
+            pins.push(
+                serde_json::from_slice(value.value()).map_err(|source| self.store.serde(source))?,
+            );
+        }
+        Ok(pins)
+    }
+
+    /// Pins whose `pin_id` starts with `prefix`, via an ordered range scan.
+    /// Publication protect/release paths address pins by their deterministic
+    /// id prefix; scanning the full table per call made every namespace commit
+    /// O(all pins ever created).
+    pub fn prefixed(&self, prefix: &str) -> Result<Vec<PinRecord>, MetadataError> {
+        let read_txn = self
+            .store
+            .db
+            .begin_read()
+            .map_err(|source| self.store.transaction(source))?;
+        let table = match read_txn.open_table(PINS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(source) => return Err(self.store.table(source)),
+        };
+        let mut pins = Vec::new();
+        for item in table
+            .range(prefix..)
+            .map_err(|source| self.store.storage(source))?
+        {
+            let (key, value) = item.map_err(|source| self.store.storage(source))?;
+            if !key.value().starts_with(prefix) {
+                break;
+            }
             pins.push(
                 serde_json::from_slice(value.value()).map_err(|source| self.store.serde(source))?,
             );
