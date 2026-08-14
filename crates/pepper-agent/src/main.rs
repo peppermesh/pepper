@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 mod api_error;
+mod block_cache;
 mod bucket_api;
 mod compute;
 mod diagnostics;
@@ -237,7 +238,21 @@ struct AppState {
     // current root and enforces per-key preconditions at apply, so a cached
     // base stays correct; it is refreshed on each commit and invalidated on a
     // stale-base error (WRITE_PATH_OPTIMIZATION.md §5).
-    namespace_head_cache: Arc<tokio::sync::Mutex<HashMap<NamespaceId, NamespaceState>>>,
+    // Entries carry their last refresh instant: writes refresh their
+    // namespace's entry on every acked commit (same-gateway read-after-write),
+    // and the X5 GET fast path additionally bounds cross-gateway staleness by
+    // only serving entries younger than `s3_api::S3_READ_CACHE_MAX_AGE`.
+    namespace_head_cache:
+        Arc<tokio::sync::Mutex<HashMap<NamespaceId, (NamespaceState, std::time::Instant)>>>,
+    // X5 GET fast path: cached bucket routing (control namespace + partition
+    // map) so unconditional reads skip the per-request catalog head
+    // resolution. Same freshness contract as the head cache; invalidated by
+    // same-gateway bucket deletion.
+    s3_read_route_cache: Arc<tokio::sync::Mutex<HashMap<String, s3_api::CachedBucketRoute>>>,
+    /// Content-addressed block cache for the read path (immutable blocks —
+    /// no invalidation needed). Removes the measured per-GET peer fetch for
+    /// hot objects and descriptors.
+    block_payload_cache: Arc<block_cache::BlockPayloadCache>,
     repair_interval: Duration,
     repair_semaphore: Arc<Semaphore>,
     repair_diagnostics: Arc<Mutex<VecDeque<RepairDiagnosticRecord>>>,
@@ -1237,6 +1252,8 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
         s3_write_service_micros: Arc::new(AtomicU64::new(S3_WRITE_INITIAL_SERVICE_MICROS)),
         s3_list_cache: Arc::new(S3ListCache::default()),
         namespace_head_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        s3_read_route_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        block_payload_cache: Arc::new(block_cache::BlockPayloadCache::default()),
         repair_interval: Duration::from_secs(loaded.config.replication.repair_interval_seconds),
         repair_semaphore: Arc::new(Semaphore::new(1)),
         repair_diagnostics: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
@@ -1614,11 +1631,20 @@ async fn get_block_at_placement(
     cid: &Cid,
     reference: &PlacementReference,
 ) -> Result<pepper_types::Block, ApiError> {
+    // Content-addressed fast path: an immutable block cached by CID is always
+    // the right answer, regardless of placement.
+    if let Some(block) = state.block_payload_cache.get(cid) {
+        return Ok(block);
+    }
     if state.s3.is_none() && state.placement.map(reference.epoch).is_none() {
-        return get_block_resolved_transient(state, cid).await;
+        let block = get_block_resolved_transient(state, cid).await?;
+        state.block_payload_cache.put(&block);
+        return Ok(block);
     }
     let node_ids = placement_target_node_ids(state, cid, reference).await?;
-    get_block_with_placement_fallback(state, cid, reference, node_ids).await
+    let block = get_block_with_placement_fallback(state, cid, reference, node_ids).await?;
+    state.block_payload_cache.put(&block);
+    Ok(block)
 }
 
 async fn placement_target_node_ids(

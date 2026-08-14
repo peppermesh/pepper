@@ -395,12 +395,11 @@ impl ProtectionBackend for AgentProtectionBackend {
         if self
             .metadata
             .pins()
-            .all()
+            .prefixed(&prefix)
             .map_err(|error| PublicationError::Protection(error.to_string()))?
             .into_iter()
             .any(|pin| {
-                pin.pin_id.starts_with(&prefix)
-                    && pin.owner == self.node_id
+                pin.owner == self.node_id
                     && pin.status == "active"
                     && pin.expires_at_unix_seconds == expires_at_unix_seconds
             })
@@ -444,14 +443,10 @@ impl ProtectionBackend for AgentProtectionBackend {
         let mut pins = self
             .metadata
             .pins()
-            .all()
+            .prefixed(&prefix)
             .map_err(|error| PublicationError::Protection(error.to_string()))?
             .into_iter()
-            .filter(|pin| {
-                pin.pin_id.starts_with(&prefix)
-                    && pin.owner == self.node_id
-                    && pin.status == "active"
-            })
+            .filter(|pin| pin.owner == self.node_id && pin.status == "active")
             .collect::<Vec<_>>();
         for pin in &mut pins {
             pin.status = "deleted".to_string();
@@ -471,15 +466,21 @@ impl ProtectionBackend for AgentProtectionBackend {
         reason: &str,
         expires_at_unix_seconds: Option<i64>,
     ) -> Result<(), PublicationError> {
-        let active_pin_ids = self
-            .metadata
-            .pins()
-            .all()
-            .map_err(|error| PublicationError::Protection(error.to_string()))?
-            .into_iter()
-            .filter(|pin| pin.owner == self.node_id && pin.status == "active")
-            .map(|pin| pin.pin_id)
-            .collect::<HashSet<_>>();
+        // Per-cid prefix lookups: a commit protects a handful of roots, so
+        // keyed range scans replace the previous O(all pins) table scan.
+        let mut active_pin_ids = HashSet::new();
+        for cid in cids {
+            let prefix = self.pin_prefix(namespace_id, cid, reason);
+            active_pin_ids.extend(
+                self.metadata
+                    .pins()
+                    .prefixed(&prefix)
+                    .map_err(|error| PublicationError::Protection(error.to_string()))?
+                    .into_iter()
+                    .filter(|pin| pin.owner == self.node_id && pin.status == "active")
+                    .map(|pin| pin.pin_id),
+            );
+        }
         let created_at_unix_seconds = unix_seconds();
         let mut pins = Vec::with_capacity(cids.len());
         for cid in cids {
@@ -519,22 +520,18 @@ impl ProtectionBackend for AgentProtectionBackend {
         cids: &[Cid],
         reason: &str,
     ) -> Result<(), PublicationError> {
-        let prefixes = cids
-            .iter()
-            .map(|cid| format!("{}-", self.pin_prefix(namespace_id, cid, reason)))
-            .collect::<HashSet<_>>();
-        let mut pins = self
-            .metadata
-            .pins()
-            .all()
-            .map_err(|error| PublicationError::Protection(error.to_string()))?
-            .into_iter()
-            .filter(|pin| {
-                pin.owner == self.node_id
-                    && pin.status == "active"
-                    && prefixes.iter().any(|prefix| pin.pin_id.starts_with(prefix))
-            })
-            .collect::<Vec<_>>();
+        let mut pins = Vec::new();
+        for cid in cids {
+            let prefix = format!("{}-", self.pin_prefix(namespace_id, cid, reason));
+            pins.extend(
+                self.metadata
+                    .pins()
+                    .prefixed(&prefix)
+                    .map_err(|error| PublicationError::Protection(error.to_string()))?
+                    .into_iter()
+                    .filter(|pin| pin.owner == self.node_id && pin.status == "active"),
+            );
+        }
         for pin in &mut pins {
             pin.status = "deleted".to_string();
             self.sign(pin)?;
@@ -544,14 +541,181 @@ impl ProtectionBackend for AgentProtectionBackend {
             .replace(&pins)
             .map_err(|error| PublicationError::Protection(error.to_string()))
     }
+
+    fn prepare_protect_pins(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reason: &str,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Option<Vec<PinRecord>>, PublicationError> {
+        // Same construction as protect_many, without the write: the caller
+        // folds these into its own transaction.
+        let created_at_unix_seconds = unix_seconds();
+        let mut pins = Vec::with_capacity(cids.len());
+        for cid in cids {
+            let prefix = self.pin_prefix(namespace_id, cid, reason);
+            let pin_id = format!(
+                "{}-{}-{}",
+                prefix,
+                expires_at_unix_seconds
+                    .map_or_else(|| "permanent".to_string(), |value| value.to_string()),
+                self.node_id
+            );
+            let already_active = self
+                .metadata
+                .pins()
+                .prefixed(&prefix)
+                .map_err(|error| PublicationError::Protection(error.to_string()))?
+                .into_iter()
+                .any(|pin| {
+                    pin.pin_id == pin_id && pin.owner == self.node_id && pin.status == "active"
+                });
+            if already_active {
+                continue;
+            }
+            let mut pin = PinRecord {
+                pin_id,
+                root_cid: cid.clone(),
+                owner: self.node_id.clone(),
+                replication_factor: self.replication_factor,
+                created_at_unix_seconds,
+                expires_at_unix_seconds,
+                status: "active".to_string(),
+                signature_hex: String::new(),
+            };
+            self.sign(&mut pin)?;
+            pins.push(pin);
+        }
+        Ok(Some(pins))
+    }
+
+    async fn release_many_grouped(
+        &self,
+        namespace_id: &pepper_namespace::NamespaceId,
+        cids: &[Cid],
+        reasons: &[&str],
+    ) -> Result<(), PublicationError> {
+        // All covered pins retire in one fsynced transaction instead of one
+        // per reason.
+        let mut pins = Vec::new();
+        for reason in reasons {
+            for cid in cids {
+                let prefix = format!("{}-", self.pin_prefix(namespace_id, cid, reason));
+                pins.extend(
+                    self.metadata
+                        .pins()
+                        .prefixed(&prefix)
+                        .map_err(|error| PublicationError::Protection(error.to_string()))?
+                        .into_iter()
+                        .filter(|pin| pin.owner == self.node_id && pin.status == "active"),
+                );
+            }
+        }
+        for pin in &mut pins {
+            pin.status = "deleted".to_string();
+            self.sign(pin)?;
+        }
+        self.metadata
+            .pins()
+            .replace(&pins)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
+    }
+
+    async fn apply_pin_intents(
+        &self,
+        intents: &[pepper_consensus::PublicationIntentRecord],
+    ) -> Result<(), PublicationError> {
+        // Batched reconciliation: build the whole pin delta in memory (keyed
+        // prefix reads only) and persist it with a single fsynced write
+        // transaction, instead of one transaction per intent.
+        let created_at_unix_seconds = unix_seconds();
+        let mut writes = Vec::with_capacity(intents.len());
+        for intent in intents {
+            match intent.action {
+                pepper_namespace::PinAction::Protect => {
+                    let prefix = self.pin_prefix(&intent.namespace_id, &intent.cid, &intent.reason);
+                    let pin_id = format!("{prefix}-permanent-{}", self.node_id);
+                    let already_active = self
+                        .metadata
+                        .pins()
+                        .prefixed(&prefix)
+                        .map_err(|error| PublicationError::Protection(error.to_string()))?
+                        .into_iter()
+                        .any(|pin| {
+                            pin.pin_id == pin_id
+                                && pin.owner == self.node_id
+                                && pin.status == "active"
+                                && pin.expires_at_unix_seconds.is_none()
+                        });
+                    if already_active {
+                        continue;
+                    }
+                    let mut pin = PinRecord {
+                        pin_id,
+                        root_cid: intent.cid.clone(),
+                        owner: self.node_id.clone(),
+                        replication_factor: self.replication_factor,
+                        created_at_unix_seconds,
+                        expires_at_unix_seconds: None,
+                        status: "active".to_string(),
+                        signature_hex: String::new(),
+                    };
+                    self.sign(&mut pin)?;
+                    writes.push(pin);
+                }
+                pepper_namespace::PinAction::Release => {
+                    let prefix = format!(
+                        "{}-",
+                        self.pin_prefix(&intent.namespace_id, &intent.cid, &intent.reason)
+                    );
+                    for mut pin in self
+                        .metadata
+                        .pins()
+                        .prefixed(&prefix)
+                        .map_err(|error| PublicationError::Protection(error.to_string()))?
+                        .into_iter()
+                        .filter(|pin| pin.owner == self.node_id && pin.status == "active")
+                    {
+                        pin.status = "deleted".to_string();
+                        self.sign(&mut pin)?;
+                        writes.push(pin);
+                    }
+                }
+            }
+        }
+        self.metadata
+            .pins()
+            .replace(&writes)
+            .map_err(|error| PublicationError::Protection(error.to_string()))
+    }
 }
 
 pub(super) fn spawn_publication_reconciler(state: AppState) {
     tokio::spawn(async move {
         let protection = AgentProtectionBackend::from_state(&state);
         let mut interval = time::interval(Duration::from_secs(2));
+        // F7: the terminal-record purges (stale durability receipts, terminal
+        // intents left by the pre-split format) previously ran only at boot,
+        // so a long-lived node re-accumulated history until restart. A slow
+        // cadence keeps the tables bounded by recent activity.
+        let mut hygiene = time::interval(Duration::from_secs(300));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = hygiene.tick() => {
+                    if let Err(error) = state.publication_repository.migrate_terminal_intents() {
+                        warn!(%error, "terminal intent hygiene failed");
+                    }
+                    if let Err(error) = state
+                        .publication_repository
+                        .purge_stale_durability_receipts_now()
+                    {
+                        warn!(%error, "durability receipt hygiene failed");
+                    }
+                    continue;
+                }
+                _ = interval.tick() => {}
+            }
             if let Err(error) =
                 reconcile_pin_intents(&state.publication_repository, &protection).await
             {

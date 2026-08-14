@@ -1279,7 +1279,7 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
     })?;
     let agent = env!("CARGO_BIN_EXE_pepper-agent");
     run_init(agent, &config)?;
-    let _node = spawn_agent(agent, &config)?;
+    let mut node = spawn_agent(agent, &config)?;
     wait_health(api).await?;
 
     let client = reqwest::Client::new();
@@ -1348,6 +1348,13 @@ async fn erasure_coded_object_roundtrips() -> TestResult<()> {
     for shard in manifest.stripes[0].shards.iter().take(3) {
         fs::remove_file(block_file_path(temp.path(), "ec-node", &shard.cid))?;
     }
+    // The unrecoverable-read contract is about durable state: the in-memory
+    // block payload cache may legitimately keep serving CID-verified shards
+    // it fetched before the deletions, so restart the node to drop volatile
+    // state before asserting the object is gone.
+    node.kill_and_wait();
+    let _node = spawn_agent(agent, &config)?;
+    wait_health(api).await?;
     let unavailable = client
         .get(format!(
             "http://127.0.0.1:{api}/v1/objects/{}",

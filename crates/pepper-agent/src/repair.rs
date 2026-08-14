@@ -2183,20 +2183,57 @@ fn repair_lease_contention(error: &ApiError) -> bool {
         )
 }
 
+/// Inventory records planned per repair pass. Planning — placement scoring,
+/// health probes, plan construction — previously ran over the ENTIRE local
+/// inventory every pass, which measured as ~12k placement calculations and
+/// ~1k peer block probes per second of continuous background load on an idle
+/// node. A rotating cursor bounds each pass; successive passes cover the full
+/// inventory, so detection latency is bounded by one rotation instead of the
+/// work being unbounded per pass.
+const REPAIR_PLAN_BUDGET_PER_PASS: usize = 2_048;
+/// Repairs dispatched by the most recent pass; the loop reads-and-resets it
+/// to drive the healthy backoff.
+static REPAIR_LAST_PASS_DISPATCHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REPAIR_INVENTORY_CURSOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 async fn run_placement_owned_repair(state: &AppState) -> Result<u64, ApiError> {
     let map = state
         .placement
         .current_map()
         .ok_or_else(|| ApiError::internal("authoritative placement map is not loaded"))?;
+    let inventory = local_repair_inventory(state)?;
+    let total = inventory.len();
     let mut plans = Vec::new();
-    for inventory in local_repair_inventory(state)? {
-        plans.push(repair_plan_for_inventory(state, inventory).await?);
+    if total > 0 {
+        let start = REPAIR_INVENTORY_CURSOR.load(Ordering::Acquire) % total;
+        let planned = REPAIR_PLAN_BUDGET_PER_PASS.min(total);
+        for offset in 0..planned {
+            let inventory = inventory[(start + offset) % total].clone();
+            plans.push(repair_plan_for_inventory(state, inventory).await?);
+        }
+        REPAIR_INVENTORY_CURSOR.store((start + planned) % total.max(1), Ordering::Release);
     }
     let health = build_repair_health_snapshot(state, &plans).await?;
     let mut repairs = 0u64;
-    for plan in plans {
+    // X4 (§5 "S3 audit"): bound the work a single pass may dispatch. A large
+    // backlog — or a set of placements that cannot currently complete — must
+    // drain across paced passes instead of re-fetching every affected block's
+    // full payload on every 30 s sweep, which measured as sustained bursts of
+    // ~250 k remote block reads per second on an otherwise idle cluster.
+    // Repair still converges: each pass makes bounded progress and the next
+    // pass continues where inventory ordering left off. Detection (the cheap
+    // has-batch health snapshot above) stays unbounded, so degraded blocks are
+    // still discovered promptly.
+    const REPAIR_DISPATCH_BUDGET_PER_PASS: u64 = 4_096;
+    'passes: for plan in plans {
         let tasks = repair_tasks_for_inventory(state, &health, &plan).await?;
         for task in tasks {
+            if repairs >= REPAIR_DISPATCH_BUDGET_PER_PASS {
+                metrics::PLACEMENT_REPAIR_BUDGET_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+                break 'passes;
+            }
             let owners =
                 select_repair_owners(&map, task.owner_reference(), DEFAULT_REPAIR_OWNER_COUNT)
                     .map_err(authoritative_placement_error)?;
@@ -2231,6 +2268,7 @@ async fn run_placement_owned_repair(state: &AppState) -> Result<u64, ApiError> {
             ));
         }
     }
+    REPAIR_LAST_PASS_DISPATCHED.store(repairs, Ordering::Release);
     Ok(repairs)
 }
 
@@ -2262,13 +2300,30 @@ pub(super) fn spawn_repair_loop(state: AppState) {
         let first_tick = time::Instant::now()
             + state.repair_interval
             + Duration::from_millis(jitter_slots % interval_millis);
-        let mut interval = time::interval_at(first_tick, state.repair_interval);
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        time::sleep_until(first_tick).await;
+        // Healthy backoff: passes that dispatch no repairs stretch the sleep
+        // (capped at 4x the configured interval) so an all-healthy cluster is
+        // not paying continuous planning cost; any repair activity snaps the
+        // cadence back to the configured interval. Worst-case detection
+        // latency for new degradation is one full inventory rotation at the
+        // backed-off cadence.
+        let mut idle_passes = 0u32;
         loop {
-            interval.tick().await;
-            if let Err(error) = run_repair_once(&state).await {
-                warn!(?error, "repair loop iteration failed");
+            match run_repair_once(&state).await {
+                Ok(()) => {
+                    if REPAIR_LAST_PASS_DISPATCHED.swap(0, Ordering::AcqRel) > 0 {
+                        idle_passes = 0;
+                    } else {
+                        idle_passes = idle_passes.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    warn!(?error, "repair loop iteration failed");
+                    idle_passes = 0;
+                }
             }
+            let multiplier = 1u32 << idle_passes.min(2);
+            time::sleep(state.repair_interval * multiplier).await;
         }
     });
 }

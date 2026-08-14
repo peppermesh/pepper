@@ -1101,16 +1101,31 @@ async fn prepare(
         .map(|index| {
             let backend = backend.clone();
             async move {
-                let result = backend
-                    .request(
-                        Operation::Put,
-                        object_key(size, index, payload_profile),
-                        size,
-                        0,
-                        index,
-                        payload_profile,
-                    )
+                // The pool preload is setup, not measurement: honor backpressure
+                // (503 SlowDown from bounded admission queues and friends) with
+                // bounded retries the way a production S3 client would, instead
+                // of failing the cell.
+                let mut attempt = 0u32;
+                let result = loop {
+                    let result = backend
+                        .request(
+                            Operation::Put,
+                            object_key(size, index, payload_profile),
+                            size,
+                            0,
+                            index,
+                            payload_profile,
+                        )
+                        .await;
+                    if result.success || attempt >= 20 || !retryable_s3_result(&result) {
+                        break result;
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(
+                        (u64::from(attempt) * 100).min(2_000),
+                    ))
                     .await;
+                };
                 ensure!(
                     result.success,
                     "preload PUT {index} failed with status {}: {}",

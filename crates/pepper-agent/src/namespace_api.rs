@@ -773,7 +773,7 @@ async fn apply_command_internal(
     // linearizable read; otherwise fall back to the linearizable read. Conditional
     // preconditions are unaffected — they are enforced against current committed
     // state inside the state machine, not here.
-    let current = if let Some(cached) = state
+    let current = if let Some((cached, _)) = state
         .namespace_head_cache
         .lock()
         .await

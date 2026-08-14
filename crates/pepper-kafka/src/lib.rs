@@ -91,6 +91,13 @@ struct PartitionRuntime {
     // fsync entirely.
     checkpoint_lock: Mutex<()>,
     checkpoint_persisted: std::sync::atomic::AtomicU64,
+    /// Highest watermark any in-flight overlapped checkpoint has requested.
+    /// A writer that wins the checkpoint lock persists this value instead of
+    /// its own target, so queued waiters whose targets it covers skip their
+    /// fsync entirely (F6: the overlap path previously wrote 1.00 checkpoints
+    /// per produce under concurrency because strictly-increasing targets
+    /// never hit the already-persisted guard).
+    checkpoint_requested: std::sync::atomic::AtomicU64,
     /// Per-replica `recovery.ckpt` paths, precomputed at open so checkpoint
     /// writes never re-derive them from a controller-state scan.
     checkpoint_paths: BTreeMap<i32, PathBuf>,
@@ -490,6 +497,9 @@ impl KafkaCluster {
             checkpoint_persisted: std::sync::atomic::AtomicU64::new(
                 leader_checkpoint_high_watermark,
             ),
+            checkpoint_requested: std::sync::atomic::AtomicU64::new(
+                leader_checkpoint_high_watermark,
+            ),
             checkpoint_paths,
         }))
     }
@@ -635,6 +645,9 @@ impl KafkaCluster {
                 .get(&descriptor.leader_id)
                 .ok_or(KafkaError::UnknownPartition)?
                 .clone();
+            runtime
+                .checkpoint_requested
+                .fetch_max(predicted_end, std::sync::atomic::Ordering::AcqRel);
             Some(tokio::task::spawn_blocking(
                 move || -> Result<(), KafkaError> {
                     use std::sync::atomic::Ordering;
@@ -642,17 +655,27 @@ impl KafkaCluster {
                     if runtime.checkpoint_persisted.load(Ordering::Acquire) >= predicted_end {
                         return Ok(());
                     }
+                    // Persist the highest requested target so every queued
+                    // waiter this write covers skips its own fsync. The safe
+                    // floor stays this producer's base offset: the log is
+                    // durable at least that far, and any watermark overhang
+                    // beyond the durable end is unacknowledged by
+                    // construction (clamped on recovery).
+                    let target = runtime
+                        .checkpoint_requested
+                        .load(Ordering::Acquire)
+                        .max(predicted_end);
                     checkpoint_write(
                         &path,
                         &PartitionCheckpoint {
-                            high_watermark: predicted_end,
+                            high_watermark: target,
                             log_start_offset,
                             safe_floor: base_offset,
                         },
                     )?;
                     runtime
                         .checkpoint_persisted
-                        .fetch_max(predicted_end, Ordering::AcqRel);
+                        .fetch_max(target, Ordering::AcqRel);
                     Ok(())
                 },
             ))

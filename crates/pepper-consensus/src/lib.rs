@@ -540,7 +540,9 @@ impl ReplicatedStateMachine for NamespaceRsmAdapter {
     ) -> Result<Self::Response, Self::Error> {
         let mut machine = NamespaceStateMachine::new(self.store.clone(), state.clone())?;
         let result = machine.apply(command).await?;
-        *state = machine.state().clone();
+        // Move the successor state out instead of deep-cloning it — the state
+        // carries the idempotency map, so the clone grew with history.
+        *state = machine.into_state();
         Ok(result)
     }
 
@@ -826,6 +828,13 @@ pub struct RedbLogStore {
     group: String,
     io_lock: Arc<Mutex<()>>,
     max_log_bytes: u64,
+    /// Cached total encoded bytes of this group's retained log. The previous
+    /// implementation scanned the whole raft-log table — every group's
+    /// entries — on every append (the byte-limit check) and every checkpoint
+    /// probe, an O(all logs) cost per write that grew with history. Sentinel
+    /// `u64::MAX` means "uninitialized"; truncate/purge reset it and the next
+    /// reader re-derives it with one prefix range scan.
+    log_bytes_cached: Arc<AtomicU64>,
 }
 
 impl Debug for RedbLogStore {
@@ -849,6 +858,7 @@ impl RedbLogStore {
             group,
             io_lock,
             max_log_bytes,
+            log_bytes_cached: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -914,25 +924,39 @@ impl RedbLogStore {
             .open_table(NAMESPACE_RAFT_LOG)
             .map_err(read_logs_error)?;
         let prefix = self.log_prefix();
+        // Log keys are zero-padded, so lexicographic order within the prefix
+        // is numeric order: a bounded range scan replaces the previous
+        // whole-table iteration (which visited every group's entries on every
+        // replication read).
+        let lower = match range.start_bound() {
+            std::ops::Bound::Included(index) => *index,
+            std::ops::Bound::Excluded(index) => index.saturating_add(1),
+            std::ops::Bound::Unbounded => 0,
+        };
+        let start_key = self.log_key(lower);
         let mut entries = Vec::new();
-        for item in table.iter().map_err(read_logs_error)? {
+        for item in table.range(start_key.as_str()..).map_err(read_logs_error)? {
             let (key, value) = item.map_err(read_logs_error)?;
             let key = key.value();
             let Some(index) = key
                 .strip_prefix(&prefix)
                 .and_then(|index| index.parse::<u64>().ok())
             else {
-                continue;
+                break;
             };
-            if range.contains(&index) {
-                entries.push(serde_json::from_slice(value.value()).map_err(read_logs_error)?);
+            if !range.contains(&index) {
+                break;
             }
+            entries.push(serde_json::from_slice(value.value()).map_err(read_logs_error)?);
         }
-        entries.sort_by_key(|entry: &Entry<TypeConfig>| entry.log_id.index);
         Ok(entries)
     }
 
     fn log_bytes(&self) -> Result<u64, StorageError<NodeId>> {
+        let cached = self.log_bytes_cached.load(Ordering::Acquire);
+        if cached != u64::MAX {
+            return Ok(cached);
+        }
         let read = self
             .metadata
             .database()
@@ -943,12 +967,14 @@ impl RedbLogStore {
             .map_err(read_logs_error)?;
         let prefix = self.log_prefix();
         let mut bytes = 0u64;
-        for item in table.iter().map_err(read_logs_error)? {
+        for item in table.range(prefix.as_str()..).map_err(read_logs_error)? {
             let (key, value) = item.map_err(read_logs_error)?;
-            if key.value().starts_with(&prefix) {
-                bytes = bytes.saturating_add(value.value().len() as u64);
+            if !key.value().starts_with(&prefix) {
+                break;
             }
+            bytes = bytes.saturating_add(value.value().len() as u64);
         }
+        self.log_bytes_cached.store(bytes, Ordering::Release);
         Ok(bytes)
     }
 }
@@ -1068,6 +1094,9 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         let result = write.commit().map_err(write_logs_error);
         match result {
             Ok(()) => {
+                if self.log_bytes_cached.load(Ordering::Acquire) != u64::MAX {
+                    self.log_bytes_cached.fetch_add(added, Ordering::AcqRel);
+                }
                 callback.log_io_completed(Ok(()));
                 Ok(())
             }
@@ -1080,11 +1109,14 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let _guard = self.io_lock.lock().await;
+        // Removed sizes are not tracked here; the next reader re-derives.
+        self.log_bytes_cached.store(u64::MAX, Ordering::Release);
         delete_logs(&self.metadata, &self.log_prefix(), log_id.index..)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let _guard = self.io_lock.lock().await;
+        self.log_bytes_cached.store(u64::MAX, Ordering::Release);
         let write = self
             .metadata
             .database()
@@ -1096,14 +1128,15 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
                 .map_err(write_logs_error)?;
             let prefix = self.log_prefix();
             let keys = logs
-                .iter()
+                .range(prefix.as_str()..)
                 .map_err(read_logs_error)?
-                .filter_map(|item| {
+                .map_while(|item| {
                     let (key, _) = item.ok()?;
                     let key = key.value();
                     let index = key.strip_prefix(&prefix)?.parse::<u64>().ok()?;
-                    (index <= log_id.index).then(|| key.to_string())
+                    Some((index, key.to_string()))
                 })
+                .filter_map(|(index, key)| (index <= log_id.index).then_some(key))
                 .collect::<Vec<_>>();
             for key in keys {
                 logs.remove(key.as_str()).map_err(write_logs_error)?;
@@ -1210,14 +1243,15 @@ where
             .open_table(NAMESPACE_RAFT_LOG)
             .map_err(write_logs_error)?;
         let keys = logs
-            .iter()
+            .range(prefix..)
             .map_err(read_logs_error)?
-            .filter_map(|item| {
+            .map_while(|item| {
                 let (key, _) = item.ok()?;
                 let key = key.value();
                 let index = key.strip_prefix(prefix)?.parse::<u64>().ok()?;
-                range.contains(&index).then(|| key.to_string())
+                Some((index, key.to_string()))
             })
+            .filter_map(|(index, key)| range.contains(&index).then_some(key))
             .collect::<Vec<_>>();
         for key in keys {
             logs.remove(key.as_str()).map_err(write_logs_error)?;
@@ -1249,6 +1283,12 @@ struct StoredSnapshotRecord {
     pointer: SnapshotPointer,
 }
 
+/// Applied entries between durable full-state persists. Recovery replays at
+/// most this many entries (plus the in-flight batch) from the raft log; the
+/// log always retains them because purge trails snapshots, and snapshot
+/// build/install force a persist.
+const STATE_PERSIST_CADENCE_ENTRIES: u64 = 32;
+
 #[derive(Clone)]
 pub struct RedbStateMachineStore {
     metadata: Arc<MetadataStore>,
@@ -1258,6 +1298,11 @@ pub struct RedbStateMachineStore {
     state: Arc<RwLock<PersistedStateMachine>>,
     current_snapshot: Arc<RwLock<Option<StoredSnapshotRecord>>>,
     membership_epoch: Arc<AtomicU64>,
+    /// Applied index covered by the last durable full-state persist. The full
+    /// state (with its idempotency map) is persisted on a cadence rather than
+    /// per entry; recovery replays the raft log from here to the saved
+    /// committed index (`save_committed`), re-applying idempotent effects.
+    last_persisted_applied: Arc<AtomicU64>,
 }
 
 impl Debug for RedbStateMachineStore {
@@ -1288,6 +1333,11 @@ impl RedbStateMachineStore {
             read_json_table::<StoredSnapshotRecord>(&metadata, NAMESPACE_CHECKPOINTS, &group)?;
         let persisted_state = state.clone();
         let membership_epoch = Arc::new(AtomicU64::new(state.membership_epoch));
+        let last_persisted_applied = Arc::new(AtomicU64::new(
+            persisted_state
+                .last_applied_log
+                .map_or(0, |log_id| log_id.index),
+        ));
         let store = Self {
             metadata,
             group,
@@ -1296,6 +1346,7 @@ impl RedbStateMachineStore {
             state: Arc::new(RwLock::new(state)),
             current_snapshot: Arc::new(RwLock::new(current_snapshot)),
             membership_epoch,
+            last_persisted_applied,
         };
         store.persist_state_sync(&persisted_state)?;
         Ok(store)
@@ -1306,15 +1357,6 @@ impl RedbStateMachineStore {
     }
 
     fn persist_state_sync(&self, state: &PersistedStateMachine) -> Result<(), ConsensusError> {
-        self.persist_state_and_intents_sync(state, &[], &[])
-    }
-
-    fn persist_state_and_intents_sync(
-        &self,
-        state: &PersistedStateMachine,
-        intents: &[PublicationIntentRecord],
-        resolved_log_indexes: &[u64],
-    ) -> Result<(), ConsensusError> {
         let state_bytes =
             serde_json::to_vec(state).map_err(|error| ConsensusError::Serde(error.to_string()))?;
         let membership_bytes = serde_json::to_vec(&state.membership)
@@ -1340,17 +1382,49 @@ impl RedbStateMachineStore {
                 .insert(self.group.as_str(), membership_bytes.as_slice())
                 .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
         }
-        if !intents.is_empty() || !resolved_log_indexes.is_empty() {
+        write
+            .commit()
+            .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
+        self.last_persisted_applied.store(
+            state.last_applied_log.map_or(0, |log_id| log_id.index),
+            Ordering::Release,
+        );
+        Ok(())
+    }
+
+    /// Persist this batch's publication intents and retire resolved proposal
+    /// intents, in one transaction. This stays on the per-apply path: the
+    /// publish flow's reconcile→finalize chain reads pending intents right
+    /// after the commit returns, and the GC barrier (`protected_roots`) must
+    /// see a committed root's protect intent before its staging pins can be
+    /// withdrawn. Only the full-state persist rides the cadence.
+    fn persist_intents_sync(
+        &self,
+        intents: &[PublicationIntentRecord],
+        resolved_log_indexes: &[u64],
+    ) -> Result<(), ConsensusError> {
+        if intents.is_empty() && resolved_log_indexes.is_empty() {
+            return Ok(());
+        }
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
+        {
             let mut table = write
                 .open_table(pepper_metadata::NAMESPACE_PUBLICATION_INTENTS)
+                .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
+            let mut history = write
+                .open_table(pepper_metadata::NAMESPACE_PUBLICATION_INTENTS_HISTORY)
                 .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
             for log_index in resolved_log_indexes {
                 let prefix = format!("{}|{:016x}|proposal|", self.group, log_index);
                 let records = table
-                    .iter()
+                    .range(prefix.as_str()..)
                     .map_err(|error| ConsensusError::Metadata(error.to_string()))?
                     .filter_map(|item| item.ok())
-                    .filter(|(key, _)| key.value().starts_with(&prefix))
+                    .take_while(|(key, _)| key.value().starts_with(&prefix))
                     .map(|(key, value)| {
                         let record =
                             serde_json::from_slice::<PublicationIntentRecord>(value.value())
@@ -1362,8 +1436,13 @@ impl RedbStateMachineStore {
                     record.status = "resolved".to_string();
                     let bytes = serde_json::to_vec(&record)
                         .map_err(|error| ConsensusError::Serde(error.to_string()))?;
-                    table
+                    // Terminal records live in the history table so the
+                    // pending scan stays O(pending) between boots.
+                    history
                         .insert(key.as_str(), bytes.as_slice())
+                        .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
+                    table
+                        .remove(key.as_str())
                         .map_err(|error| ConsensusError::Metadata(error.to_string()))?;
                 }
             }
@@ -1563,6 +1642,11 @@ impl RedbStateMachineStore {
 impl RaftSnapshotBuilder<TypeConfig> for RedbStateMachineStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let state = self.state.read().await.clone();
+        // Pin the durable state to the snapshot point: log purge trails the
+        // snapshot index, so persisting here guarantees the replay window
+        // (persisted applied → committed) always lies within retained log.
+        self.persist_state_sync(&state)
+            .map_err(write_snapshot_error)?;
         let replica_node_ids = snapshot_replica_node_ids(&state);
         self.data_store
             .hydrate_merkle_tree(&state.namespace_state.current_root_cid, &replica_node_ids)
@@ -1642,12 +1726,14 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         let mut responses = Vec::new();
         let mut publication_intents = Vec::new();
         let mut resolved_log_indexes = Vec::new();
+        let mut membership_changed = false;
         for entry in entries {
             let log_index = entry.log_id.index;
             next.last_applied_log = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Blank => responses.push(ConsensusBatchResponse::blank()),
                 EntryPayload::Membership(membership) => {
+                    membership_changed = true;
                     next.membership_epoch = next.membership_epoch.saturating_add(1);
                     next.membership = StoredMembership::new(Some(entry.log_id), membership);
                     responses.push(ConsensusBatchResponse::blank());
@@ -1694,8 +1780,23 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
                 }
             }
         }
-        self.persist_state_and_intents_sync(&next, &publication_intents, &resolved_log_indexes)
+        // Intents are durable before this batch's responses are released (the
+        // publish reconcile chain and GC barrier read them immediately). The
+        // full state — dominated by the idempotency map, which made every
+        // apply O(state) — persists on a cadence instead: recovery replays the
+        // raft log from the last persisted applied index to the saved
+        // committed index, and every replayed effect is idempotent
+        // (content-addressed merkle blocks, intent records keyed by
+        // intent_id).
+        self.persist_intents_sync(&publication_intents, &resolved_log_indexes)
             .map_err(write_state_error)?;
+        let applied_index = next.last_applied_log.map_or(0, |log_id| log_id.index);
+        let persist_due = membership_changed
+            || applied_index.saturating_sub(self.last_persisted_applied.load(Ordering::Acquire))
+                >= STATE_PERSIST_CADENCE_ENTRIES;
+        if persist_due {
+            self.persist_state_sync(&next).map_err(write_state_error)?;
+        }
         self.membership_epoch
             .store(next.membership_epoch, Ordering::Release);
         *self.state.write().await = next;
@@ -1773,6 +1874,10 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachineStore {
         self.membership_epoch
             .store(next.membership_epoch, Ordering::Release);
         *self.state.write().await = next;
+        self.last_persisted_applied.store(
+            meta.last_log_id.map_or(0, |log_id| log_id.index),
+            Ordering::Release,
+        );
         *self.current_snapshot.write().await = Some(record);
         Ok(())
     }
@@ -2223,6 +2328,16 @@ impl GroupHandle {
         self.state_machine.namespace_state().await
     }
 
+    /// Current head without cloning the state's history/idempotency maps.
+    pub async fn namespace_head_state(&self) -> NamespaceState {
+        self.state_machine
+            .state
+            .read()
+            .await
+            .namespace_state
+            .head_projection()
+    }
+
     pub async fn durability_replicas(&self) -> u16 {
         self.state_machine
             .state
@@ -2416,6 +2531,9 @@ pub struct NamespaceGroupManager {
     groups: GroupRegistry<GroupHandle>,
     command_metrics: Mutex<BTreeMap<String, ConsensusCommandAccumulator>>,
     sqlite_writers: Mutex<HashMap<String, WriterCoordinator>>,
+    /// X2 leadership affinity: per-namespace cooldown for local election
+    /// nudges, so a serving gateway campaigns at most once per window.
+    leadership_nudges: Mutex<HashMap<String, tokio::time::Instant>>,
 }
 
 fn namespace_rsm_group(namespace_id: &NamespaceId) -> RsmGroupId {
@@ -2465,6 +2583,7 @@ impl NamespaceGroupManager {
             groups,
             command_metrics: Mutex::new(BTreeMap::new()),
             sqlite_writers: Mutex::new(HashMap::new()),
+            leadership_nudges: Mutex::new(HashMap::new()),
         })
     }
 
@@ -2489,6 +2608,7 @@ impl NamespaceGroupManager {
             groups,
             command_metrics: Mutex::new(BTreeMap::new()),
             sqlite_writers: Mutex::new(HashMap::new()),
+            leadership_nudges: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3166,7 +3286,10 @@ impl NamespaceGroupManager {
         projection: proto::NamespaceStateProjection,
     ) -> Result<NamespaceState, ConsensusError> {
         if let Ok(group) = self.group(namespace_id).await {
-            if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+            if let Some(state) = self
+                .linearizable_local_namespace_projection(&group, projection)
+                .await
+            {
                 return Ok(project_namespace_state(state, projection));
             }
         }
@@ -3176,7 +3299,10 @@ impl NamespaceGroupManager {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(group) = self.group(namespace_id).await {
-                if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+                if let Some(state) = self
+                    .linearizable_local_namespace_projection(&group, projection)
+                    .await
+                {
                     return Ok(project_namespace_state(state, projection));
                 }
                 if let Some(state) = self
@@ -3237,7 +3363,10 @@ impl NamespaceGroupManager {
             // An election may complete while discovery is in flight. Check the
             // local group again before routing to remote candidates.
             if let Ok(group) = self.group(namespace_id).await {
-                if let Some(state) = self.linearizable_local_namespace_state(&group).await {
+                if let Some(state) = self
+                    .linearizable_local_namespace_projection(&group, projection)
+                    .await
+                {
                     return Ok(project_namespace_state(state, projection));
                 }
             }
@@ -3262,6 +3391,18 @@ impl NamespaceGroupManager {
     async fn linearizable_local_namespace_state(
         &self,
         group: &GroupHandle,
+    ) -> Option<NamespaceState> {
+        self.linearizable_local_namespace_projection(group, proto::NamespaceStateProjection::Full)
+            .await
+    }
+
+    /// Like `linearizable_local_namespace_state`, but a `Head` projection is
+    /// materialized without cloning the full state (F4: the full clone was
+    /// ~96% of S3 GET latency on a mature namespace).
+    async fn linearizable_local_namespace_projection(
+        &self,
+        group: &GroupHandle,
+        projection: proto::NamespaceStateProjection,
     ) -> Option<NamespaceState> {
         let metrics = group.raft.metrics().borrow().clone();
         let leader = if let Some(leader) = metrics.current_leader {
@@ -3293,7 +3434,11 @@ impl NamespaceGroupManager {
         );
         if lease_current {
             LINEARIZABLE_READ_LEASE_HITS.fetch_add(1, Ordering::Relaxed);
-            return Some(group.namespace_state().await);
+            return Some(if projection == proto::NamespaceStateProjection::Head {
+                group.namespace_head_state().await
+            } else {
+                group.namespace_state().await
+            });
         }
         LINEARIZABLE_READ_PROOFS.fetch_add(1, Ordering::Relaxed);
         if group.ensure_linearizable().await.is_err() {
@@ -3306,7 +3451,11 @@ impl NamespaceGroupManager {
             return None;
         }
         *group.last_known_leader.write().await = Some((self.node_id, confirmed.current_term));
-        Some(group.namespace_state().await)
+        Some(if projection == proto::NamespaceStateProjection::Head {
+            group.namespace_head_state().await
+        } else {
+            group.namespace_state().await
+        })
     }
 
     async fn namespace_state_from_local_leader(
@@ -3861,6 +4010,44 @@ impl NamespaceGroupManager {
             .await
     }
 
+    /// X2 leadership affinity (§5 "S3 audit"): a gateway that repeatedly
+    /// serves writes for a namespace campaigns to lead that namespace's Raft
+    /// group, so commits take the local path instead of a forwarded hop.
+    /// Rate-limited per namespace; a no-op when this node already leads, is
+    /// not a voter, or nudged recently. Leadership placement is a performance
+    /// property in Raft — elections preserve quorum and fsync semantics, and
+    /// the worst case of competing gateways is periodic leadership movement
+    /// bounded by the cooldown.
+    pub async fn nudge_local_leadership(&self, namespace_id: &NamespaceId) {
+        const COOLDOWN: Duration = Duration::from_secs(60);
+        let Ok(group) = self.group(namespace_id).await else {
+            return;
+        };
+        let metrics = group.raft.metrics().borrow().clone();
+        if metrics.current_leader == Some(self.node_id) {
+            return;
+        }
+        if !metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .any(|voter| voter == self.node_id)
+        {
+            return;
+        }
+        {
+            let mut nudges = self.leadership_nudges.lock().await;
+            let now = tokio::time::Instant::now();
+            match nudges.get(&namespace_id.to_string()) {
+                Some(last) if now.duration_since(*last) < COOLDOWN => return,
+                _ => {
+                    nudges.insert(namespace_id.to_string(), now);
+                }
+            }
+        }
+        let _ = group.raft.trigger().elect().await;
+    }
+
     pub async fn routed_write(
         &self,
         namespace_id: &NamespaceId,
@@ -3928,6 +4115,38 @@ impl NamespaceGroupManager {
                     };
                 }
             }
+            // X1 (§5 "S3 audit"): forward through already-known routes before
+            // any discovery. A local replica knows its group's leader from
+            // Raft metrics and membership, and previously persisted discovery
+            // records are usually current. A stale route is harmless — the
+            // old leader rejects the forward at its term check and the loop
+            // falls through to rediscovery — so trying known routes first
+            // never trades correctness, only removes the ~1 s discovery
+            // fan-out this audit measured on every routed write.
+            let mut known = self
+                .discovery_records(&namespace_id.to_string())
+                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+            if let Ok(group) = self.group(namespace_id).await
+                && let Some(hint) = self.local_route_hint(&group, namespace_id).await
+            {
+                known.push(hint);
+            }
+            if let Some(response) = self
+                .forward_write_to_candidates(
+                    network,
+                    namespace_id,
+                    known,
+                    &command_json,
+                    &application_guard_json,
+                )
+                .await
+            {
+                return Ok(response);
+            }
+            // Known routes failed: rediscover, but attempt the forward as each
+            // peer answers instead of draining the whole fan-out first (an
+            // unreachable peer previously held every operation for its full
+            // 1 s discovery timeout).
             let peers = network.peers().await;
             let mut discoveries = tokio::task::JoinSet::new();
             for peer in &peers {
@@ -3948,64 +4167,27 @@ impl NamespaceGroupManager {
                     });
                 }
             }
-            let mut candidates = self
-                .discovery_records(&namespace_id.to_string())
-                .map_err(|error| ConsensusError::Raft(error.to_string()))?;
             while let Some(result) = discoveries.join_next().await {
-                if let Ok(Some(records)) = result {
-                    for record in records {
-                        let _ = self.persist_discovery_record(record.clone());
-                        candidates.push(record);
-                    }
-                }
-            }
-            candidates.sort_by(|left, right| {
-                right
-                    .membership_epoch
-                    .cmp(&left.membership_epoch)
-                    .then_with(|| right.leader_term.cmp(&left.leader_term))
-            });
-            candidates.dedup_by(|left, right| {
-                left.membership_epoch == right.membership_epoch
-                    && left.leader_node_id == right.leader_node_id
-            });
-
-            let mut forwards = tokio::task::JoinSet::new();
-            for record in candidates.into_iter().take(3) {
-                if record.leader_node_id.is_empty() || record.leader_node_id == self.node_identity {
-                    continue;
-                }
-                let Some(peer) = network.peer_address(&record.leader_node_id).await else {
+                let Ok(Some(records)) = result else {
                     continue;
                 };
-                let network = network.clone();
-                let request = proto::NamespaceForwardRequest {
-                    context: Some(proto::NamespaceRpcContext {
-                        namespace_id: namespace_id.to_string(),
-                        namespace_protocol_version: 1,
-                        membership_epoch: record.membership_epoch,
-                        term: record.leader_term,
-                        sender_identity: self.node_identity.clone(),
-                        request_id: String::new(),
-                    }),
-                    command_json: command_json.clone(),
-                    application_guard_json: application_guard_json.clone(),
-                };
-                forwards.spawn(async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        network.namespace_forward(peer, request),
+                let mut fresh = Vec::with_capacity(records.len());
+                for record in records {
+                    let _ = self.persist_discovery_record(record.clone());
+                    fresh.push(record);
+                }
+                if let Some(response) = self
+                    .forward_write_to_candidates(
+                        network,
+                        namespace_id,
+                        fresh,
+                        &command_json,
+                        &application_guard_json,
                     )
                     .await
-                    .ok()
-                    .and_then(Result::ok)
-                });
-            }
-            while let Some(result) = forwards.join_next().await {
-                if let Ok(Some(response)) = result
-                    && let Ok(result) = serde_json::from_slice(&response.response_json)
                 {
-                    return Ok(result);
+                    discoveries.abort_all();
+                    return Ok(response);
                 }
             }
             if tokio::time::Instant::now() >= deadline || peers.is_empty() {
@@ -4016,6 +4198,116 @@ impl NamespaceGroupManager {
         Err(ConsensusError::Raft(
             "namespace leader unavailable after bounded rediscovery".to_string(),
         ))
+    }
+
+    /// Route hint for a group this node replicates: the leader according to
+    /// local Raft metrics and membership. Requires no network round trip and
+    /// is validated by the leader's own term/epoch checks on use.
+    async fn local_route_hint(
+        &self,
+        group: &GroupHandle,
+        namespace_id: &NamespaceId,
+    ) -> Option<proto::NamespaceDiscoveryRecord> {
+        let metrics = group.raft.metrics().borrow().clone();
+        let leader = metrics.current_leader.or_else(|| {
+            group
+                .last_known_leader
+                .try_read()
+                .ok()?
+                .filter(|(_, term)| *term == metrics.current_term)
+                .map(|(leader, _)| leader)
+        })?;
+        if leader == self.node_id {
+            return None;
+        }
+        let state = group.state_machine.state.read().await;
+        let leader_identity = state
+            .membership
+            .nodes()
+            .find(|(node_id, _)| **node_id == leader)
+            .map(|(_, node)| node.addr.clone())
+            .or_else(|| {
+                state
+                    .namespace_state
+                    .descriptor
+                    .initial_replica_set
+                    .iter()
+                    .find(|identity| raft_node_id(identity) == leader)
+                    .cloned()
+            })?;
+        Some(proto::NamespaceDiscoveryRecord {
+            namespace_id: namespace_id.to_string(),
+            namespace_protocol_version: 1,
+            membership_epoch: group.membership_epoch(),
+            replica_node_ids: Vec::new(),
+            leader_node_id: leader_identity,
+            leader_term: metrics.current_term,
+            expires_at_unix_seconds: 0,
+            announcer_node_id: self.node_identity.clone(),
+            signature_hex: String::new(),
+        })
+    }
+
+    /// Try to forward a write to the best few candidate leaders; first
+    /// successful application wins. Returns None when no candidate accepted.
+    async fn forward_write_to_candidates(
+        &self,
+        network: &NetworkHandle,
+        namespace_id: &NamespaceId,
+        mut candidates: Vec<proto::NamespaceDiscoveryRecord>,
+        command_json: &[u8],
+        application_guard_json: &[u8],
+    ) -> Option<ConsensusResponse> {
+        candidates.sort_by(|left, right| {
+            right
+                .membership_epoch
+                .cmp(&left.membership_epoch)
+                .then_with(|| right.leader_term.cmp(&left.leader_term))
+        });
+        candidates.dedup_by(|left, right| {
+            left.membership_epoch == right.membership_epoch
+                && left.leader_node_id == right.leader_node_id
+        });
+        let mut forwards = tokio::task::JoinSet::new();
+        for record in candidates.into_iter().take(3) {
+            if record.leader_node_id.is_empty() || record.leader_node_id == self.node_identity {
+                continue;
+            }
+            let Some(peer) = network.peer_address(&record.leader_node_id).await else {
+                continue;
+            };
+            let network = network.clone();
+            let request = proto::NamespaceForwardRequest {
+                context: Some(proto::NamespaceRpcContext {
+                    namespace_id: namespace_id.to_string(),
+                    namespace_protocol_version: 1,
+                    membership_epoch: record.membership_epoch,
+                    term: record.leader_term,
+                    sender_identity: self.node_identity.clone(),
+                    request_id: String::new(),
+                }),
+                command_json: command_json.to_vec(),
+                application_guard_json: application_guard_json.to_vec(),
+            };
+            forwards.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    network.namespace_forward(peer, request),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            });
+        }
+        while let Some(result) = forwards.join_next().await {
+            if let Ok(Some(response)) = result
+                && let Ok(result) = serde_json::from_slice(&response.response_json)
+            {
+                forwards.abort_all();
+                return Some(result);
+            }
+        }
+        None
     }
 
     pub async fn announce_group(&self, namespace_id: &NamespaceId) -> Result<(), ConsensusError> {
@@ -6112,6 +6404,105 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    /// Cadence-persist crash contract: the full state persists every
+    /// `STATE_PERSIST_CADENCE_ENTRIES` applies, so a crash loses at most that
+    /// many applied entries of durable state — and replaying the same raft
+    /// entries (what openraft does from `save_committed` on restart)
+    /// reconverges the state machine and its publication intents exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_before_cadence_persist_replays_to_identical_state() {
+        use openraft::CommittedLeaderId;
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
+        );
+        let data_store = ConsensusDataStore::new(MemoryDataBackend::default());
+        let created = create_namespace(
+            &data_store,
+            descriptor(1),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let bundle = StorageBundle::open(
+            metadata.clone(),
+            &created.namespace_id,
+            created.state.clone(),
+            data_store.clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        let mut state_machine = bundle.state_machine.clone();
+        let mut applied_commands = Vec::new();
+        for index in 1..=5u64 {
+            let base = state_machine.namespace_state().await;
+            let command = put_command(&base, &format!("replay-{index}"), &format!("key-{index}"));
+            applied_commands.push((index, command.clone()));
+            let entry = Entry::<TypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, raft_node_id("node-a")), index),
+                payload: EntryPayload::Normal(ConsensusCommandBatch {
+                    commands: vec![command],
+                }),
+            };
+            let responses = state_machine.apply([entry]).await.unwrap();
+            assert!(responses[0].responses[0].error.is_none());
+        }
+        let live_state = state_machine.namespace_state().await;
+        assert_eq!(
+            live_state.current_revision,
+            created.state.current_revision + 5
+        );
+        let live_pending = {
+            let read = metadata.database().begin_read().unwrap();
+            let table = read
+                .open_table(pepper_metadata::NAMESPACE_PUBLICATION_INTENTS)
+                .unwrap();
+            table.iter().unwrap().count()
+        };
+        assert!(live_pending > 0, "intents must be durable per apply");
+
+        // Crash: drop without any further persist. Five applies stay below the
+        // cadence, so the durable state must still be the initial one.
+        drop(state_machine);
+        drop(bundle);
+        let reopened = StorageBundle::open(
+            metadata.clone(),
+            &created.namespace_id,
+            created.state.clone(),
+            data_store,
+            1024 * 1024,
+        )
+        .unwrap();
+        let mut recovered = reopened.state_machine.clone();
+        let (recovered_applied, _) = recovered.applied_state().await.unwrap();
+        assert_eq!(
+            recovered_applied, None,
+            "durable applied index must lag to the last cadence persist"
+        );
+        assert_eq!(recovered.namespace_state().await, created.state);
+
+        // Replay the same entries (openraft re-applies from save_committed).
+        for (index, command) in applied_commands {
+            let entry = Entry::<TypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, raft_node_id("node-a")), index),
+                payload: EntryPayload::Normal(ConsensusCommandBatch {
+                    commands: vec![command],
+                }),
+            };
+            let responses = recovered.apply([entry]).await.unwrap();
+            assert!(responses[0].responses[0].error.is_none());
+        }
+        let replayed = recovered.namespace_state().await;
+        assert_eq!(
+            replayed, live_state,
+            "replayed state must match the pre-crash state exactly"
+        );
+        let (replayed_applied, _) = recovered.applied_state().await.unwrap();
+        assert_eq!(replayed_applied.map(|log_id| log_id.index), Some(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
