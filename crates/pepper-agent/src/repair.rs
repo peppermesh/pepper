@@ -2309,7 +2309,7 @@ pub(super) fn spawn_repair_loop(state: AppState) {
         // backed-off cadence.
         let mut idle_passes = 0u32;
         loop {
-            match run_repair_once(&state).await {
+            match run_repair_once(&state, false).await {
                 Ok(()) => {
                     if REPAIR_LAST_PASS_DISPATCHED.swap(0, Ordering::AcqRel) > 0 {
                         idle_passes = 0;
@@ -2368,7 +2368,10 @@ pub(super) async fn healthy_provider_node_ids(
     healthy
 }
 
-pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
+pub(super) async fn run_repair_once(
+    state: &AppState,
+    force_coordinator: bool,
+) -> Result<(), ApiError> {
     let _repair_permit = state
         .repair_semaphore
         .acquire()
@@ -2548,7 +2551,11 @@ pub(super) async fn run_repair_once(state: &AppState) -> Result<(), ApiError> {
         if healthy_nodes.len() >= desired_replication {
             continue;
         }
-        if repair_coordinator != Some(&state.status.node_id) {
+        // The coordinator election deduplicates the periodic background
+        // sweeps; an explicit admin trigger is an operator asking THIS node
+        // to repair now, and replica puts are idempotent, so it proceeds
+        // regardless of which healthy node would coordinate.
+        if !force_coordinator && repair_coordinator != Some(&state.status.node_id) {
             continue;
         }
 
@@ -2993,7 +3000,7 @@ pub(super) async fn reconstruct_erasure_shards(
 pub(super) async fn run_repair(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    run_repair_once(&state).await?;
+    run_repair_once(&state, true).await?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
