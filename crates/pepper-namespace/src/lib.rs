@@ -23,6 +23,7 @@ use thiserror::Error;
 const DESCRIPTOR_TYPE: &str = "pepper.namespace_descriptor";
 const COMMIT_TYPE: &str = "pepper.namespace_commit";
 const CHECKPOINT_TYPE: &str = "pepper.namespace_checkpoint";
+const CHECKPOINT_SEGMENTS_TYPE: &str = "pepper.namespace_checkpoint_segments";
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1683,10 +1684,51 @@ fn prune_idempotency(state: &mut NamespaceState, limit: usize) {
     }
 }
 
+/// Upper bound for one stored checkpoint block. Namespace state grows without
+/// bound (history, idempotency records), so checkpoints larger than this are
+/// split into segment blocks referenced by a manifest — a single oversized
+/// block would exceed `max_block_bytes` and fail the Raft snapshot, which
+/// openraft treats as fatal. Kept safely below every deployed block limit.
+const CHECKPOINT_SEGMENT_MAX_BYTES: usize = 3 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NamespaceCheckpointSegments {
+    #[serde(rename = "type")]
+    checkpoint_type: String,
+    version: u32,
+    total_bytes: u64,
+    segments: Vec<Cid>,
+    created_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckpointHeader {
+    #[serde(rename = "type")]
+    checkpoint_type: String,
+}
+
 pub async fn write_checkpoint<S>(
     store: &S,
     state: &NamespaceState,
     created_at_unix_seconds: i64,
+) -> Result<Cid, NamespaceError>
+where
+    S: NamespaceStore + ?Sized,
+{
+    write_checkpoint_with_segment_limit(
+        store,
+        state,
+        created_at_unix_seconds,
+        CHECKPOINT_SEGMENT_MAX_BYTES,
+    )
+    .await
+}
+
+async fn write_checkpoint_with_segment_limit<S>(
+    store: &S,
+    state: &NamespaceState,
+    created_at_unix_seconds: i64,
+    segment_limit: usize,
 ) -> Result<Cid, NamespaceError>
 where
     S: NamespaceStore + ?Sized,
@@ -1702,10 +1744,26 @@ where
         state: state.clone(),
         created_at_unix_seconds,
     };
+    let bytes = canonical_bytes(&checkpoint)?;
+    if bytes.len() <= segment_limit {
+        return put_canonical(store, CODEC_NAMESPACE_CHECKPOINT, bytes).await;
+    }
+    let total_bytes = bytes.len() as u64;
+    let mut segments = Vec::with_capacity(bytes.len().div_ceil(segment_limit));
+    for chunk in bytes.chunks(segment_limit) {
+        segments.push(put_canonical(store, CODEC_NAMESPACE_CHECKPOINT, chunk.to_vec()).await?);
+    }
+    let manifest = NamespaceCheckpointSegments {
+        checkpoint_type: CHECKPOINT_SEGMENTS_TYPE.to_string(),
+        version: FORMAT_VERSION,
+        total_bytes,
+        segments,
+        created_at_unix_seconds,
+    };
     put_canonical(
         store,
         CODEC_NAMESPACE_CHECKPOINT,
-        canonical_bytes(&checkpoint)?,
+        canonical_bytes(&manifest)?,
     )
     .await
 }
@@ -1733,6 +1791,43 @@ where
             "checkpoint CID mismatch".to_string(),
         ));
     }
+    // Large checkpoints are stored as a segment manifest; reassemble the
+    // canonical bytes before the strict decode below verifies them whole.
+    let payload = match serde_json::from_slice::<CheckpointHeader>(&payload) {
+        Ok(header) if header.checkpoint_type == CHECKPOINT_SEGMENTS_TYPE => {
+            let manifest: NamespaceCheckpointSegments = decode_canonical(&payload)?;
+            if manifest.version != FORMAT_VERSION {
+                return Err(NamespaceError::InvalidPayload(
+                    "unsupported checkpoint manifest".to_string(),
+                ));
+            }
+            let mut assembled =
+                Vec::with_capacity(usize::try_from(manifest.total_bytes).unwrap_or(0));
+            for segment_cid in &manifest.segments {
+                let segment =
+                    store
+                        .get(segment_cid)
+                        .await
+                        .map_err(|message| NamespaceError::Read {
+                            cid: segment_cid.to_string(),
+                            message,
+                        })?;
+                if !segment_cid.verify(&segment) {
+                    return Err(NamespaceError::InvalidPayload(
+                        "checkpoint segment CID mismatch".to_string(),
+                    ));
+                }
+                assembled.extend_from_slice(&segment);
+            }
+            if assembled.len() as u64 != manifest.total_bytes {
+                return Err(NamespaceError::InvalidPayload(
+                    "checkpoint segments do not reassemble to the recorded size".to_string(),
+                ));
+            }
+            assembled
+        }
+        _ => payload,
+    };
     let checkpoint: NamespaceCheckpoint = decode_canonical(&payload)?;
     if checkpoint.checkpoint_type != CHECKPOINT_TYPE || checkpoint.version != FORMAT_VERSION {
         return Err(NamespaceError::InvalidPayload(
@@ -2139,6 +2234,56 @@ mod tests {
     // relies on: a transaction built against an older base still rebases onto
     // the current root and enforces per-key preconditions against the CURRENT
     // state, so a cached (non-linearizable) base at the ingress stays correct.
+
+    #[tokio::test]
+    async fn oversized_checkpoint_roundtrips_through_segments() {
+        let store = MemoryStore::default();
+        let created = create_namespace(
+            &store,
+            descriptor(),
+            NamespaceLimits::default(),
+            MerkleLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut machine = NamespaceStateMachine::new(store, created.state).unwrap();
+        machine
+            .apply(put_command(
+                machine.state(),
+                "r1",
+                "alpha",
+                "va",
+                KeyPrecondition::Absent,
+                10,
+            ))
+            .await
+            .unwrap();
+        let state = machine.state().clone();
+        let store = machine.store();
+        // A tiny segment limit forces the manifest path without building a
+        // multi-megabyte state in the test.
+        let cid = write_checkpoint_with_segment_limit(store, &state, 10, 64)
+            .await
+            .unwrap();
+        let manifest_payload = store.get(&cid).await.unwrap();
+        let header: CheckpointHeader = serde_json::from_slice(&manifest_payload).unwrap();
+        assert_eq!(header.checkpoint_type, CHECKPOINT_SEGMENTS_TYPE);
+        let loaded = load_checkpoint(store, &cid, NamespaceLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(loaded, state);
+        // Small checkpoints keep the legacy single-block representation.
+        let inline_cid = write_checkpoint(store, &state, 10).await.unwrap();
+        let inline_payload = store.get(&inline_cid).await.unwrap();
+        let header: CheckpointHeader = serde_json::from_slice(&inline_payload).unwrap();
+        assert_eq!(header.checkpoint_type, CHECKPOINT_TYPE);
+        assert_eq!(
+            load_checkpoint(store, &inline_cid, NamespaceLimits::default())
+                .await
+                .unwrap(),
+            state
+        );
+    }
 
     #[tokio::test]
     async fn stale_base_disjoint_key_transactions_rebase_and_apply() {
