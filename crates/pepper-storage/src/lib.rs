@@ -2869,6 +2869,22 @@ fn read_native_raw_block_range(
     )))
 }
 
+/// Maximum non-payload overhead of a stored block file (envelope header, CID
+/// text, and checksum table) for blocks within the workspace block limit.
+/// External auditors add this to the logical size when bounding file reads.
+pub const BLOCK_FILE_OVERHEAD_MAX_BYTES: u64 = BLOCK_ENVELOPE_MAX_BYTES;
+
+/// Decode a stored block file image back to its logical bytes, verifying the
+/// envelope, the per-chunk checksums, and the content address. Test harnesses
+/// use this to audit on-disk replicas without assuming the physical encoding.
+pub fn decode_stored_block(
+    stored: &[u8],
+    expected_cid: &Cid,
+    max_logical_bytes: u64,
+) -> Result<Vec<u8>, StorageError> {
+    decode_block_bytes(stored, expected_cid, max_logical_bytes, None)
+}
+
 fn verify_file(path: &Path, cid: &Cid, max_bytes: u64) -> Result<bool, StorageError> {
     if !path.exists() {
         return Ok(false);

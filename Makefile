@@ -192,6 +192,23 @@ s3-bench-replicated:
 s3-bench-replicated-full:
 	PROFILE=replicated SCALE=full bash benchmarks/pepper-parity/run-s3-parity.sh
 
+# ---- System suites (local) ------------------------------------------------
+#
+# Run the CI nightly/chaos scenario suites locally with the same runner,
+# Docker backend, and day-derived seed scheme. The scenario lists are parsed
+# from the workflow files so local runs cannot drift from CI.
+#   make system-nightly                       # full nightly suite
+#   make system-chaos SCENARIO=RAFT-002       # one scenario
+# Overrides: SCENARIO= SEED= IMAGE= REBUILD=1 (rebuild image from tree)
+
+.PHONY: system-nightly
+system-nightly:
+	bash scripts/run-system-suite.sh nightly $(SCENARIO)
+
+.PHONY: system-chaos
+system-chaos:
+	bash scripts/run-system-suite.sh chaos $(SCENARIO)
+
 # ---- Release --------------------------------------------------------------
 #
 # Four resumable steps driven by scripts/release.sh (state lives in GitHub,

@@ -853,9 +853,19 @@ async fn observe_continuous(
             .find(|node| &node.node_identity == identity)
             && cluster
                 .backend
-                .read_storage_file(&node.id, &relative, bytes.len() + 1)
+                .read_storage_file(
+                    &node.id,
+                    &relative,
+                    bytes.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+                )
                 .await
-                .is_ok_and(|stored| stored == bytes)
+                .is_ok_and(|stored| {
+                    // Stored files carry the block envelope (header + checksum
+                    // table + optional compression); verify by decoding to
+                    // logical bytes rather than comparing the raw file image.
+                    pepper_storage::decode_stored_block(&stored, &receipt.cid, bytes.len() as u64)
+                        .is_ok_and(|logical| logical == bytes)
+                })
         {
             verified += 1;
         }

@@ -741,6 +741,25 @@ pub struct GroupMetadata {
     pub learners: Vec<String>,
     pub status: String,
     pub created_at_unix_seconds: i64,
+    /// Evidence of the most recent replica replacement, captured between the
+    /// blocking learner catch-up and the voter promotion. Replacement is too
+    /// fast for external observers to sample the learner window, so the
+    /// coordinator records the proof instead.
+    #[serde(default)]
+    pub last_replacement: Option<ReplacementAudit>,
+}
+
+/// Catch-up evidence recorded by `replace_replica` at the instant it decides
+/// to promote the learner: the learner's replicated (matched) log index must
+/// have reached the leader's committed index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplacementAudit {
+    pub failed_identity: String,
+    pub replacement_identity: String,
+    pub learner_matched_index: Option<u64>,
+    pub leader_committed_index: Option<u64>,
+    pub caught_up: bool,
+    pub recorded_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2452,6 +2471,7 @@ pub struct NamespaceOperationalStatus {
     pub checkpoint_cid: Option<Cid>,
     pub checkpoint_verified: bool,
     pub running: bool,
+    pub last_replacement: Option<ReplacementAudit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2725,6 +2745,9 @@ impl NamespaceGroupManager {
                 .map_or_else(Vec::new, |metadata| metadata.learners.clone()),
             status: "running".to_string(),
             created_at_unix_seconds: unix_seconds(),
+            last_replacement: previous_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_replacement.clone()),
         };
         write_json_table(&self.metadata, NAMESPACE_GROUPS, &group, &metadata)?;
         let proposal_batcher = ProposalBatcher::new(raft.clone(), self.config.max_command_bytes);
@@ -2789,6 +2812,7 @@ impl NamespaceGroupManager {
             learners: vec![self.node_identity.clone()],
             status: "learner".to_string(),
             created_at_unix_seconds: unix_seconds(),
+            last_replacement: None,
         };
         write_json_table(&self.metadata, NAMESPACE_GROUPS, &group, &metadata)?;
         let persisted = PersistedStateMachine {
@@ -2847,6 +2871,65 @@ impl NamespaceGroupManager {
             .add_learner(replacement_id, BasicNode::new(replacement_identity), true)
             .await
             .map_err(|error| ConsensusError::Raft(error.to_string()))?;
+        // openraft's blocking add_learner only waits until the learner is
+        // within `replication_lag_threshold` (default 1000) entries of the
+        // leader, which for small groups means it can return before the
+        // learner replicated anything. The replacement contract is stricter:
+        // the learner must reach the index that was committed when the
+        // promotion was decided, or the replacement fails.
+        let leader_committed_index = group
+            .log_store
+            .clone()
+            .read_committed()
+            .await
+            .ok()
+            .flatten()
+            .map(|log| log.index);
+        if let Some(target) = leader_committed_index {
+            group
+                .raft
+                .wait(Some(std::time::Duration::from_secs(60)))
+                .metrics(
+                    |metrics| {
+                        metrics
+                            .replication
+                            .as_ref()
+                            .and_then(|replication| replication.get(&replacement_id).copied())
+                            .flatten()
+                            .is_some_and(|log| log.index >= target)
+                    },
+                    "replacement learner catch-up to committed index",
+                )
+                .await
+                .map_err(|error| {
+                    ConsensusError::InvalidReplacement(format!(
+                        "replacement learner did not catch up to committed index {target}: {error}"
+                    ))
+                })?;
+        }
+        // Record the evidence (matched vs committed index) before the
+        // promotion below makes the learner window externally unobservable.
+        let learner_matched_index = {
+            let metrics = group.raft.metrics().borrow().clone();
+            metrics
+                .replication
+                .as_ref()
+                .and_then(|replication| replication.get(&replacement_id).copied())
+                .flatten()
+                .map(|log| log.index)
+        };
+        let replacement_audit = ReplacementAudit {
+            failed_identity: failed_identity.to_string(),
+            replacement_identity: replacement_identity.to_string(),
+            learner_matched_index,
+            leader_committed_index,
+            caught_up: match (learner_matched_index, leader_committed_index) {
+                (Some(matched), Some(committed)) => matched >= committed,
+                (_, None) => true,
+                (None, Some(_)) => false,
+            },
+            recorded_at_unix_seconds: unix_seconds(),
+        };
         let voters = metadata
             .members
             .iter()
@@ -2871,6 +2954,7 @@ impl NamespaceGroupManager {
         metadata.members.sort();
         metadata.learners.clear();
         metadata.membership_epoch = group.membership_epoch.load(Ordering::Acquire);
+        metadata.last_replacement = Some(replacement_audit);
         write_json_table(&self.metadata, NAMESPACE_GROUPS, &key, &metadata)
     }
 
@@ -2927,6 +3011,7 @@ impl NamespaceGroupManager {
                 learners: Vec::new(),
                 status: "recovery_pending".to_string(),
                 created_at_unix_seconds: unix_seconds(),
+                last_replacement: None,
             },
         )?;
         let handle = self.start_group(state.clone(), data_store).await?;
@@ -4416,6 +4501,14 @@ impl NamespaceGroupManager {
                 .await
                 .as_ref()
                 .map(|snapshot| snapshot.pointer.checkpoint_cid.clone());
+            let last_replacement = read_json_table::<GroupMetadata>(
+                &self.metadata,
+                NAMESPACE_GROUPS,
+                &group.namespace_id.to_string(),
+            )
+            .ok()
+            .flatten()
+            .and_then(|metadata| metadata.last_replacement);
             statuses.push(NamespaceOperationalStatus {
                 namespace_id: group.namespace_id.clone(),
                 membership_epoch: group.membership_epoch(),
@@ -4445,6 +4538,7 @@ impl NamespaceGroupManager {
                 checkpoint_verified: checkpoint_cid.is_some(),
                 checkpoint_cid,
                 running: metrics.running_state.is_ok(),
+                last_replacement,
             });
         }
         statuses.sort_by_key(|status| status.namespace_id.to_string());

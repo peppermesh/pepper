@@ -97,6 +97,9 @@ pub(super) async fn json_success_eventually(
     path: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    // Retried statuses are remembered so a timeout reports WHY the endpoint
+    // kept refusing instead of only that it did.
+    let last_retried = std::sync::Mutex::new(None::<(u16, serde_json::Value)>);
     eventually(
         &format!("successful {method} {path}"),
         Duration::from_secs(45),
@@ -106,6 +109,7 @@ pub(super) async fn json_success_eventually(
             if (200..300).contains(&status) {
                 Ok(Some(value))
             } else if matches!(status, 409 | 503) {
+                *last_retried.lock().unwrap() = Some((status, value));
                 Ok(None)
             } else {
                 bail!("{method} {path} returned HTTP {status}: {value}")
@@ -113,6 +117,12 @@ pub(super) async fn json_success_eventually(
         },
     )
     .await
+    .map_err(|error| match last_retried.lock().unwrap().take() {
+        Some((status, value)) => {
+            error.context(format!("last retried response: HTTP {status}: {value}"))
+        }
+        None => error,
+    })
 }
 
 async fn bootstrap_three_nodes(context: &mut ScenarioContext) -> Result<PepperClient> {

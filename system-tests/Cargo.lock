@@ -653,6 +653,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1091,6 +1101,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1408,6 +1429,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pepper-config"
+version = "0.3.0"
+dependencies = [
+ "pepper-types",
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "pepper-dag"
 version = "0.3.0"
 dependencies = [
@@ -1428,6 +1459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-durability"
+version = "0.3.0"
+dependencies = [
+ "pepper-observability",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "pepper-merkle"
 version = "0.3.0"
 dependencies = [
@@ -1438,6 +1478,27 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "pepper-metadata"
+version = "0.3.0"
+dependencies = [
+ "pepper-types",
+ "redb",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "pepper-observability"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1457,6 +1518,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pepper-storage"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "fs2",
+ "hex",
+ "io-uring",
+ "libc",
+ "pepper-config",
+ "pepper-durability",
+ "pepper-metadata",
+ "pepper-observability",
+ "pepper-types",
+ "redb",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "pepper-system-tests"
 version = "0.3.0"
 dependencies = [
@@ -1473,6 +1557,7 @@ dependencies = [
  "kafka-protocol",
  "libc",
  "pepper-sqlite",
+ "pepper-storage",
  "pepper-types",
  "reqwest",
  "rusqlite",
@@ -1641,6 +1726,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2376,7 +2470,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

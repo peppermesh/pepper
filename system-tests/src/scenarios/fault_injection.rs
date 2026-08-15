@@ -243,7 +243,11 @@ impl Scenario for StorageFaultScenario {
         let relative = storage_relative_path(&receipt.cid).display().to_string();
         let original = cluster
             .backend
-            .read_storage_file(&victim.id, relative.as_ref(), payload.len() + 1)
+            .read_storage_file(
+                &victim.id,
+                relative.as_ref(),
+                payload.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+            )
             .await?;
 
         let delete = cluster
@@ -257,7 +261,11 @@ impl Scenario for StorageFaultScenario {
         ensure!(
             cluster
                 .backend
-                .read_storage_file(&victim.id, relative.as_ref(), payload.len() + 1)
+                .read_storage_file(
+                    &victim.id,
+                    relative.as_ref(),
+                    payload.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+                )
                 .await
                 .is_err(),
             "delete fault did not activate"
@@ -266,7 +274,11 @@ impl Scenario for StorageFaultScenario {
         ensure!(
             cluster
                 .backend
-                .read_storage_file(&victim.id, relative.as_ref(), payload.len() + 1)
+                .read_storage_file(
+                    &victim.id,
+                    relative.as_ref(),
+                    payload.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+                )
                 .await?
                 == original
         );
@@ -282,7 +294,11 @@ impl Scenario for StorageFaultScenario {
         ensure!(
             cluster
                 .backend
-                .read_storage_file(&victim.id, relative.as_ref(), payload.len() + 1)
+                .read_storage_file(
+                    &victim.id,
+                    relative.as_ref(),
+                    payload.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+                )
                 .await?
                 != original,
             "corruption fault did not activate"
@@ -291,7 +307,11 @@ impl Scenario for StorageFaultScenario {
         ensure!(
             cluster
                 .backend
-                .read_storage_file(&victim.id, relative.as_ref(), payload.len() + 1)
+                .read_storage_file(
+                    &victim.id,
+                    relative.as_ref(),
+                    payload.len() + pepper_storage::BLOCK_FILE_OVERHEAD_MAX_BYTES as usize,
+                )
                 .await?
                 == original
         );
