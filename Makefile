@@ -192,6 +192,38 @@ s3-bench-replicated:
 s3-bench-replicated-full:
 	PROFILE=replicated SCALE=full bash benchmarks/pepper-parity/run-s3-parity.sh
 
+# ---- Release --------------------------------------------------------------
+#
+# Four resumable steps driven by scripts/release.sh (state lives in GitHub,
+# keyed by the RC commit — every step can be re-run safely):
+#   make release-candidate VERSION=0.3.0   # push release/v0.3.0, launch suites
+#   make release-status    VERSION=0.3.0   # one-line status per suite
+#   make release-qualify   VERSION=0.3.0   # wait for suites, run qualification
+#   make release-publish   VERSION=0.3.0   # tag + draft prerelease with report
+# Overrides: COMMIT= (RC commit), SOAK_DURATION= (seconds), NOTES_DIR=
+
+RELEASE_VERSION_REQUIRED = @test -n "$(VERSION)" || { echo "set VERSION=<x.y.z>"; exit 2; }
+
+.PHONY: release-candidate
+release-candidate:
+	$(RELEASE_VERSION_REQUIRED)
+	bash scripts/release.sh candidate $(VERSION)
+
+.PHONY: release-status
+release-status:
+	$(RELEASE_VERSION_REQUIRED)
+	bash scripts/release.sh status $(VERSION)
+
+.PHONY: release-qualify
+release-qualify:
+	$(RELEASE_VERSION_REQUIRED)
+	bash scripts/release.sh qualify $(VERSION)
+
+.PHONY: release-publish
+release-publish:
+	$(RELEASE_VERSION_REQUIRED)
+	bash scripts/release.sh publish $(VERSION)
+
 # ---- Docker ---------------------------------------------------------------
 
 .PHONY: docker-image

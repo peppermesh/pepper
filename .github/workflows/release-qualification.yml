@@ -8,6 +8,9 @@ on:
       release_commit:
         description: "Exact release-candidate Git commit"
         required: true
+      version:
+        description: "Release version being qualified (e.g. 0.3.0)"
+        required: true
       smoke_run_id:
         description: "Successful system-smoke workflow run ID"
         required: true
@@ -72,7 +75,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: pepper-0.3.0-qualification-${{ inputs.release_commit }}
+          name: pepper-${{ inputs.version }}-qualification-${{ inputs.release_commit }}
           path: qualification-report/
           if-no-files-found: error
           retention-days: 90
