@@ -476,7 +476,27 @@ fn sqlite_error(error: SqliteError) -> ApiError {
                 error.to_string(),
             )
         }
-        SqliteError::Storage(message) => ApiError::internal(message),
+        SqliteError::Storage(message) => {
+            // The store trait erases HTTP classification to a string, so
+            // transient replication/routing conditions must be recognized
+            // here: they are retriable 503s, not internal errors. A 500
+            // aborts callers (and CI soak retries) that would have succeeded
+            // moments later once the slow replica or re-elected leader
+            // recovered.
+            if message.contains("durability was not met")
+                || message.contains("leader unavailable")
+                || message.contains("deadline exceeded")
+                || message.contains("Unavailable")
+            {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::Unavailable,
+                    message,
+                )
+            } else {
+                ApiError::internal(message)
+            }
+        }
         _ => ApiError::bad_request(error.to_string()),
     }
 }

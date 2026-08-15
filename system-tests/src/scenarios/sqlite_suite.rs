@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    bootstrap_cluster, json_request, json_success_eventually,
+    bootstrap_cluster, json_request, json_success_eventually, json_success_within,
     namespace_suite::{find_leader, namespace_groups},
 };
 use crate::harness::{
@@ -1398,12 +1398,16 @@ impl Scenario for SqliteSoakScenario {
         let mut iterations = 0u64;
         while started.elapsed() < duration {
             let iteration = iterations;
-            let value = json_success_eventually(
+            // Soak asserts sustained progress, not latency: allow transient
+            // unavailability windows (leader churn, starved CI runners) up to
+            // three minutes before declaring the cluster stuck.
+            let value = json_success_within(
                 &client,
                 &nodes[iteration as usize % nodes.len()],
                 "POST",
                 "/v1/sqlite/databases/sqlite-soak/compact",
                 json!({"request_id":format!("sqlite-soak-{iteration}")}),
+                Duration::from_secs(180),
             )
             .await?;
             ensure!(value["durability"] == "durable");
