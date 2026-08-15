@@ -97,12 +97,23 @@ pub(super) async fn json_success_eventually(
     path: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    json_success_within(client, node, method, path, body, Duration::from_secs(45)).await
+}
+
+pub(super) async fn json_success_within(
+    client: &PepperClient,
+    node: &crate::harness::cluster::NodeRuntime,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
     // Retried statuses are remembered so a timeout reports WHY the endpoint
     // kept refusing instead of only that it did.
     let last_retried = std::sync::Mutex::new(None::<(u16, serde_json::Value)>);
     eventually(
         &format!("successful {method} {path}"),
-        Duration::from_secs(45),
+        timeout,
         Duration::from_millis(250),
         || async {
             let (status, value) = json_request(client, node, method, path, body.clone()).await?;
