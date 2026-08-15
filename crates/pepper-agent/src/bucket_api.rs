@@ -251,6 +251,19 @@ pub(super) async fn bucket_put(
                 )
             })
         })
+        .or_else(|| {
+            // Native clusters without the S3 catalog never install an
+            // authoritative placement map; fall back to the legacy epoch-1
+            // replicated reference, matching the block put path (readers
+            // resolve epoch-1 references via providers when no map exists).
+            state.s3.is_none().then(|| {
+                PlacementReference::replicated(
+                    1,
+                    request.content_cid.clone(),
+                    state.replication_factor as u16,
+                )
+            })
+        })
         .ok_or_else(|| {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -395,11 +408,18 @@ pub(super) async fn bucket_put(
         {
             preverified_durability.push(receipt);
         } else {
+            // ensure_durable (not ensure_at_placement directly): clusters
+            // without an authoritative placement map take its legacy
+            // durability path instead of failing the epoch lookup.
             preverified_durability.push(
-                AgentDurabilityBackend(state.clone())
-                    .ensure_at_placement(&request.content_cid, required, content_placement.clone())
-                    .await
-                    .map_err(publication_error)?,
+                pepper_publication::DurabilityBackend::ensure_durable(
+                    &AgentDurabilityBackend(state.clone()),
+                    &request.content_cid,
+                    required,
+                    Some(content_placement),
+                )
+                .await
+                .map_err(publication_error)?,
             );
         }
     }

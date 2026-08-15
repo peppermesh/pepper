@@ -2403,6 +2403,7 @@ async fn put_replicated_block_with_placement_map(
     let mut replica_writes = stream::iter(writes).buffered(8);
     let replica_transfer_started = time::Instant::now();
 
+    let mut provider_records = Vec::new();
     while let Some((node_id, result)) = replica_writes.next().await {
         match result {
             Ok(ack) => {
@@ -2411,7 +2412,13 @@ async fn put_replicated_block_with_placement_map(
                         metrics::PLACEMENT_DIRECT_TARGET_BYTES
                             .fetch_add(local_put.size, Ordering::Relaxed);
                         replica_nodes.push(node_id.clone());
-                        let _ = record;
+                        // Provider records are discovery metadata, not
+                        // durability credit: persistence failures degrade
+                        // lookups but must not fail an acknowledged write.
+                        if let Err(error) = state.network.persist_provider_record(&record) {
+                            warn!(%error, node_id = %node_id, "provider record persistence failed");
+                        }
+                        provider_records.push(record);
                     }
                     Err(error) => warn!(
                         node_id = %node_id,
@@ -2451,6 +2458,21 @@ async fn put_replicated_block_with_placement_map(
             ),
         ));
     }
+    // Every accepted replica advertises a provider record so peers that are
+    // not authoritative owners can resolve the block (provider-fallback
+    // reads). The batch announcement fans out concurrently and its failures
+    // only degrade discovery, never the durability already established above.
+    if local_selected {
+        let record = state.network.local_provider_record(&local_put.cid);
+        if let Err(error) = state.network.persist_provider_record(&record) {
+            warn!(%error, "local provider record persistence failed");
+        }
+        provider_records.push(record);
+    }
+    state
+        .network
+        .announce_providers_to_peers(&provider_records)
+        .await;
     observe_current_stage(OperationStage::Durability);
     let status = "durable".to_string();
     let placement = match placement {

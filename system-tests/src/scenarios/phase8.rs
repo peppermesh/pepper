@@ -215,14 +215,36 @@ impl Scenario for LearnerReplacementScenario {
                     .as_u64()
                     .unwrap_or_default()
         );
+        // The learner window is too fast to witness reliably by sampling, so
+        // the promotion decision itself records catch-up evidence: the
+        // coordinator captures the learner's matched index against the
+        // leader's committed index between the blocking add_learner and the
+        // membership change. Assert that recorded proof; keep the sampled
+        // observations as best-effort corroboration.
+        let coordinator_group = namespace_groups(&client, &cluster.node(&leader)?.clone())
+            .await?
+            .into_iter()
+            .find(|group| group["namespace_id"].as_str() == Some(namespace.as_str()))
+            .context("coordinator group missing")?;
+        let audit = &coordinator_group["last_replacement"];
         ensure!(
-            saw_learner,
-            "replacement was never observed as a learner before promotion"
+            audit["replacement_identity"].as_str() == Some(replacement.node_identity.as_str()),
+            "replacement audit missing or for the wrong node: {audit}"
         );
         ensure!(
-            saw_caught_up_learner,
-            "learner was not observed caught up before promotion"
+            audit["caught_up"].as_bool() == Some(true),
+            "learner was promoted without recorded catch-up: {audit}"
         );
+        context.run.events.record(
+            "observation",
+            json!({
+                "details": {
+                    "sampled_learner": saw_learner,
+                    "sampled_caught_up_learner": saw_caught_up_learner,
+                    "replacement_audit": audit,
+                }
+            }),
+        )?;
 
         // Heal the process fault, then retire the removed replica so it cannot
         // run as a fourth voter after committed membership has changed.
