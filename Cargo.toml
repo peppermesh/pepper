@@ -66,7 +66,7 @@ getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
-libsqlite3-sys = { version = "=0.38.1", features = ["bundled"] }
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled"] }
 io-uring = "0.7.13"
 crc32c = "0.6"
 crc32fast = "1.5"
