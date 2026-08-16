@@ -1429,6 +1429,36 @@ async fn run_agent(loaded: LoadedConfig) -> Result<()> {
     initialize_repair_inventory_tables(&state).map_err(|error| anyhow::anyhow!(error.message))?;
     spawn_repair_loop(state.clone());
     spawn_publication_reconciler(state.clone());
+    // jemalloc retains freed dirty pages far beyond its decay target under
+    // sustained mixed-size churn (metadata store, replication buffers),
+    // which reads as unbounded RSS growth inside memory-limited containers.
+    // A periodic full-arena purge returns those pages to the kernel; the
+    // call costs single-digit milliseconds and bounds the steady state.
+    tokio::spawn(async {
+        // MALLCTL_ARENAS_ALL as defined by jemalloc.
+        const ARENAS_ALL: &[u8] = b"arena.4096.purge\0";
+        let mut interval = time::interval(Duration::from_secs(120));
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let result = tokio::task::spawn_blocking(|| unsafe {
+                // Void mallctl command: no old/new value buffers.
+                tikv_jemalloc_sys::mallctl(
+                    ARENAS_ALL.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            })
+            .await;
+            if let Ok(code) = result
+                && code != 0
+            {
+                warn!(code, "jemalloc arena purge failed");
+            }
+        }
+    });
     spawn_s3_lifecycle_reconciler(state.clone());
     spawn_s3_placement_refresh_loop(state.clone());
     spawn_small_object_pack_loop(state.clone());
@@ -4173,6 +4203,22 @@ fn proto_transfer_bytes(
     })
 }
 
+/// Trigger a jemalloc heap-profile dump on demand. Requires the process to
+/// run with `MALLOC_CONF=prof:true` (the profiling-enabled allocator build);
+/// otherwise the mallctl call reports an error. The dump lands at the
+/// configured `prof_prefix` path and the response echoes jemalloc's result.
+async fn heap_dump(State(_state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    // Safety: "prof.dump\0" is a valid null-terminated mallctl name and a
+    // null pointer selects the default (prof_prefix-derived) dump path.
+    let result = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", std::ptr::null::<u8>()) };
+    match result {
+        Ok(()) => Ok(Json(serde_json::json!({"status": "dumped"}))),
+        Err(error) => Err(ApiError::internal(format!(
+            "jemalloc prof.dump failed (is MALLOC_CONF=prof:true set?): {error}"
+        ))),
+    }
+}
+
 async fn run_gc(
     State(state): State<AppState>,
     Query(query): Query<GcQuery>,
@@ -5517,8 +5563,11 @@ async fn put_object_stream_receipts(
     body: Body,
 ) -> Result<ObjectWriteReceipts, ApiError> {
     let mut body_stream = body.into_data_stream();
-    metrics::observe_payload_allocation(OBJECT_CHUNK_SIZE);
-    let mut pending = Vec::with_capacity(OBJECT_CHUNK_SIZE);
+    // Grow the pending chunk with the data instead of pre-allocating a full
+    // OBJECT_CHUNK_SIZE buffer: most objects (sqlite page packs, descriptors)
+    // are a few KiB, and a 4 MiB allocation per put churns allocator arenas
+    // until small-memory nodes hit their container limit.
+    let mut pending = Vec::new();
     let mut transfers = stream::FuturesOrdered::new();
     let mut chunks = Vec::new();
     let mut block_receipts = Vec::new();
@@ -5549,8 +5598,7 @@ async fn put_object_stream_receipts(
             remaining = &remaining[take..];
             if pending.len() == OBJECT_CHUNK_SIZE {
                 metrics::observe_payload_allocation(OBJECT_CHUNK_SIZE);
-                let payload =
-                    std::mem::replace(&mut pending, Vec::with_capacity(OBJECT_CHUNK_SIZE));
+                let payload = std::mem::take(&mut pending);
                 transfers.push_back(put_object_chunk(state, payload, next_chunk_offset));
                 next_chunk_offset += OBJECT_CHUNK_SIZE as u64;
                 if transfers.len() >= pipeline_depth {

@@ -198,7 +198,7 @@ async fn bootstrap_cluster(
                 command: vec!["pepper".to_string(), "--help".to_string()],
                 stdin: Vec::new(),
                 timeout_seconds: 5,
-                max_output_bytes: 4096,
+                max_output_bytes: 64 * 1024,
             },
         )
         .await?;

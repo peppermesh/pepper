@@ -62,6 +62,8 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3.23"
 tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

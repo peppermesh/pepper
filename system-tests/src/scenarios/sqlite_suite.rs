@@ -46,6 +46,12 @@ fn requirements() -> ScenarioRequirements {
 async fn bootstrap(context: &mut ScenarioContext) -> Result<PepperClient> {
     let mut spec = ClusterSpec::three_node(context.run.seed);
     spec.sqlite_enabled = true;
+    // The bounded soak drives compactions at maximum rate for hours; the
+    // metadata cache, allocator bookkeeping, and page-cache working set need
+    // more headroom than the default functional-test budget.
+    for node in &mut spec.nodes {
+        node.resources.memory_bytes = 1024 * 1024 * 1024;
+    }
     bootstrap_cluster(context, spec).await
 }
 

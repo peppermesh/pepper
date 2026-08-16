@@ -493,6 +493,13 @@ pub trait ProtectionBackend: Send + Sync + 'static {
     }
 }
 
+/// How long a stored durability receipt can satisfy `durable_receipt`.
+/// The window only needs to span client retry horizons; sizing it in hours
+/// made the receipt table and its in-memory cache scale with sustained
+/// commit rate (tens of MB per node in the CI soak) instead of with recent
+/// activity.
+const RECEIPT_REUSE_WINDOW_SECONDS: i64 = 10 * 60;
+
 #[derive(Clone)]
 pub struct PublicationRepository {
     metadata: Arc<MetadataStore>,
@@ -550,7 +557,10 @@ impl PublicationRepository {
         let stale: Vec<String> =
             read_all::<StoredDurabilityReceipt>(&self.metadata, NAMESPACE_DURABILITY_RECEIPTS)?
                 .into_iter()
-                .filter(|record| record.verified_at_unix_seconds < now.saturating_sub(60 * 60))
+                .filter(|record| {
+                    record.verified_at_unix_seconds
+                        < now.saturating_sub(RECEIPT_REUSE_WINDOW_SECONDS)
+                })
                 .map(|record| {
                     format!(
                         "{}|{}|{}",
@@ -892,7 +902,8 @@ impl PublicationRepository {
                     .is_none_or(|expected| record.receipt.placement.as_ref() == Some(expected))
                 && record.receipt.replicas_accepted >= required
                 && record.receipt.status == "durable"
-                && record.verified_at_unix_seconds >= now.saturating_sub(60 * 60)
+                && record.verified_at_unix_seconds
+                    >= now.saturating_sub(RECEIPT_REUSE_WINDOW_SECONDS)
         };
         {
             let recent = self
@@ -982,7 +993,7 @@ impl PublicationRepository {
             .map(|record| record.verified_at_unix_seconds)
             .max()
             .unwrap_or(0)
-            .saturating_sub(60 * 60);
+            .saturating_sub(RECEIPT_REUSE_WINDOW_SECONDS);
         recent.retain(|_, record| record.verified_at_unix_seconds >= horizon);
         Ok(())
     }
