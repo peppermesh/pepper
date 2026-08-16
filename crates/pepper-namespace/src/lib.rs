@@ -1986,6 +1986,17 @@ impl DagCodecHandler for NamespaceCheckpointCodecHandler {
     }
 
     fn links(&self, payload: &[u8], _limits: &TraversalLimits) -> Result<Vec<Cid>, DagError> {
+        // Oversized checkpoints are stored as a segment manifest whose links
+        // are the segment blocks; the segments themselves are byte fragments
+        // of the canonical checkpoint and carry no links of their own.
+        match serde_json::from_slice::<CheckpointHeader>(payload) {
+            Ok(header) if header.checkpoint_type == CHECKPOINT_SEGMENTS_TYPE => {
+                let manifest: NamespaceCheckpointSegments = decode_for_dag(payload, self.codec())?;
+                return Ok(manifest.segments);
+            }
+            Ok(_) => {}
+            Err(_) => return Ok(Vec::new()),
+        }
         let checkpoint: NamespaceCheckpoint = decode_for_dag(payload, self.codec())?;
         if checkpoint.checkpoint_type != CHECKPOINT_TYPE || checkpoint.version != FORMAT_VERSION {
             return Err(DagError::InvalidPayload {
@@ -2272,6 +2283,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded, state);
+        // GC traversal must see the manifest's segments as links and treat
+        // the segment fragments themselves as leaves.
+        let handler = NamespaceCheckpointCodecHandler;
+        let manifest_links = handler
+            .links(&manifest_payload, &TraversalLimits::default())
+            .unwrap();
+        assert!(!manifest_links.is_empty());
+        for segment_cid in &manifest_links {
+            let segment_payload = store.get(segment_cid).await.unwrap();
+            assert!(
+                handler
+                    .links(&segment_payload, &TraversalLimits::default())
+                    .unwrap()
+                    .is_empty(),
+                "checkpoint segments are traversal leaves"
+            );
+        }
         // Small checkpoints keep the legacy single-block representation.
         let inline_cid = write_checkpoint(store, &state, 10).await.unwrap();
         let inline_payload = store.get(&inline_cid).await.unwrap();
