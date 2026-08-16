@@ -491,6 +491,15 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
          # HELP pepper_explicit_payload_allocated_bytes_total Capacity bytes requested by reviewed explicit payload-buffer allocations.\n\
          # TYPE pepper_explicit_payload_allocated_bytes_total counter\n\
          pepper_explicit_payload_allocated_bytes_total {}\n\
+         # HELP pepper_jemalloc_allocated_bytes Live bytes allocated by the application.\n\
+         # TYPE pepper_jemalloc_allocated_bytes gauge\n\
+         pepper_jemalloc_allocated_bytes {}\n\
+         # HELP pepper_jemalloc_resident_bytes Physical memory retained by the allocator.\n\
+         # TYPE pepper_jemalloc_resident_bytes gauge\n\
+         pepper_jemalloc_resident_bytes {}\n\
+         # HELP pepper_jemalloc_metadata_bytes Allocator-internal metadata, never returned to the OS.\n\
+         # TYPE pepper_jemalloc_metadata_bytes gauge\n\
+         pepper_jemalloc_metadata_bytes {}\n\
          # HELP pepper_explicit_payload_copy_operations_total Reviewed explicit payload copy operations.\n\
          # TYPE pepper_explicit_payload_copy_operations_total counter\n\
          pepper_explicit_payload_copy_operations_total {}\n\
@@ -576,6 +585,9 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         publication_phases.raft_publication_observations,
         EXPLICIT_PAYLOAD_ALLOCATIONS.load(Ordering::Relaxed),
         EXPLICIT_PAYLOAD_ALLOCATED_BYTES.load(Ordering::Relaxed),
+        jemalloc_stat(b"stats.allocated\0"),
+        jemalloc_stat(b"stats.resident\0"),
+        jemalloc_stat(b"stats.metadata\0"),
         EXPLICIT_PAYLOAD_COPY_OPERATIONS.load(Ordering::Relaxed),
         EXPLICIT_PAYLOAD_COPY_BYTES.load(Ordering::Relaxed),
         SHARED_PAYLOAD_REFERENCES.load(Ordering::Relaxed),
@@ -1309,4 +1321,13 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
     }
     body.push_str(&pepper_observability::process_metrics().render_prometheus());
     body.into_response()
+}
+
+/// Read a jemalloc size statistic; refreshes the stats epoch first so the
+/// gauges track the current heap rather than a stale snapshot.
+fn jemalloc_stat(name: &[u8]) -> u64 {
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name) }
+        .map(|value| value as u64)
+        .unwrap_or(0)
 }

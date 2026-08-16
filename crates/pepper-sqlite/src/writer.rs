@@ -136,8 +136,18 @@ pub struct WriterCoordinator {
     active: Option<WriterTicket>,
     waiters: VecDeque<Waiter>,
     acquisitions: HashMap<String, AcquisitionStatus>,
+    acquisition_order: VecDeque<String>,
     commits: HashMap<String, (CommitAttempt, CommitRecord)>,
+    commit_order: VecDeque<String>,
 }
+
+/// Writer bookkeeping is leader-local and rebuilt on leadership change, but
+/// a long-lived leader serving a busy database accumulates one acquisition
+/// and one commit record per transaction; both maps must stay bounded or the
+/// process grows without limit (observed as soak OOM). The bounds keep far
+/// more history than any client retries across.
+const MAX_ACQUISITION_RECORDS: usize = 1024;
+const MAX_COMMIT_RECORDS: usize = 1024;
 
 impl WriterCoordinator {
     pub fn new(
@@ -171,6 +181,8 @@ impl WriterCoordinator {
             waiters: VecDeque::new(),
             acquisitions: HashMap::new(),
             commits: HashMap::new(),
+            acquisition_order: VecDeque::new(),
+            commit_order: VecDeque::new(),
         })
     }
 
@@ -230,7 +242,7 @@ impl WriterCoordinator {
         }
         if base_snapshot_cid != self.head_snapshot_cid || base_generation != self.head_generation {
             let status = self.stale_status();
-            self.acquisitions.insert(acquisition_id, status.clone());
+            self.record_acquisition(acquisition_id, status.clone());
             return Ok(status);
         }
         if self.active.is_none() {
@@ -242,12 +254,12 @@ impl WriterCoordinator {
                 now_millis,
             )?;
             let status = AcquisitionStatus::Granted { ticket };
-            self.acquisitions.insert(acquisition_id, status.clone());
+            self.record_acquisition(acquisition_id, status.clone());
             return Ok(status);
         }
         if wait_timeout_millis == 0 || self.waiters.len() >= self.max_waiters {
             let status = AcquisitionStatus::Busy;
-            self.acquisitions.insert(acquisition_id, status.clone());
+            self.record_acquisition(acquisition_id, status.clone());
             return Ok(status);
         }
         let deadline_millis = now_millis
@@ -263,7 +275,7 @@ impl WriterCoordinator {
         let status = AcquisitionStatus::Queued {
             position: self.waiters.len(),
         };
-        self.acquisitions.insert(acquisition_id, status.clone());
+        self.record_acquisition(acquisition_id, status.clone());
         Ok(status)
     }
 
@@ -283,7 +295,7 @@ impl WriterCoordinator {
             .checked_add(self.lease_millis)
             .ok_or_else(|| SqliteError::Invalid("writer lease deadline overflow".into()))?;
         let renewed = active.clone();
-        self.acquisitions.insert(
+        self.record_acquisition(
             renewed.acquisition_id.clone(),
             AcquisitionStatus::Granted {
                 ticket: renewed.clone(),
@@ -296,8 +308,7 @@ impl WriterCoordinator {
         self.advance(now_millis);
         self.validate_active(ticket, now_millis)?;
         let released = self.active.take().expect("validated active ticket");
-        self.acquisitions
-            .insert(released.acquisition_id, AcquisitionStatus::Released);
+        self.record_acquisition(released.acquisition_id, AcquisitionStatus::Released);
         self.advance(now_millis);
         Ok(())
     }
@@ -311,18 +322,20 @@ impl WriterCoordinator {
             .is_some_and(|ticket| ticket.holder == holder)
         {
             let released = self.active.take().expect("active ticket");
-            self.acquisitions
-                .insert(released.acquisition_id, AcquisitionStatus::Released);
+            self.record_acquisition(released.acquisition_id, AcquisitionStatus::Released);
         }
+        let mut released_waiters = Vec::new();
         self.waiters.retain(|waiter| {
             if waiter.holder == holder {
-                self.acquisitions
-                    .insert(waiter.acquisition_id.clone(), AcquisitionStatus::Released);
+                released_waiters.push(waiter.acquisition_id.clone());
                 false
             } else {
                 true
             }
         });
+        for acquisition_id in released_waiters {
+            self.record_acquisition(acquisition_id, AcquisitionStatus::Released);
+        }
         self.advance(now_millis);
     }
 
@@ -339,12 +352,11 @@ impl WriterCoordinator {
         }
         self.advance(now_millis);
         if let Some(ticket) = self.active.take() {
-            self.acquisitions
-                .insert(ticket.acquisition_id, AcquisitionStatus::Fenced);
+            self.record_acquisition(ticket.acquisition_id, AcquisitionStatus::Fenced);
         }
-        for waiter in self.waiters.drain(..) {
-            self.acquisitions
-                .insert(waiter.acquisition_id, AcquisitionStatus::Fenced);
+        let drained = self.waiters.drain(..).collect::<Vec<_>>();
+        for waiter in drained {
+            self.record_acquisition(waiter.acquisition_id, AcquisitionStatus::Fenced);
         }
         self.leader_term = new_term;
         self.next_ticket = 1;
@@ -401,12 +413,49 @@ impl WriterCoordinator {
         self.head_snapshot_cid = attempt.new_snapshot_cid.clone();
         self.head_generation = generation;
         let released = self.active.take().expect("validated active ticket");
-        self.acquisitions
-            .insert(released.acquisition_id, AcquisitionStatus::Released);
-        self.commits
-            .insert(attempt.idempotency_key.clone(), (attempt, record.clone()));
+        self.record_acquisition(released.acquisition_id, AcquisitionStatus::Released);
+        self.record_commit(attempt.idempotency_key.clone(), attempt, record.clone());
         self.advance(now_millis);
         Ok(record)
+    }
+
+    fn record_acquisition(&mut self, acquisition_id: String, status: AcquisitionStatus) {
+        if !self.acquisitions.contains_key(&acquisition_id) {
+            self.acquisition_order.push_back(acquisition_id.clone());
+        }
+        self.acquisitions.insert(acquisition_id, status);
+        while self.acquisitions.len() > MAX_ACQUISITION_RECORDS {
+            let Some(oldest) = self.acquisition_order.pop_front() else {
+                break;
+            };
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|ticket| ticket.acquisition_id == oldest)
+            {
+                // Never evict the active writer's record; rotate it to the
+                // back and retry with the next-oldest entry.
+                self.acquisition_order.push_back(oldest);
+                if self.acquisition_order.len() <= 1 {
+                    break;
+                }
+                continue;
+            }
+            self.acquisitions.remove(&oldest);
+        }
+    }
+
+    fn record_commit(&mut self, key: String, attempt: CommitAttempt, record: CommitRecord) {
+        if !self.commits.contains_key(&key) {
+            self.commit_order.push_back(key.clone());
+        }
+        self.commits.insert(key, (attempt, record));
+        while self.commits.len() > MAX_COMMIT_RECORDS {
+            let Some(oldest) = self.commit_order.pop_front() else {
+                break;
+            };
+            self.commits.remove(&oldest);
+        }
     }
 
     /// Deterministically applies expiry/timeout and grants the oldest eligible
@@ -418,14 +467,13 @@ impl WriterCoordinator {
             .is_some_and(|ticket| now_millis >= ticket.expires_at_millis)
         {
             let expired = self.active.take().expect("expired active ticket");
-            self.acquisitions
-                .insert(expired.acquisition_id, AcquisitionStatus::Fenced);
+            self.record_acquisition(expired.acquisition_id, AcquisitionStatus::Fenced);
         }
         let mut waiting = VecDeque::with_capacity(self.waiters.len());
-        for waiter in self.waiters.drain(..) {
+        let drained = std::mem::take(&mut self.waiters);
+        for waiter in drained {
             if now_millis >= waiter.deadline_millis {
-                self.acquisitions
-                    .insert(waiter.acquisition_id, AcquisitionStatus::TimedOut);
+                self.record_acquisition(waiter.acquisition_id, AcquisitionStatus::TimedOut);
             } else {
                 waiting.push_back(waiter);
             }
@@ -439,7 +487,7 @@ impl WriterCoordinator {
                 || waiter.base_generation != self.head_generation
             {
                 let status = self.stale_status();
-                self.acquisitions.insert(waiter.acquisition_id, status);
+                self.record_acquisition(waiter.acquisition_id, status);
                 continue;
             }
             match self.grant(
@@ -450,22 +498,24 @@ impl WriterCoordinator {
                 now_millis,
             ) {
                 Ok(ticket) => {
-                    self.acquisitions
-                        .insert(waiter.acquisition_id, AcquisitionStatus::Granted { ticket });
+                    self.record_acquisition(
+                        waiter.acquisition_id,
+                        AcquisitionStatus::Granted { ticket },
+                    );
                 }
                 Err(_) => {
-                    self.acquisitions
-                        .insert(waiter.acquisition_id, AcquisitionStatus::Fenced);
+                    self.record_acquisition(waiter.acquisition_id, AcquisitionStatus::Fenced);
                 }
             }
         }
-        for (position, waiter) in self.waiters.iter().enumerate() {
-            self.acquisitions.insert(
-                waiter.acquisition_id.clone(),
-                AcquisitionStatus::Queued {
-                    position: position + 1,
-                },
-            );
+        let queued = self
+            .waiters
+            .iter()
+            .enumerate()
+            .map(|(position, waiter)| (waiter.acquisition_id.clone(), position + 1))
+            .collect::<Vec<_>>();
+        for (acquisition_id, position) in queued {
+            self.record_acquisition(acquisition_id, AcquisitionStatus::Queued { position });
         }
     }
 

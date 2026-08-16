@@ -112,6 +112,34 @@ pub struct MetadataStore {
     schema_version: u32,
 }
 
+/// Bound for redb's in-process page cache. redb's default derives from
+/// SYSTEM memory and ignores cgroup limits, so a node in a small container
+/// (CI soak nodes run at 512 MiB) grows its cache toward a target the
+/// container can never satisfy and gets OOM-killed as the store churns.
+/// A quarter of the cgroup limit (clamped) keeps the cache proportionate;
+/// `PEPPER_METADATA_CACHE_BYTES` overrides explicitly.
+fn metadata_cache_bytes() -> u64 {
+    const MIN: u64 = 32 * 1024 * 1024;
+    const MAX: u64 = 1024 * 1024 * 1024;
+    if let Ok(value) = std::env::var("PEPPER_METADATA_CACHE_BYTES")
+        && let Ok(bytes) = value.trim().parse::<u64>()
+    {
+        return bytes.clamp(8 * 1024 * 1024, 8 * MAX);
+    }
+    let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        });
+    match cgroup_limit {
+        Some(bytes) if bytes < u64::MAX / 2 => (bytes / 4).clamp(MIN, MAX),
+        _ => MAX,
+    }
+}
+
 impl MetadataStore {
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, MetadataError> {
         let path = path.as_ref().to_path_buf();
@@ -121,10 +149,13 @@ impl MetadataStore {
                 source,
             })?;
         }
-        let db = Database::create(&path).map_err(|source| MetadataError::Open {
-            path: path.display().to_string(),
-            source: Box::new(source),
-        })?;
+        let db = Database::builder()
+            .set_cache_size(metadata_cache_bytes() as usize)
+            .create(&path)
+            .map_err(|source| MetadataError::Open {
+                path: path.display().to_string(),
+                source: Box::new(source),
+            })?;
         let schema_version = initialize_schema(&path, &db)?;
         let store = Self {
             path,

@@ -75,6 +75,7 @@ pub(super) fn router(state: AppState) -> Router {
         )
         .route("/v1/admin/gc", post(run_gc))
         .route("/v1/admin/repair", post(run_repair))
+        .route("/v1/admin/debug/heap-dump", post(heap_dump))
         .route("/v1/admin/status", get(admin_status))
         .route("/v1/admin/storage", get(admin_storage))
         .route("/v1/admin/placement", get(admin_placement_status))

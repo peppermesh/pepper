@@ -97,7 +97,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tikv-jemallocator = "0.7"
+tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = "0.7"
+tikv-jemalloc-sys = "0.7"
 async-trait = "0.1"
 kafka-protocol = { version = "=0.15.1", features = ["messages_enums"] }
 futures-util = "0.3"
