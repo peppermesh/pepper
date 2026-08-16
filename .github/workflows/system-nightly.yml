@@ -20,9 +20,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build:
+    name: build shared image and harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build the system-test image once
+        run: |
+          docker build -f system-tests/docker/Dockerfile -t "pepper-system-test:${GITHUB_SHA}" .
+          docker save "pepper-system-test:${GITHUB_SHA}" | zstd -T0 -3 -o system-test-image.tar.zst
+      - name: Build the test harness once
+        run: |
+          cargo build --release --locked --manifest-path system-tests/Cargo.toml
+          cp system-tests/target/release/pepper-system-test .
+      - name: Share build artifacts with test jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: system-test-build
+          path: |
+            system-test-image.tar.zst
+            pepper-system-test
+          if-no-files-found: error
+          retention-days: 1
+
   functional:
     name: nightly docker ${{ matrix.scenario }}
     runs-on: ubuntu-latest
+    needs: build
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -78,8 +105,14 @@ jobs:
       TOKIO_WORKER_THREADS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: system-test-build
+      - name: Load the shared image and harness
+        run: |
+          zstd -d --stdout system-test-image.tar.zst | docker load
+          rm system-test-image.tar.zst
+          chmod +x pepper-system-test
       - name: Select archived deterministic seed
         id: seed
         env:
@@ -95,9 +128,9 @@ jobs:
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
       - name: Run functional scenario
         run: >-
-          cargo run --manifest-path system-tests/Cargo.toml --locked --
+          ./pepper-system-test
           run --scenario "${{ matrix.scenario }}" --seed "${{ steps.seed.outputs.seed }}"
-          --backend docker --image "pepper-system-test:${GITHUB_SHA}"
+          --backend docker --image "pepper-system-test:${GITHUB_SHA}" --no-image-build
       - name: Assert backend cleanup
         if: always()
         run: |
