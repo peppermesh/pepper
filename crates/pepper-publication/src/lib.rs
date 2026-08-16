@@ -493,6 +493,11 @@ pub trait ProtectionBackend: Send + Sync + 'static {
     }
 }
 
+/// How long an APPLIED publication intent still acts as a GC barrier. Pins
+/// take over protection at apply time; the window only covers a crash
+/// between pin application and the intent's own status update.
+const APPLIED_INTENT_BARRIER_SECONDS: i64 = 60 * 60;
+
 /// How long a stored durability receipt can satisfy `durable_receipt`.
 /// The window only needs to span client retry horizons; sizing it in hours
 /// made the receipt table and its in-memory cache scale with sustained
@@ -815,6 +820,44 @@ impl PublicationRepository {
         }
     }
 
+    /// Drop history-table intents whose GC-barrier window has long passed.
+    /// The history ledger exists for audit/idempotency during the barrier
+    /// window, not as a permanent record; unbounded growth makes every
+    /// `protected_roots` and repair pass scan the full commit history.
+    pub fn prune_intent_history_now(&self) -> Result<usize, PublicationError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        let horizon = now.saturating_sub(APPLIED_INTENT_BARRIER_SECONDS.saturating_mul(24));
+        let stale: Vec<String> = read_all::<PublicationIntentRecord>(
+            &self.metadata,
+            NAMESPACE_PUBLICATION_INTENTS_HISTORY,
+        )?
+        .into_iter()
+        .filter(|intent| intent.created_at_unix_seconds < horizon)
+        .map(|intent| intent.intent_id)
+        .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let write = self
+            .metadata
+            .database()
+            .begin_write()
+            .map_err(storage_error)?;
+        {
+            let mut history = write
+                .open_table(NAMESPACE_PUBLICATION_INTENTS_HISTORY)
+                .map_err(storage_error)?;
+            for key in &stale {
+                history.remove(key.as_str()).map_err(storage_error)?;
+            }
+        }
+        write.commit().map_err(storage_error)?;
+        Ok(stale.len())
+    }
+
     fn retire_intent(
         &self,
         intent: &PublicationIntentRecord,
@@ -1008,21 +1051,29 @@ impl PublicationRepository {
                 .into_iter()
                 .map(|lease| lease.root_cid),
         );
-        // Union of the live (pending) and history (applied) tables: the GC
-        // barrier set is exactly what it was before terminal intents moved to
-        // the history table.
+        // An intent's GC-barrier role ends once its pins are durably applied:
+        // from then on the pin records provide protection and, unlike the
+        // intent ledger, they respect namespace retention. Protecting every
+        // applied intent forever made retention unable to release anything —
+        // superseded revisions stayed rooted and storage grew without bound.
+        // Pending intents are always barriers; applied ones only within a
+        // recency window covering the gap between pin application and the
+        // intent's status flip on a crashed node.
         let mut intents =
             read_all::<PublicationIntentRecord>(&self.metadata, NAMESPACE_PUBLICATION_INTENTS)?;
         intents.extend(read_all::<PublicationIntentRecord>(
             &self.metadata,
             NAMESPACE_PUBLICATION_INTENTS_HISTORY,
         )?);
+        let applied_barrier_horizon = now.saturating_sub(APPLIED_INTENT_BARRIER_SECONDS);
         roots.extend(
             intents
                 .into_iter()
                 .filter(|intent| {
                     intent.action == PinAction::Protect
-                        && (intent.status == "pending" || intent.status == "applied")
+                        && (intent.status == "pending"
+                            || (intent.status == "applied"
+                                && intent.created_at_unix_seconds >= applied_barrier_horizon))
                 })
                 .map(|intent| intent.cid),
         );
@@ -2148,6 +2199,87 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn applied_intents_stop_being_gc_barriers_after_the_recency_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(
+            MetadataStore::open_or_create(directory.path().join("metadata.redb")).unwrap(),
+        );
+        let repository =
+            PublicationRepository::new(metadata.clone(), PublicationLimits::default()).unwrap();
+        let namespace = NamespaceId::new(Cid::new(
+            pepper_types::CODEC_NAMESPACE_DESCRIPTOR,
+            b"barrier-namespace",
+        ))
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let intent =
+            |id: &str, cid_seed: &[u8], status: &str, created: i64| PublicationIntentRecord {
+                intent_id: id.to_string(),
+                namespace_id: namespace.clone(),
+                log_index: 1,
+                request_id: id.to_string(),
+                cid: Cid::new(CODEC_RAW, cid_seed),
+                action: PinAction::Protect,
+                reason: "test".to_string(),
+                status: status.to_string(),
+                created_at_unix_seconds: created,
+            };
+        let pending = intent("pending", b"pending-root", "pending", 1);
+        let recent = intent("recent", b"recent-root", "applied", now - 60);
+        // Past both the one-hour barrier window and the 24-hour history
+        // retention horizon.
+        let old = intent("old", b"old-root", "applied", now - 25 * 60 * 60);
+        let write = metadata.database().begin_write().unwrap();
+        {
+            let mut live = write.open_table(NAMESPACE_PUBLICATION_INTENTS).unwrap();
+            live.insert(
+                pending.intent_id.as_str(),
+                serde_json::to_vec(&pending).unwrap().as_slice(),
+            )
+            .unwrap();
+            let mut history = write
+                .open_table(NAMESPACE_PUBLICATION_INTENTS_HISTORY)
+                .unwrap();
+            for record in [&recent, &old] {
+                history
+                    .insert(
+                        record.intent_id.as_str(),
+                        serde_json::to_vec(record).unwrap().as_slice(),
+                    )
+                    .unwrap();
+            }
+        }
+        write.commit().unwrap();
+
+        let roots = repository.protected_roots(now).unwrap();
+        assert!(
+            roots.contains(&pending.cid),
+            "pending intents always bar GC"
+        );
+        assert!(
+            roots.contains(&recent.cid),
+            "recently applied intents bar GC within the window"
+        );
+        assert!(
+            !roots.contains(&old.cid),
+            "applied intents past the window release their barrier"
+        );
+
+        // History hygiene drops entries older than the retention horizon and
+        // keeps the recent ones.
+        let pruned = repository.prune_intent_history_now().unwrap();
+        assert_eq!(pruned, 1, "only the ancient history intent is pruned");
+        let remaining =
+            read_all::<PublicationIntentRecord>(&metadata, NAMESPACE_PUBLICATION_INTENTS_HISTORY)
+                .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].intent_id, "recent");
     }
 
     #[tokio::test]

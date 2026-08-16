@@ -1327,7 +1327,12 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
 /// gauges track the current heap rather than a stale snapshot.
 fn jemalloc_stat(name: &[u8]) -> u64 {
     let _ = tikv_jemalloc_ctl::epoch::advance();
-    unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name) }
-        .map(|value| value as u64)
-        .unwrap_or(0)
+    match name {
+        b"stats.allocated\0" => tikv_jemalloc_ctl::stats::allocated::read(),
+        b"stats.resident\0" => tikv_jemalloc_ctl::stats::resident::read(),
+        b"stats.metadata\0" => tikv_jemalloc_ctl::stats::metadata::read(),
+        _ => return 0,
+    }
+    .map(|value| value as u64)
+    .unwrap_or(0)
 }

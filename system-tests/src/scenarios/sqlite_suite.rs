@@ -47,10 +47,12 @@ async fn bootstrap(context: &mut ScenarioContext) -> Result<PepperClient> {
     let mut spec = ClusterSpec::three_node(context.run.seed);
     spec.sqlite_enabled = true;
     // The bounded soak drives compactions at maximum rate for hours; the
-    // metadata cache, allocator bookkeeping, and page-cache working set need
-    // more headroom than the default functional-test budget.
+    // metadata cache, allocator bookkeeping, page-cache working set, and the
+    // block store's between-GC garbage need more headroom than the default
+    // functional-test budget.
     for node in &mut spec.nodes {
         node.resources.memory_bytes = 1024 * 1024 * 1024;
+        node.storage.capacity_bytes = 512 * 1024 * 1024;
     }
     bootstrap_cluster(context, spec).await
 }
@@ -1404,6 +1406,24 @@ impl Scenario for SqliteSoakScenario {
         let mut iterations = 0u64;
         while started.elapsed() < duration {
             let iteration = iterations;
+            // Sustained operation includes garbage collection: without it the
+            // block store accumulates superseded generations until capacity
+            // exhaustion. Rotate the GC across nodes the way an operator's
+            // schedule would; a failed cycle surfaces on a later iteration.
+            if iteration > 0 && iteration.is_multiple_of(500) {
+                let (status, report) = json_request(
+                    &client,
+                    &nodes[(iteration / 500) as usize % nodes.len()],
+                    "POST",
+                    "/v1/admin/gc?dry_run=false",
+                    Value::Null,
+                )
+                .await?;
+                ensure!(
+                    status == 200,
+                    "soak garbage collection failed: HTTP {status}: {report}"
+                );
+            }
             // Soak asserts sustained progress, not latency: allow transient
             // unavailability windows (leader churn, starved CI runners) up to
             // three minutes before declaring the cluster stuck.

@@ -712,6 +712,9 @@ pub(super) fn spawn_publication_reconciler(state: AppState) {
                     {
                         warn!(%error, "durability receipt hygiene failed");
                     }
+                    if let Err(error) = state.publication_repository.prune_intent_history_now() {
+                        warn!(%error, "intent history hygiene failed");
+                    }
                     continue;
                 }
                 _ = interval.tick() => {}
